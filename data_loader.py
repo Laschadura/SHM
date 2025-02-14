@@ -237,6 +237,18 @@ def load_labels_for_test(test_id, labels_dir=LABELS_DIR, image_shape=IMAGE_SHAPE
     smoothed_mask = smooth_mask(binary_mask, sigma)
     return smoothed_mask
 
+############################################################################
+#Load data function -> lets us access the data simply with .load_data()
+############################################################################
+def load_data():
+    accel_dict = load_accelerometer_data(DATA_DIR, SKIP_TESTS)
+    mask_dict = {}
+    for test_id in accel_dict.keys():
+        mask = load_labels_for_test(test_id, LABELS_DIR, IMAGE_SHAPE, GAUSSIAN_SIGMA)
+        mask_dict[test_id] = mask
+    return accel_dict, mask_dict
+
+
 ######################################
 # Main Function (Example Usage)
 ######################################
