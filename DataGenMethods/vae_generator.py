@@ -238,6 +238,48 @@ def train_vae(model, dataset, optimizer, num_epochs=10):
                      f"Reconstruction Mask Loss: {total_recon_mask/num_batches:.4f}")
     return model
 
+# Global variable to store the trained VAE model for external access.
+vae_model = None
+
+def encoder(ts_sample, mask_sample=None):
+    """
+    Encodes a time-series sample into its latent representation.
+    
+    Args:
+        ts_sample: Numpy array of shape [batch, 12000, 12]
+        mask_sample: (Optional) Numpy array of shape [batch, 256, 768]. 
+                     If not provided, a dummy mask of zeros is used.
+    
+    Returns:
+        Latent vector (mu) from the encoder.
+    """
+    global vae_model
+    if vae_model is None:
+        raise ValueError("VAE model has not been trained or loaded.")
+    if mask_sample is None:
+        mask_sample = np.zeros((ts_sample.shape[0], 256, 768), dtype=np.float32)
+    mu, logvar, _, _ = vae_model.encoder(ts_sample, mask_sample)
+    return mu
+
+
+def decoder(z):
+    """
+    Wrapper function to decode a latent vector z into a pair of outputs:
+    the reconstructed time-series and its corresponding binary mask.
+    
+    Args:
+        z: Latent vector of shape [batch, latent_dim]
+    
+    Returns:
+        Tuple (recon_ts, recon_mask)
+    """
+    global vae_model
+    if vae_model is None:
+        raise ValueError("VAE model has not been trained or loaded.")
+    recon_ts, recon_mask = vae_model.generate(z)
+    return recon_ts, recon_mask
+
+
 # ----- Main Script -----
 def main():
     logging.basicConfig(level=logging.INFO)
@@ -267,6 +309,10 @@ def main():
     
     num_epochs = 10  # Adjust as needed
     model = train_vae(model, dataset, optimizer, num_epochs=num_epochs)
+    
+    # Set the global variable so that the encoder() and decoder() functions can use the trained model.
+    global vae_model
+    vae_model = model
     
     # ----- Generating New Synthetic Data -----
     results_dir = os.path.join("results", "vae_results")
