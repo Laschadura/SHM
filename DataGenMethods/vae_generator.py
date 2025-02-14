@@ -278,9 +278,11 @@ def decoder(z):
         raise ValueError("VAE model has not been trained or loaded.")
     recon_ts, recon_mask = vae_model.generate(z)
     return recon_ts, recon_mask
+
 def load_trained_model(weights_path):
     """
     Load a trained VAE model from the given weights file and assign it to the global variable.
+    This function builds the model (by calling it with dummy inputs) before loading the weights.
     
     Args:
         weights_path: Path to the saved weights file.
@@ -288,10 +290,17 @@ def load_trained_model(weights_path):
     global vae_model
     latent_dim = 128  # Ensure this matches the latent_dim used in training.
     model = VAE(latent_dim)
-    # Load the weights from the file
+    
+    # Build the model's variables by calling it with dummy inputs.
+    dummy_ts = tf.zeros((1, 12000, 12), dtype=tf.float32)
+    dummy_mask = tf.zeros((1, 256, 768), dtype=tf.float32)
+    _ = model(dummy_ts, dummy_mask)
+    
+    # Now load the weights.
     model.load_weights(weights_path)
     vae_model = model
     print("Trained VAE model loaded successfully.")
+
 
 def save_trained_model(weights_path):
     """
