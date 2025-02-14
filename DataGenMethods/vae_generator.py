@@ -278,6 +278,33 @@ def decoder(z):
         raise ValueError("VAE model has not been trained or loaded.")
     recon_ts, recon_mask = vae_model.generate(z)
     return recon_ts, recon_mask
+def load_trained_model(weights_path):
+    """
+    Load a trained VAE model from the given weights file and assign it to the global variable.
+    
+    Args:
+        weights_path: Path to the saved weights file.
+    """
+    global vae_model
+    latent_dim = 128  # Ensure this matches the latent_dim used in training.
+    model = VAE(latent_dim)
+    # Load the weights from the file
+    model.load_weights(weights_path)
+    vae_model = model
+    print("Trained VAE model loaded successfully.")
+
+def save_trained_model(weights_path):
+    """
+    Save the current trained VAE model's weights to the given path.
+    
+    Args:
+        weights_path: Path to save the weights.
+    """
+    global vae_model
+    if vae_model is None:
+        raise ValueError("No trained model to save.")
+    vae_model.save_weights(weights_path)
+    print("Trained VAE model saved successfully.")
 
 
 # ----- Main Script -----
@@ -313,6 +340,9 @@ def main():
     # Set the global variable so that the encoder() and decoder() functions can use the trained model.
     global vae_model
     vae_model = model
+
+    save_trained_model("results/vae_weights.h5")
+
     
     # ----- Generating New Synthetic Data -----
     results_dir = os.path.join("results", "vae_results")
