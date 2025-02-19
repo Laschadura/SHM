@@ -14,7 +14,7 @@ DATA_DIR = "Data"          # Directory containing Test_* folders with CSV files
 LABELS_DIR = "Labels"      # Directory containing label images for each test
 IMAGE_SHAPE = (256, 768)   # Output combined image shape (height, width)
 SKIP_TESTS = [23, 24]      # List of test numbers to skip (if any)
-GAUSSIAN_SIGMA = 5.0       # Sigma for Gaussian smoothing
+GAUSSIAN_SIGMA = 2.0       # Sigma for Gaussian smoothing
 EXPECTED_LENGTH = 12000    # Expected number of datapoints (60s at 200Hz)
 
 # Mapping for perspective images (adjust names if necessary)
@@ -250,7 +250,7 @@ def load_data():
 
 
 ######################################
-# Main Function (Example Usage)
+# Main Function
 ######################################
 def main():
     print("INFO: Loading accelerometer data...")
