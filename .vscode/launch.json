@@ -8,12 +8,9 @@
             "program": "${workspaceFolder}/evaluate.py",
             "console": "integratedTerminal",
             "args": [
-                "--synthetic_folder", "results/vae_results",
-                "--use_interpolation",
-                "--encoder_module", "vae_generator",
-                "--decoder_module", "vae_generator",
-                "--model", "vae"
+                "--synthetic_folder", "results/vae_results"
             ]
         }
     ]
 }
+
