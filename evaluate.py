@@ -1,12 +1,16 @@
-import os, sys
+import os
+import sys
 import glob
 import argparse
 import numpy as np
 import matplotlib.pyplot as plt
-import matplotlib.cm as cm
+import umap
+import plotly.graph_objects as go
+import plotly.io as pio
+from scipy.stats import spearmanr
 from scipy.stats import ks_2samp
+from scipy.signal import welch
 from sklearn.decomposition import PCA
-from sklearn.manifold import TSNE
 
 # Import your real data loader
 import data_loader
@@ -15,328 +19,257 @@ data_gen_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "DataGe
 if data_gen_path not in sys.path:
     sys.path.append(data_gen_path)
 
+# Ensure the output directory exists
+output_dir = "evaluation_plots"
+os.makedirs(output_dir, exist_ok=True)
+
 ##########################
 # 1. Data Loading
 ##########################
-def load_real_data():
-    """
-    Load held-out real test data using your data_loader module.
-    Aggregates all samples from the returned dictionary.
-    
-    Returns:
-      - signals: NumPy array of shape [num_samples, 12000, 12] for the time series data.
-      - masks: NumPy array of shape [num_samples, H, W] for the corresponding masks.
-    """
-    accel_dict, mask_dict = data_loader.load_data()
-    signals = []
-    masks = []
-    # Iterate over all tests in the dictionary.
-    for test_id, samples in accel_dict.items():
-        # Assume that each sample in the test uses the same mask from mask_dict.
-        for sample in samples:
-            signals.append(sample)
-            masks.append(mask_dict[test_id])
-    signals = np.stack(signals)
-    masks = np.stack(masks)
-    return signals, masks
 
+def load_real_data():
+    """Loads and segments real data into 5s impact events."""
+    accel_dict, mask_dict = data_loader.load_data()
+    signals, masks, test_ids = [], [], []
+
+    for test_id, all_ts in accel_dict.items():
+        mask_data = mask_dict[test_id]
+
+        for ts_raw in all_ts:
+            segment_size = 1000  # 5s at 200Hz
+            for i in range(0, ts_raw.shape[0] - segment_size + 1, segment_size):
+                segment = ts_raw[i:i+segment_size, :]
+                signals.append(segment)
+                masks.append(mask_data)
+                test_ids.append(test_id)
+
+    # Debug: Print loaded test IDs
+    print(f"[DEBUG] Loaded {len(test_ids)} real test IDs. First 10: {test_ids[:10]}")
+
+    return np.stack(signals), np.stack(masks), np.array(test_ids)
 
 
 def load_synthetic_data(synthetic_folder):
-    """
-    Load synthetic data from the specified folder.
-    This function searches for pairs of .npy files:
-      - synthetic_sample_*_acc.npy for time series data,
-      - synthetic_sample_*_mask.npy for corresponding mask data.
-    
-    It then aggregates them into NumPy arrays.
-    
-    Returns:
-      signals: NumPy array of shape [num_samples, 12000, 12] (or whatever shape your data has).
-      masks: NumPy array of shape [num_samples, H, W] for the corresponding masks.
-      metadata: None (or you can populate this if needed).
-    """
+    """Loads synthetic 5s segments and masks."""
+    ts_files = sorted(glob.glob(os.path.join(synthetic_folder, "gen_ts_*.npy")))
+    mask_files = sorted(glob.glob(os.path.join(synthetic_folder, "gen_mask_*.npy")))
 
-    # Find all accelerometer files and mask files
-    ts_files = sorted(glob.glob(os.path.join(synthetic_folder, "synthetic_sample_*_acc.npy")))
-    mask_files = sorted(glob.glob(os.path.join(synthetic_folder, "synthetic_sample_*_mask.npy")))
-    
     if not ts_files or not mask_files:
-        raise FileNotFoundError("No synthetic sample files found in folder: " + synthetic_folder)
-    
-    signals = []
-    masks = []
-    
-    # Assuming files are named so that their sorted order matches (e.g., sample_0, sample_1, ...)
+        raise FileNotFoundError(f"No synthetic sample files found in folder: {synthetic_folder}")
+
+    signals, masks, test_ids = [], [], []
+
     for ts_file, mask_file in zip(ts_files, mask_files):
-        ts = np.load(ts_file)
-        m = np.load(mask_file)
+        ts = np.load(ts_file).squeeze(0)  # Shape: (1000, 12)
+        m = np.load(mask_file)  # Shape: (256, 768)
+
+        test_id = int(ts_file.split("_")[-1].split(".")[0])  # Extract test ID from filename
         signals.append(ts)
         masks.append(m)
-    
-    signals = np.stack(signals)
-    masks = np.stack(masks)
-    metadata = None  # You can add metadata if needed.
-    return signals, masks, metadata
+        test_ids.append(test_id)
+
+    # Debug: Print loaded synthetic test IDs
+    print(f"[DEBUG] Loaded {len(test_ids)} synthetic test IDs. First 10: {test_ids[:10]}")
+
+    return np.stack(signals), np.stack(masks), np.array(test_ids)
+
+##########################
+# 2. Feature Computation
+##########################
+
+def compute_features(data, sample_rate=200):
+    """Computes FFT, RMS, and PSD features for time-series data."""
+    fft_features, rms_features, psd_features = [], [], []
+
+    for sample in data:
+        fft_vals = np.abs(np.fft.rfft(sample, axis=0))  # Shape: (freq_bins, num_channels)
+        fft_feature = np.linalg.norm(fft_vals, axis=1)  # Reduce across channels
+
+        rms_feature = np.sqrt(np.mean(sample**2, axis=1))  # Per time step
+
+        psd_list = []
+        for ch in range(sample.shape[1]):
+            f, pxx = welch(sample[:, ch], fs=sample_rate)
+            psd_list.append(pxx)
+        psd_feature = np.mean(np.array(psd_list), axis=0)  # Mean across channels
+
+        fft_features.append(fft_feature)
+        rms_features.append(rms_feature)
+        psd_features.append(psd_feature)
+
+    return np.array(fft_features), np.array(rms_features), np.array(psd_features)
+
+
+def compute_mask_features(masks):
+    """Flattens masks for UMAP analysis."""
+    return np.array([mask.flatten() for mask in masks])
 
 
 ##########################
-# 2. Reconstruction Error Analysis
+# 3. UMAP Visualization
 ##########################
-def calculate_reconstruction_error(real_data, synthetic_data):
-    """
-    Calculate the Mean Squared Error (MSE) between real and synthetic data.
-    If the number of samples differs, randomly subsample from the larger array
-    so that both have the same number of samples.
-    """
-    n_real = real_data.shape[0]
-    n_syn = synthetic_data.shape[0]
-    if n_real > n_syn:
-        idx = np.random.choice(n_real, n_syn, replace=False)
-        real_data = real_data[idx]
-    elif n_syn > n_real:
-        idx = np.random.choice(n_syn, n_real, replace=False)
-        synthetic_data = synthetic_data[idx]
+
+def plot_umap_3d_combined(real_features, real_labels, synthetic_features, synthetic_labels, title, filename):
+    """Plots real & synthetic data in a single UMAP 3D scatter plot."""
+    reducer = umap.UMAP(n_components=3, random_state=42)
     
-    mse = np.mean((real_data - synthetic_data)**2)
-    return mse
+    # Combine real and synthetic features
+    combined_features = np.vstack([real_features, synthetic_features])
+    combined_labels = np.hstack([real_labels, synthetic_labels])
+    
+    # Apply UMAP reduction
+    embedding = reducer.fit_transform(combined_features)
+
+    # Assign different color gradients for real (reds) vs. synthetic (blues)
+    colors = np.hstack([
+        np.linspace(0.2, 1.0, len(real_labels)),  # Real data (progressing from light red to dark red)
+        np.linspace(0.2, 1.0, len(synthetic_labels))  # Synthetic data (progressing from light blue to dark blue)
+    ])
+    color_scale = np.hstack([
+        np.full(len(real_labels), "Reds"),  
+        np.full(len(synthetic_labels), "Blues")  
+    ])
+
+    # Create a single 3D scatter plot
+    fig = go.Figure()
+
+    fig.add_trace(go.Scatter3d(
+        x=embedding[:len(real_labels), 0],
+        y=embedding[:len(real_labels), 1],
+        z=embedding[:len(real_labels), 2],
+        mode='markers',
+        marker=dict(
+            size=4,
+            color=colors[:len(real_labels)],
+            colorscale="Reds",  # Real data: Red gradient
+            opacity=0.7
+        ),
+        name="Real Data"
+    ))
+
+    fig.add_trace(go.Scatter3d(
+        x=embedding[len(real_labels):, 0],
+        y=embedding[len(real_labels):, 1],
+        z=embedding[len(real_labels):, 2],
+        mode='markers',
+        marker=dict(
+            size=4,
+            color=colors[len(real_labels):],
+            colorscale="Blues",  # Synthetic data: Blue gradient
+            opacity=0.7
+        ),
+        name="Synthetic Data"
+    ))
+
+    fig.update_layout(
+        scene=dict(
+            xaxis_title="UMAP 1",
+            yaxis_title="UMAP 2",
+            zaxis_title="UMAP 3"
+        ),
+        title=title
+    )
+
+    pio.write_html(fig, file=os.path.join(output_dir, filename), auto_open=False)
+    print(f"Saved interactive combined UMAP plot: {filename}")
 
 
-##########################
-# 3. Statistical Similarity Tests
-##########################
-def run_ks_test(real_data, synthetic_data):
-    """
-    Flatten the data and run the Kolmogorov–Smirnov test to compare the overall distributions.
-    """
-    real_flat = real_data.flatten()
-    synthetic_flat = synthetic_data.flatten()
-    statistic, p_value = ks_2samp(real_flat, synthetic_flat)
-    return statistic, p_value
+def check_damage_correlation_combined(real_features, real_labels, synthetic_features, synthetic_labels, dataset_name):
+    """Computes Spearman correlation between UMAP components and damage progression for real & synthetic data."""
+    reducer = umap.UMAP(n_components=3, random_state=42)
+    
+    # Combine real and synthetic features
+    combined_features = np.vstack([real_features, synthetic_features])
+    combined_labels = np.hstack([real_labels, synthetic_labels])
+    
+    # Apply UMAP
+    embedding = reducer.fit_transform(combined_features)
 
-def spectral_analysis(signal, fs=200.0):
-    """
-    Compute the Fourier transform of a 1D signal to analyze its frequency content.
-    
-    Args:
-      signal: 1D numpy array.
-      fs: Sampling frequency in Hz.
-    
-    Returns:
-      freqs: Frequency bins in Hz.
-      fft_vals: Magnitude of the FFT.
-    """
-    fft_vals = np.abs(np.fft.fft(signal))
-    freqs = np.fft.fftfreq(len(signal), d=1/fs)
-    return freqs, fft_vals
+    # Compute correlation separately for real and synthetic data
+    real_corr_x, _ = spearmanr(embedding[:len(real_labels), 0], real_labels)
+    real_corr_y, _ = spearmanr(embedding[:len(real_labels), 1], real_labels)
+    real_corr_z, _ = spearmanr(embedding[:len(real_labels), 2], real_labels)
 
+    synthetic_corr_x, _ = spearmanr(embedding[len(real_labels):, 0], synthetic_labels)
+    synthetic_corr_y, _ = spearmanr(embedding[len(real_labels):, 1], synthetic_labels)
+    synthetic_corr_z, _ = spearmanr(embedding[len(real_labels):, 2], synthetic_labels)
 
-def plot_spectral_comparison(real_signal, synthetic_signal, sample_idx=0):
-    """
-    Plot the frequency spectra of a pair of real and synthetic signals for all channels.
-    
-    For clarity:
-      - All real channels are plotted in a consistent dark navy color.
-      - All synthetic channels are plotted in a consistent red color.
-    
-    Args:
-      real_signal: NumPy array of shape [time_steps, channels].
-      synthetic_signal: NumPy array of shape [time_steps, channels].
-      sample_idx: The sample index (for title display).
-    """
-    num_channels = real_signal.shape[1]
-    plt.figure(figsize=(10, 5))
-    
-    # Plot real channels in navy color.
-    for ch in range(num_channels):
-        r_ch = real_signal[:, ch]
-        freqs, fft_real = spectral_analysis(r_ch)
-        if ch == 0:
-            plt.plot(freqs, fft_real, label='Real', color='navy', alpha=0.7)
-        else:
-            plt.plot(freqs, fft_real, color='navy', alpha=0.7)
-    
-    # Plot synthetic channels in red color.
-    for ch in range(num_channels):
-        s_ch = synthetic_signal[:, ch]
-        freqs, fft_synthetic = spectral_analysis(s_ch)
-        if ch == 0:
-            plt.plot(freqs, fft_synthetic, label='Synthetic', color='red', alpha=0.7)
-        else:
-            plt.plot(freqs, fft_synthetic, color='red', alpha=0.7)
-    
-    plt.xlabel("Frequency")
-    plt.ylabel("Amplitude")
-    plt.title(f"Spectral Analysis Comparison (Sample {sample_idx})")
-    plt.legend()
-    plt.show()
+    print(f"\n[INFO] Spearman Correlation of {dataset_name} UMAP with Damage Progression:")
+    print(f"    Real Data - UMAP 1: {real_corr_x:.4f}, UMAP 2: {real_corr_y:.4f}, UMAP 3: {real_corr_z:.4f}")
+    print(f"    Synthetic Data - UMAP 1: {synthetic_corr_x:.4f}, UMAP 2: {synthetic_corr_y:.4f}, UMAP 3: {synthetic_corr_z:.4f}\n")
 
-
-##########################
-# 4. Latent Space Evaluation and Optional Interpolation
-##########################
-def latent_space_visualization(latent_real, latent_synthetic, method="pca"):
-    """
-    Visualize the latent space of real and synthetic samples using PCA or t-SNE.
-    """
-    if method == "pca":
-        reducer = PCA(n_components=2)
-    elif method == "tsne":
-        reducer = TSNE(n_components=2)
-    else:
-        raise ValueError(f"Unknown latent visualization method: {method}")
-    
-    combined = np.concatenate([latent_real, latent_synthetic], axis=0)
-    reduced = reducer.fit_transform(combined)
-    n_real = latent_real.shape[0]
-    
-    plt.figure(figsize=(8, 6))
-    plt.scatter(reduced[:n_real, 0], reduced[:n_real, 1], label='Real', alpha=0.7)
-    plt.scatter(reduced[n_real:, 0], reduced[n_real:, 1], label='Synthetic', alpha=0.7)
-    plt.xlabel("Component 1")
-    plt.ylabel("Component 2")
-    plt.title(f"Latent Space Visualization using {method.upper()}")
-    plt.legend()
-    plt.show()
-
-
-def interpolation_experiment(encoder, decoder, real_data, num_steps=10):
-    """
-    Perform an interpolation experiment between two real samples:
-      - Encode two real samples into the latent space.
-      - Interpolate between the latent vectors.
-      - Decode the intermediate latent vectors to generate interpolated samples.
-      
-    Note:
-      - The decoder is assumed to return a tuple: (reconstructed time series, reconstructed mask).
-      - For the time series, we plot the first channel.
-      - For the mask, we use imshow to display the binary image.
-    """
-    sample1 = real_data[0]
-    sample2 = real_data[1]
-    
-    # Encode the two samples.
-    z1 = encoder(sample1[np.newaxis, :])
-    z2 = encoder(sample2[np.newaxis, :])
-    
-    interpolated_ts = []
-    interpolated_masks = []
-    alphas = np.linspace(0, 1, num_steps)
-    
-    for alpha in alphas:
-        z_interp = (1 - alpha) * z1 + alpha * z2
-        # decoder now returns a tuple (recon_ts, recon_mask)
-        recon_ts, recon_mask = decoder(z_interp)
-        interpolated_ts.append(recon_ts.numpy().squeeze(0))
-        interpolated_masks.append(recon_mask.numpy().squeeze(0))
-    
-    # Create a colormap that assigns a distinct color to each alpha.
-    cmap = plt.get_cmap("viridis", num_steps)
-    
-    plt.figure(figsize=(12, 6))
-    for i, ts in enumerate(interpolated_ts):
-        # Now each line gets its own label, so the legend will list all alpha values.
-        plt.plot(ts[:, 0], color=cmap(i), label=f"alpha={alphas[i]:.2f}")
-    plt.xlabel("Time")
-    plt.ylabel("Amplitude (Channel 1)")
-    plt.title("Time Series Interpolation Experiment")
-    plt.legend()
-    plt.show()
-    
-    # Plot mask interpolation: show each mask as an image in a row.
-    n = len(interpolated_masks)
-    plt.figure(figsize=(15, 3))
-    for i, mask in enumerate(interpolated_masks):
-        plt.subplot(1, n, i+1)
-        plt.imshow(mask, cmap='gray')
-        plt.axis('off')
-        plt.title(f"alpha={alphas[i]:.2f}")
-    plt.suptitle("Mask Interpolation Experiment")
-    plt.show()
-
+    return (real_corr_x, real_corr_y, real_corr_z), (synthetic_corr_x, synthetic_corr_y, synthetic_corr_z)
 
 ##########################
-# 5. Diversity and Coverage Metrics
+# 4. Evaluation Pipeline
 ##########################
-def diversity_coverage_metrics(real_data, synthetic_data):
-    """
-    Compare variances along features as a simple metric of diversity and coverage.
-    """
-    real_var = np.var(real_data, axis=0)
-    synthetic_var = np.var(synthetic_data, axis=0)
-    diversity_score = np.mean(np.abs(real_var - synthetic_var))
-    return diversity_score
 
-##########################
-# 6. Main Routine
-##########################
 def main(args):
-    # Load data and unpack the tuple into real_signals and real_masks.
-    real_signals, real_masks = load_real_data()
-    print(f"Loaded real signals with shape: {real_signals.shape}")
-    print(f"Loaded real masks with shape: {real_masks.shape}")
-    
-    synthetic_data, synthetic_masks, metadata = load_synthetic_data(args.synthetic_folder)
-    print(f"Loaded synthetic data with shape: {synthetic_data.shape}")
-    
-    # Use real_signals for evaluation tests:
-    mse = calculate_reconstruction_error(real_signals, synthetic_data)
+    # Load real & synthetic data
+    real_signals, real_masks, real_ids = load_real_data()
+    synthetic_signals, synthetic_masks, synthetic_ids = load_synthetic_data(args.synthetic_folder)
+
+    # Debug: Print test ID distribution
+    print(f"\n[DEBUG] Real Data - Unique Test IDs: {np.unique(real_ids)}")
+    print(f"[DEBUG] Synthetic Data - Unique Test IDs: {np.unique(synthetic_ids)}\n")
+
+    # Ensure same sample size
+    min_samples = min(real_signals.shape[0], synthetic_signals.shape[0])
+    real_signals, real_masks, real_ids = real_signals[:min_samples], real_masks[:min_samples], real_ids[:min_samples]
+    synthetic_signals, synthetic_masks, synthetic_ids = synthetic_signals[:min_samples], synthetic_masks[:min_samples], synthetic_ids[:min_samples]
+
+    # Compute features
+    real_fft, real_rms, real_psd = compute_features(real_signals)
+    synthetic_fft, synthetic_rms, synthetic_psd = compute_features(synthetic_signals)
+
+    real_mask_features = compute_mask_features(real_masks)
+    synthetic_mask_features = compute_mask_features(synthetic_masks)
+
+    # Compute reconstruction error (MSE)
+    mse = np.mean((real_signals - synthetic_signals) ** 2)
     print(f"Mean Squared Reconstruction Error: {mse:.4f}")
-    
-    ks_stat, ks_p = run_ks_test(real_signals, synthetic_data)
+
+    # KS Test for real vs. synthetic distributions
+    ks_stat, ks_p = ks_2samp(real_signals.flatten(), synthetic_signals.flatten())
     print(f"KS Test Statistic: {ks_stat:.4f}, p-value: {ks_p:.4f}")
-    
-    if real_signals.shape[0] > 0 and synthetic_data.shape[0] > 0:
-        plot_spectral_comparison(real_signals[0], synthetic_data[0], sample_idx=0)
-    
-    if args.use_latent:
-        latent_real_file = os.path.join(args.synthetic_folder, "latent_real.npy")
-        latent_synthetic_file = os.path.join(args.synthetic_folder, "latent_synthetic.npy")
-        if os.path.exists(latent_real_file) and os.path.exists(latent_synthetic_file):
-            latent_real = np.load(latent_real_file)
-            latent_synthetic = np.load(latent_synthetic_file)
-            latent_space_visualization(latent_real, latent_synthetic, method=args.latent_method)
-        else:
-            print("Latent representations not found in synthetic folder. Skipping latent space visualization.")
-    
-    diversity_score = diversity_coverage_metrics(real_signals, synthetic_data)
-    print(f"Diversity Coverage Score (mean absolute variance difference): {diversity_score:.4f}")
-    
-    if args.use_interpolation:
-        if args.model in ["vae", "gan"]:
-            if args.encoder_module and args.decoder_module:
-                import importlib
-                encoder_module = importlib.import_module(args.encoder_module)
-                decoder_module = importlib.import_module(args.decoder_module)
-                # Load the trained model weights so that vae_model is set in the module.
-                encoder_module.load_trained_model("results/vae_weights.h5")
-                
-                encoder = encoder_module.encoder
-                decoder = decoder_module.decoder
-                # Pass real_signals to the interpolation experiment.
-                interpolation_experiment(encoder, decoder, real_signals)
-            else:
-                print("Encoder/Decoder modules not specified. Skipping interpolation experiment.")
-        else:
-            print(f"Interpolation experiment skipped because the chosen model ({args.model}) does not support latent space interpolation.")
+
+    # UMAP Visualization
+    plot_umap_3d_combined(
+        real_fft, real_ids, synthetic_fft, synthetic_ids,
+        title="UMAP 3D of FFT Features (Real vs. Synthetic)",
+        filename="UMAP_FFT_Combined.html"
+    )
+
+    plot_umap_3d_combined(
+        real_rms, real_ids, synthetic_rms, synthetic_ids,
+        title="UMAP 3D of RMS Features (Real vs. Synthetic)",
+        filename="UMAP_RMS_Combined.html"
+    )
+
+    plot_umap_3d_combined(
+        real_psd, real_ids, synthetic_psd, synthetic_ids,
+        title="UMAP 3D of PSD Features (Real vs. Synthetic)",
+        filename="UMAP_PSD_Combined.html"
+    )
+
+    plot_umap_3d_combined(
+        real_mask_features, real_ids, synthetic_mask_features, synthetic_ids,
+        title="UMAP 3D of Mask Features (Real vs. Synthetic)",
+        filename="UMAP_Mask_Combined.html"
+    )
+
+    print("\nChecking if VAE captures damage progression...\n")
+
+    check_damage_correlation_combined(real_fft, real_ids, synthetic_fft, synthetic_ids, "FFT Features")
+    check_damage_correlation_combined(real_rms, real_ids, synthetic_rms, synthetic_ids, "RMS Features")
+    check_damage_correlation_combined(real_psd, real_ids, synthetic_psd, synthetic_ids, "PSD Features")
+    check_damage_correlation_combined(real_mask_features, real_ids, synthetic_mask_features, synthetic_ids, "Mask Features")
+
 
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Evaluation Script for Synthetic Data")
-    parser.add_argument("--synthetic_folder", type=str, required=True,
-                        help="Folder containing synthetic data (e.g., vae_results) and optionally latent representations")
-    parser.add_argument("--use_latent", action="store_true",
-                        help="Perform latent space visualization if latent representations are available")
-    parser.add_argument("--latent_method", type=str, default="pca", choices=["pca", "tsne"],
-                        help="Method for latent space visualization (pca or tsne)")
-    parser.add_argument("--use_interpolation", action="store_true",
-                        help="Perform interpolation experiments for models with a latent space (e.g., VAE, GAN)")
-    parser.add_argument("--encoder_module", type=str,
-                        help="Python module path for the encoder (e.g., vae_generator)")
-    parser.add_argument("--decoder_module", type=str,
-                        help="Python module path for the decoder (e.g., vae_generator)")
-    parser.add_argument("--model", type=str, default="vae", choices=["vae", "gan", "diffusion"],
-                        help="Specify the type of generative model used. This helps determine if interpolation is applicable.")
+    parser.add_argument("--synthetic_folder", type=str, required=True, help="Folder containing synthetic data")
     args = parser.parse_args()
     main(args)
