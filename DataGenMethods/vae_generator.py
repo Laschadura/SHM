@@ -24,6 +24,8 @@ from keras import layers, Model
 import logging
 import numpy as np
 from scipy import signal
+import matplotlib.pyplot as plt
+
 
 # Append parent directory to find data_loader.py
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -198,14 +200,59 @@ def compute_psd(segment, sample_rate):
 # ----- Loss Functions -----
 def dice_loss(pred, target, smooth=1e-6):
     """
-    Compute Dice loss for the mask reconstruction.
-    Both pred and target are assumed to be of shape [batch, H, W].
+    Dice loss with epsilon to avoid divide-by-zero.
     """
-    pred_flat = tf.reshape(pred, (tf.shape(pred)[0], -1))
-    target_flat = tf.reshape(target, (tf.shape(target)[0], -1))
+    # Assert that incoming pred/target don't contain NaNs/infs
+    tf.debugging.assert_all_finite(pred, "dice_loss: pred contains NaN or Inf")
+    tf.debugging.assert_all_finite(target, "dice_loss: target contains NaN or Inf")
+
+    # Clip predictions to [0, 1] just in case
+    pred = tf.clip_by_value(pred, 0.0, 1.0)
+
+    # Flatten
+    pred_flat = tf.reshape(pred, [tf.shape(pred)[0], -1])
+    target_flat = tf.reshape(target, [tf.shape(target)[0], -1])
+
     intersection = tf.reduce_sum(pred_flat * target_flat, axis=1)
-    dice = (2. * intersection + smooth) / (tf.reduce_sum(pred_flat, axis=1) + tf.reduce_sum(target_flat, axis=1) + smooth)
-    return 1 - tf.reduce_mean(dice)
+    # Add smooth to denominator and numerator to avoid zero
+    dice = (2.0 * intersection + smooth) / (
+        tf.reduce_sum(pred_flat, axis=1) + tf.reduce_sum(target_flat, axis=1) + smooth
+    )
+
+    # Check that dice ratio is still finite
+    tf.debugging.assert_all_finite(dice, "dice_loss: dice ratio is NaN or Inf")
+
+    return 1.0 - tf.reduce_mean(dice)
+
+def focal_loss(y_true, y_pred, alpha=0.25, gamma=2.0, eps=1e-7):
+    """
+    Focal loss with clipping to avoid log(0).
+    """
+    # Validate inputs
+    tf.debugging.assert_all_finite(y_true, "focal_loss: y_true has NaN/Inf")
+    tf.debugging.assert_all_finite(y_pred, "focal_loss: y_pred has NaN/Inf")
+
+    # Clip y_pred to avoid log(0) => -inf
+    y_pred = tf.clip_by_value(y_pred, eps, 1.0 - eps)
+
+    # Cross-entropy terms
+    ce_pos = -y_true * tf.math.log(y_pred)
+    ce_neg = -(1.0 - y_true) * tf.math.log(1.0 - y_pred)
+
+    # Focal weights
+    wt_pos = alpha * tf.pow((1.0 - y_pred), gamma)
+    wt_neg = (1.0 - alpha) * tf.pow(y_pred, gamma)
+
+    # Combine
+    fl_pos = wt_pos * ce_pos
+    fl_neg = wt_neg * ce_neg
+
+    focal = tf.reduce_mean(fl_pos + fl_neg)
+
+    # Assert focal is still finite
+    tf.debugging.assert_all_finite(focal, "focal_loss result is NaN/Inf")
+
+    return focal
 
 def reparameterize(mu, logvar):
     std = tf.exp(0.5 * logvar)
@@ -214,231 +261,96 @@ def reparameterize(mu, logvar):
 
 # ----- Encoder Branches -----
 class RawEncoder(keras.Model):
-    """Conv1D stack for raw time-series of shape (1000, 12) with MoG output."""
-    def __init__(self, latent_dim, num_mixtures=5):
+    """Convolutional encoder for raw time-series data.
+       Input shape: (1000, 12)
+       Outputs a feature vector of dimension feature_dim.
+    """
+    def __init__(self, feature_dim):
         super().__init__()
-        self.num_mixtures = num_mixtures
-        self.latent_dim = latent_dim  # We'll reshape to [batch, num_mixtures, latent_dim]
-        
-        # Convolutions
         self.conv1 = layers.Conv1D(16, kernel_size=4, strides=2, padding='same', activation='relu')
         self.dropout1 = layers.Dropout(0.3)
         self.conv2 = layers.Conv1D(32, kernel_size=4, strides=2, padding='same', activation='relu')
         self.dropout2 = layers.Dropout(0.3)
-        
         self.flatten = layers.Flatten()
         self.dense_reduce = layers.Dense(512, activation='relu')
-        
-        # Mixture of Gaussians
-        self.mu_layer = layers.Dense(self.latent_dim * self.num_mixtures)       # e.g. 128*5=640
-        self.logvar_layer = layers.Dense(self.latent_dim * self.num_mixtures)
-        self.pi_layer = layers.Dense(self.num_mixtures, activation="softmax")  # 5
+        self.feature_layer = layers.Dense(feature_dim)  # final feature vector
 
     def call(self, x, training=False):
-        # Conv1D + pooling by strides=2
         x = self.conv1(x)
         x = self.dropout1(x, training=training)
         x = self.conv2(x)
         x = self.dropout2(x, training=training)
-        
-        # Flatten => e.g. shape (batch, 32 * ~250?)
         x = self.flatten(x)
-        x = self.dense_reduce(x)  # shape (batch, 512)
-        
-        # If we do latent_dim=128, num_mixtures=5 => output shape = (batch, 640)
-        mu_unshaped = self.mu_layer(x)     # => (batch, 640)
-        mu = tf.reshape(mu_unshaped, [-1, self.num_mixtures, self.latent_dim])  
-        # => (batch, 5, 128)
-
-        logvar_unshaped = self.logvar_layer(x)  # => (batch, 640)
-        logvar = tf.reshape(logvar_unshaped, [-1, self.num_mixtures, self.latent_dim])
-
-        pi = self.pi_layer(x)  # => (batch, 5)
-        
-        return mu, logvar, pi
-
+        x = self.dense_reduce(x)
+        feature = self.feature_layer(x)
+        return feature  # shape: [batch, feature_dim]
+    
 class FFTEncoder(keras.Model):
-    """We'll assume shape ~ (501, 12).
-       Fewer filters -> 8, then flatten, then Dense(128).
-       Then we produce a mixture-of-Gaussians with dimension = latent_dim
+    """Encoder for FFT features.
+       Input shape: (501, 12)
+       Outputs a feature vector of dimension feature_dim.
     """
-    def __init__(self, latent_dim, num_mixtures=5):
+    def __init__(self, feature_dim):
         super().__init__()
-        self.latent_dim = latent_dim
-        self.num_mixtures = num_mixtures
-        
-        # CNN layers
         self.conv1 = layers.Conv1D(8, 3, strides=1, padding='same', activation='relu')
         self.dropout1 = layers.Dropout(0.3)
         self.flatten = layers.Flatten()
         self.dense_reduce = layers.Dense(128, activation='relu')
-
-        # Mixture of Gaussians
-        self.mu_layer = layers.Dense(self.latent_dim * self.num_mixtures)
-        self.logvar_layer = layers.Dense(self.latent_dim * self.num_mixtures)
-        self.pi_layer = layers.Dense(self.num_mixtures, activation="softmax")
-
-    def call(self, x, training=False):
-        # x shape: [batch, freq_len, 12], for example
-        x = self.conv1(x)
-        x = self.dropout1(x, training=training)
-        x = self.flatten(x)      # => [batch, freq_len * 8]
-        x = self.dense_reduce(x) # => [batch, 128]
-
-        # MoG outputs
-        mu_unshaped = self.mu_layer(x)     # => [batch, latent_dim * num_mixtures]
-        mu = tf.reshape(mu_unshaped, [-1, self.num_mixtures, self.latent_dim])
-
-        logvar_unshaped = self.logvar_layer(x)
-        logvar = tf.reshape(logvar_unshaped, [-1, self.num_mixtures, self.latent_dim])
-
-        pi = self.pi_layer(x)  # => [batch, num_mixtures]
-
-        # Return (mu, logvar, pi)
-        return mu, logvar, pi
-
-class PSDEncoder(keras.Model):
-    """If shape ~ (freq_bins, 12), we do small conv -> flatten -> Dense(128).
-       Then produce a mixture-of-Gaussians of dimension latent_dim.
-    """
-    def __init__(self, latent_dim, num_mixtures=5):
-        super().__init__()
-        self.latent_dim = latent_dim
-        self.num_mixtures = num_mixtures
-        
-        self.conv1 = layers.Conv1D(8, 3, strides=1, padding='same', activation='relu')
-        self.dropout1 = layers.Dropout(0.3)
-        self.flatten = layers.Flatten()
-        self.dense_reduce = layers.Dense(128, activation='relu')
-
-        # MoG
-        self.mu_layer = layers.Dense(self.latent_dim * self.num_mixtures)
-        self.logvar_layer = layers.Dense(self.latent_dim * self.num_mixtures)
-        self.pi_layer = layers.Dense(self.num_mixtures, activation="softmax")
+        self.feature_layer = layers.Dense(feature_dim)
 
     def call(self, x, training=False):
         x = self.conv1(x)
         x = self.dropout1(x, training=training)
         x = self.flatten(x)
-        x = self.dense_reduce(x)  # => [batch, 128]
+        x = self.dense_reduce(x)
+        feature = self.feature_layer(x)
+        return feature  # shape: [batch, feature_dim]
+    
+class PSDEncoder(keras.Model):
+    """Encoder for PSD features.
+       Input shape: (freq_bins, 12) e.g. (129, 12)
+       Outputs a feature vector of dimension feature_dim.
+    """
+    def __init__(self, feature_dim):
+        super().__init__()
+        self.conv1 = layers.Conv1D(8, 3, strides=1, padding='same', activation='relu')
+        self.dropout1 = layers.Dropout(0.3)
+        self.flatten = layers.Flatten()
+        self.dense_reduce = layers.Dense(128, activation='relu')
+        self.feature_layer = layers.Dense(feature_dim)
 
-        # MoG outputs
-        mu_unshaped = self.mu_layer(x)
-        mu = tf.reshape(mu_unshaped, [-1, self.num_mixtures, self.latent_dim])
-
-        logvar_unshaped = self.logvar_layer(x)
-        logvar = tf.reshape(logvar_unshaped, [-1, self.num_mixtures, self.latent_dim])
-
-        pi = self.pi_layer(x)
-        return mu, logvar, pi
+    def call(self, x, training=False):
+        x = self.conv1(x)
+        x = self.dropout1(x, training=training)
+        x = self.flatten(x)
+        x = self.dense_reduce(x)
+        feature = self.feature_layer(x)
+        return feature  # shape: [batch, feature_dim]
 
 class RMSEncoder(keras.Model):
-    """If input shape = (batch, 12) => MLP -> mixture-of-Gaussians in a latent_dim dimension.
+    """Encoder for RMS features.
+       Input shape: (batch, 12) (one value per channel)
+       Outputs a feature vector of dimension feature_dim.
     """
-    def __init__(self, latent_dim, num_mixtures=5):
+    def __init__(self, feature_dim):
         super().__init__()
-        self.latent_dim = latent_dim
-        self.num_mixtures = num_mixtures
-        
         self.dense1 = layers.Dense(16, activation='relu')
         self.drop1 = layers.Dropout(0.3)
-
-        # Mixture of Gaussians
-        self.mu_layer = layers.Dense(self.latent_dim * self.num_mixtures)
-        self.logvar_layer = layers.Dense(self.latent_dim * self.num_mixtures)
-        self.pi_layer = layers.Dense(self.num_mixtures, activation="softmax")
+        self.feature_layer = layers.Dense(feature_dim)
 
     def call(self, x, training=False):
         x = self.dense1(x)
         x = self.drop1(x, training=training)
-
-        # MoG outputs
-        mu_unshaped = self.mu_layer(x)
-        mu = tf.reshape(mu_unshaped, [-1, self.num_mixtures, self.latent_dim])
-
-        logvar_unshaped = self.logvar_layer(x)
-        logvar = tf.reshape(logvar_unshaped, [-1, self.num_mixtures, self.latent_dim])
-
-        pi = self.pi_layer(x)
-        return mu, logvar, pi
-
-class TSFeaturesEncoder(keras.Model):
-    """
-    Merges raw, fft, rms, psd => final TS embedding of size 128.
-    Then produces a mixture-of-Gaussians of dimension = latent_dim.
-    """
-    def __init__(self, latent_dim, num_mixtures=5):
-        super().__init__()
-        self.latent_dim = latent_dim
-        self.num_mixtures = num_mixtures
-
-        self.raw_enc = RawEncoder(latent_dim, num_mixtures)
-        self.fft_enc = FFTEncoder(latent_dim, num_mixtures)
-        self.rms_enc = RMSEncoder(latent_dim, num_mixtures)
-        self.psd_enc = PSDEncoder(latent_dim, num_mixtures)
-
-        self.merge_dense = layers.Dense(128, activation='relu')  # final TS embedding
-
-        # MoG
-        self.mu_layer = layers.Dense(self.latent_dim * self.num_mixtures)
-        self.logvar_layer = layers.Dense(self.latent_dim * self.num_mixtures)
-        self.pi_layer = layers.Dense(self.num_mixtures, activation="softmax")
-
-    def call(self, raw_in, fft_in, rms_in, psd_in, training=False):
-        # sub-encoders all produce (mu, logvar, pi).
-        # If you only want the "mu" from each, you might adapt. But let's assume they are separate branches for demonstration:
-        mu_raw, logvar_raw, pi_raw = self.raw_enc(raw_in, training=training)
-        mu_fft, logvar_fft, pi_fft = self.fft_enc(fft_in, training=training)
-        mu_rms, logvar_rms, pi_rms = self.rms_enc(rms_in, training=training)
-        mu_psd, logvar_psd, pi_psd = self.psd_enc(psd_in, training=training)
-
-        # Suppose we "combine" just the underlying feature vectors from each sub-encoder's final Dense:
-        # For example, you might store them as "raw_feat = self.raw_enc.dense_reduce(...)" etc.
-        # But let's assume we do something simpler here: we skip the sub-encoders' mo g outputs and
-        # do our own final mo g from the merge. For demonstration, let's just do a trivial merge:
-
-        # This is purely example logic. If each sub-encoder returns mu/logvar, you can't just "concatenate" them as is.
-        # You might want to actually do an intermediate feature approach. 
-        # For clarity, let's assume each sub-encoder returns some "feature vector" we can combine. 
-
-        # Let's pretend we have "raw_feat" as the last hidden layer from raw_enc 
-        # => you'd need to define a method or a second object that doesn't produce mo g yet.
-
-        # For now, let's do a dummy:
-        # we won't actually combine mu/logvar from the sub-encoders, because that doesn't make sense dimensionally.
-        # We'll just do a single Dense from some combined "feature" approach:
-        
-        # E.g. we cheat and just re-run the "x" path from each sub-encoder:
-        # (But from your code snippet, raw_enc returns mu, logvar, pi. So you might need a new approach.)
-        # 
-        # Let's just show how to reshape in the final MoG. This is the key piece:
-
-        # final 128-d representation
-        combined_features = self.merge_dense( # shape => [batch, 128]
-            # could be tf.concat(...) of sub-encoder hidden states
-            # but for demonstration, let's do something trivial:
-            tf.zeros_like(mu_raw[:,0,:])  # shape [batch, latent_dim], placeholder
-        )
-
-        mu_unshaped = self.mu_layer(combined_features)  # => [batch, latent_dim * num_mixtures]
-        mu = tf.reshape(mu_unshaped, [-1, self.num_mixtures, self.latent_dim])
-
-        logvar_unshaped = self.logvar_layer(combined_features)
-        logvar = tf.reshape(logvar_unshaped, [-1, self.num_mixtures, self.latent_dim])
-
-        pi = self.pi_layer(combined_features)
-        return mu, logvar, pi
+        feature = self.feature_layer(x)
+        return feature  # shape: [batch, feature_dim]
 
 class MaskEncoder(keras.Model):
+    """Encoder for damage mask images.
+       Input shape: (256, 768)
+       Uses convolutional layers to extract spatial features and then a Dense layer to reduce to feature_dim.
     """
-    We'll reduce from shape (256, 768) => big Flatten => Dense(256),
-    then produce a mixture-of-Gaussians of dimension latent_dim.
-    """
-    def __init__(self, latent_dim, num_mixtures=5):
+    def __init__(self, feature_dim):
         super().__init__()
-        self.latent_dim = latent_dim
-        self.num_mixtures = num_mixtures
-
         self.expand = layers.Lambda(lambda x: tf.expand_dims(x, axis=-1))
         self.conv1 = layers.Conv2D(16, kernel_size=4, strides=2, padding='same', activation='relu')
         self.drop1 = layers.Dropout(0.3)
@@ -450,376 +362,366 @@ class MaskEncoder(keras.Model):
         self.drop4 = layers.Dropout(0.3)
         self.flatten = layers.Flatten()
         self.dense_reduce = layers.Dense(256, activation='relu')
-
-        # Mixture of Gaussians
-        self.mu_layer = layers.Dense(self.latent_dim * self.num_mixtures)
-        self.logvar_layer = layers.Dense(self.latent_dim * self.num_mixtures)
-        self.pi_layer = layers.Dense(self.num_mixtures, activation="softmax")
+        self.feature_layer = layers.Dense(feature_dim)
 
     def call(self, x, training=False):
-        x = self.expand(x)    # => shape [batch, 256, 768, 1]
-        x = self.conv1(x)     # => [batch, 128, 384, 16]
+        x = self.expand(x)
+        x = self.conv1(x)
         x = self.drop1(x, training=training)
-        x = self.conv2(x)     # => [batch, 64, 192, 32]
+        x = self.conv2(x)
         x = self.drop2(x, training=training)
-        x = self.conv3(x)     # => [batch, 32, 96, 64]
+        x = self.conv3(x)
         x = self.drop3(x, training=training)
-        x = self.conv4(x)     # => [batch, 16, 48, 128]
+        x = self.conv4(x)
         x = self.drop4(x, training=training)
-        x = self.flatten(x)   # => shape [batch, 16*48*128]
-        x = self.dense_reduce(x)  # => [batch, 256]
-
-        mu_unshaped = self.mu_layer(x)
-        mu = tf.reshape(mu_unshaped, [-1, self.num_mixtures, self.latent_dim])
-
-        logvar_unshaped = self.logvar_layer(x)
-        logvar = tf.reshape(logvar_unshaped, [-1, self.num_mixtures, self.latent_dim])
-
-        pi = self.pi_layer(x)
-
-        # Return
-        return mu, logvar, pi
+        x = self.flatten(x)
+        x = self.dense_reduce(x)
+        feature = self.feature_layer(x)
+        return feature  # shape: [batch, feature_dim]
 
 # ----- Combined Encoder with Multi Branches -----
 class MultiModalEncoder(keras.Model):
-    def __init__(self, latent_dim, num_mixtures=5):
+    """
+    Aggregates feature vectors from raw, FFT, RMS, PSD, and mask encoders.
+    Each sub-encoder outputs a deterministic feature vector.
+    These are concatenated (along with test_id) and passed through an MLP to produce
+    the final MoG parameters for the shared latent space.
+    
+    Outputs:
+      mu_final: [B, num_mixtures, latent_dim]
+      logvar_final: [B, num_mixtures, latent_dim]
+      pi_final: [B, num_mixtures]
+      combined_features: [B, combined_feature_dim] (for conditioning)
+    """
+    def __init__(self, latent_dim, feature_dim, num_mixtures=5):
         super().__init__()
-        self.raw_enc = RawEncoder(latent_dim, num_mixtures)
-        self.fft_enc = FFTEncoder(latent_dim, num_mixtures)
-        self.rms_enc = RMSEncoder(latent_dim, num_mixtures)
-        self.psd_enc = PSDEncoder(latent_dim, num_mixtures)
-        self.mask_enc = MaskEncoder(latent_dim, num_mixtures)
-
-        # Merge -> final MoG
-        self.merge_dense = layers.Dense(latent_dim, activation='relu')
+        self.num_mixtures = num_mixtures
+        self.raw_enc = RawEncoder(feature_dim)
+        self.fft_enc = FFTEncoder(feature_dim)
+        self.rms_enc = RMSEncoder(feature_dim)
+        self.psd_enc = PSDEncoder(feature_dim)
+        self.mask_enc = MaskEncoder(feature_dim)
+        
+        # Aggregator: concatenate features from all 5 modalities plus test_id.
+        self.fc_agg = layers.Dense(128, activation='relu')
         self.mu_layer = layers.Dense(latent_dim * num_mixtures)
         self.logvar_layer = layers.Dense(latent_dim * num_mixtures)
         self.pi_layer = layers.Dense(num_mixtures, activation="softmax")
-    
+
     def call(self, raw_in, fft_in, rms_in, psd_in, mask_in, test_id, training=False):
+        feat_raw  = self.raw_enc(raw_in, training=training)    # [B, feature_dim]
+        feat_fft  = self.fft_enc(fft_in, training=training)
+        feat_rms  = self.rms_enc(rms_in, training=training)
+        feat_psd  = self.psd_enc(psd_in, training=training)
+        feat_mask = self.mask_enc(mask_in, training=training)
         
-        # 1) Encode each branch => each is shape [batch, 5, latent_dim]
-        mu_raw,  logvar_raw,  pi_raw  = self.raw_enc(raw_in,  training)
-        mu_fft,  logvar_fft,  pi_fft  = self.fft_enc(fft_in,  training)
-        mu_rms,  logvar_rms,  pi_rms  = self.rms_enc(rms_in,  training)
-        mu_psd,  logvar_psd,  pi_psd  = self.psd_enc(psd_in,  training)
-        mu_mask, logvar_mask, pi_mask = self.mask_enc(mask_in,training)
-
-        # 2) test_id is shape [batch], or [batch,1].  Cast + reshape + tile to [batch, 5, 1]
-        test_id = tf.cast(test_id, tf.float32)          # ensure float
-        test_id = tf.reshape(test_id, [-1, 1, 1])       # => [batch, 1, 1]
-        test_id_expanded = tf.tile(test_id, [1, 5, 1])   # => [batch, 5, 1]
-
-        # 3) Concat everything. Now each mu_* is [B,5,latent_dim], test_id_expanded is [B,5,1].
-        combined_mu = tf.concat(
-            [mu_raw, mu_fft, mu_rms, mu_psd, mu_mask, test_id_expanded],
-            axis=-1
-        )
-        combined_logvar = tf.concat(
-            [logvar_raw, logvar_fft, logvar_rms, logvar_psd, logvar_mask, test_id_expanded],
-            axis=-1
-        )
-
-        # 4) Merge combined features => shape [batch, 5, <whatever sum of dims>]
-        merged_features = self.merge_dense(combined_mu)
-        # e.g. if combined_mu is [batch, 5, 641], then merged_features is [batch, 5, <latent_dim>]
-
-        # 5) Final MoG
-        #    Suppose merged_features.shape == [batch, 5, some_dim],
-        #    We then do a Dense => shape [batch, 5, latent_dim * num_mixtures], then reshape to [batch, num_mixtures, ...].
-        num_mixtures = pi_raw.shape[1]  # typically 5
-        mu_final = tf.reshape(
-            self.mu_layer(merged_features),
-            [-1, num_mixtures, merged_features.shape[-1]]
-        )
-        logvar_final = tf.reshape(
-            self.logvar_layer(merged_features),
-            [-1, num_mixtures, merged_features.shape[-1]]
-        )
-        pi_final = self.pi_layer(merged_features)  # => [batch, 5, num_mixtures? or [batch, 5, 5]
-
-        # 6) Build ts_features, mask_features the same way: must append test_id_expanded, not test_id
-        ts_features = tf.concat(
-            [mu_raw, mu_fft, mu_rms, mu_psd,
-             logvar_raw, logvar_fft, logvar_rms, logvar_psd,
-             test_id_expanded],  # same rank-3
-            axis=-1
-        )
-        mask_features = tf.concat(
-            [mu_mask, logvar_mask, test_id_expanded],
-            axis=-1
-        )
+        # Process test_id: convert to float and expand dimension => [B, 1]
+        test_id = tf.cast(test_id, tf.float32)
+        test_id = tf.expand_dims(test_id, axis=-1)
         
-        return mu_final, logvar_final, pi_final, ts_features, mask_features
-
+        # Concatenate all features: [B, (5*feature_dim + 1)]
+        combined_features = tf.concat([feat_raw, feat_fft, feat_rms, feat_psd, feat_mask, test_id], axis=-1)
+        
+        # Pass through aggregator MLP.
+        agg = self.fc_agg(combined_features)  # [B, 128]
+        mu_unshaped = self.mu_layer(agg)      # [B, latent_dim*num_mixtures]
+        logvar_unshaped = self.logvar_layer(agg)  # [B, latent_dim*num_mixtures]
+        pi_final = self.pi_layer(agg)          # [B, num_mixtures]
+        
+        # Reshape mu and logvar to [B, num_mixtures, latent_dim]
+        latent_dim = tf.shape(mu_unshaped)[-1] // self.num_mixtures
+        mu_final = tf.reshape(mu_unshaped, [-1, self.num_mixtures, latent_dim])
+        logvar_final = tf.reshape(logvar_unshaped, [-1, self.num_mixtures, latent_dim])
+        
+        return mu_final, logvar_final, pi_final, combined_features
+       
 # ----- Decoders with Cross-Attention -----
-class TimeSeriesDecoder(Model):
+class TimeSeriesDecoder(keras.Model):
     """
-    Decoder for a 5s segment => shape (1000, 12).
-    We'll do 2 upsamplings: 250->500->1000
-    But with smaller channel dimensions.
+    Decoder for a 5s segment of raw time-series data.
+    Input: latent vector z.
+    Uses cross-attention on mask features.
+    Output shape: (1000, 12)
     """
     def __init__(self):
         super(TimeSeriesDecoder, self).__init__()
-        # 1) Fully connect to 250*128 instead of 250*256
         self.fc = layers.Dense(250 * 128, activation='relu')
         self.reshape_layer = layers.Reshape((250, 128))
-
-        # cross-attention
         self.attention_layer = layers.MultiHeadAttention(num_heads=4, key_dim=128)
         self.mask_proj_layer = layers.Dense(128)
-
-        # upsampling
-        self.upsample1 = layers.UpSampling1D(size=2)   # 250->500
+        self.upsample1 = layers.UpSampling1D(size=2)   # 250 -> 500
         self.conv1 = layers.Conv1D(32, kernel_size=3, padding='same', activation='relu')
         self.drop1 = layers.Dropout(0.3)
-        
-        self.upsample2 = layers.UpSampling1D(size=2)   # 500->1000
+        self.upsample2 = layers.UpSampling1D(size=2)   # 500 -> 1000
         self.conv2 = layers.Conv1D(16, kernel_size=3, padding='same', activation='relu')
         self.drop2 = layers.Dropout(0.3)
-
-        # final conv => 12 channels
         self.conv_out = layers.Conv1D(12, kernel_size=3, padding='same')
 
     def call(self, z, mask_features=None, training=False):
-        x = self.fc(z)                           # => [batch, 250*128]
-        x = self.reshape_layer(x)                # => [batch, 250, 128]
-
-        # cross-attention from mask
+        x = self.fc(z)
+        x = self.reshape_layer(x)  # [B, 250, 128]
         if mask_features is not None:
-            mask_proj = self.mask_proj_layer(mask_features)   # => [batch, 128]
-            mask_proj = tf.expand_dims(mask_proj, axis=1)      # => [batch, 1, 128]
-            mask_proj = tf.tile(mask_proj, [1, tf.shape(x)[1], 1])  # => [batch, 250, 128]
+            mask_proj = self.mask_proj_layer(mask_features)  # [B, 128]
+            mask_proj = tf.expand_dims(mask_proj, axis=1)     # [B, 1, 128]
+            mask_proj = tf.tile(mask_proj, [1, tf.shape(x)[1], 1])
             attn_output = self.attention_layer(query=x, value=mask_proj, key=mask_proj)
             x = x + attn_output
-
-        # upsample1 => 500
         x = self.upsample1(x)
         x = self.conv1(x)
         x = self.drop1(x, training=training)
-
-        # upsample2 => 1000
         x = self.upsample2(x)
         x = self.conv2(x)
         x = self.drop2(x, training=training)
-
-        # final conv => shape [batch, 1000, 12]
         x = self.conv_out(x)
-        return x
-
-class MaskDecoder(Model):
+        return x  # [B, 1000, 12]
+ 
+class MaskDecoder(keras.Model):
     """
     Decoder for damage mask reconstruction.
-    Reconstructs output of shape [batch, 256, 768].
-    Includes a cross-attention layer to integrate time-series features.
+    For sparse masks, we use an output activation (sigmoid) and can later combine Dice or focal losses.
+    Output shape: (256, 768)
     """
     def __init__(self):
         super(MaskDecoder, self).__init__()
-        # reduce dimension
-        self.fc = layers.Dense(48 * 16 * 64, activation='relu')  
+        self.fc = layers.Dense(48 * 16 * 64, activation='relu')
         self.reshape_layer = layers.Reshape((48, 16, 64))
-        
         self.attention_layer = layers.MultiHeadAttention(num_heads=4, key_dim=64)
         self.ts_proj_layer = layers.Dense(64)
-
         self.deconv1 = layers.Conv2DTranspose(32, kernel_size=4, strides=2, padding='same', activation='relu')
         self.deconv2 = layers.Conv2DTranspose(16, kernel_size=4, strides=2, padding='same', activation='relu')
         self.deconv3 = layers.Conv2DTranspose(8, kernel_size=4, strides=2, padding='same', activation='relu')
         self.deconv4 = layers.Conv2DTranspose(1, kernel_size=4, strides=2, padding='same', activation='sigmoid')
 
     def call(self, z, ts_features=None, training=False):
-        x = self.fc(z)                 # => [batch, 48*16*64]
-        x = self.reshape_layer(x)      # => [batch, 48, 16, 64]
-        
+        x = self.fc(z)
+        x = self.reshape_layer(x)  # [B, 48, 16, 64]
         b = tf.shape(x)[0]
         seq_len = 48 * 16
         x_seq = tf.reshape(x, (b, seq_len, 64))
-        
         if ts_features is not None:
-            ts_proj = self.ts_proj_layer(ts_features)  # => [batch, 64]
-            ts_proj = tf.expand_dims(ts_proj, axis=1)   # => [batch, 1, 64]
-            ts_proj = tf.tile(ts_proj, [1, seq_len, 1]) # => [batch, 48*16, 64]
+            ts_proj = self.ts_proj_layer(ts_features)  # [B, 64]
+            ts_proj = tf.expand_dims(ts_proj, axis=1)   # [B, 1, 64]
+            ts_proj = tf.tile(ts_proj, [1, seq_len, 1])
             attn_output = self.attention_layer(query=x_seq, value=ts_proj, key=ts_proj)
             x_seq = x_seq + attn_output
-        
         x = tf.reshape(x_seq, (b, 48, 16, 64))
-        
-        x = self.deconv1(x)  # => [batch, 96, 32, 32]
-        x = self.deconv2(x)  # => [batch, 192, 64, 16]
-        x = self.deconv3(x)  # => [batch, 384, 128, 8]
-        x = self.deconv4(x)  # => [batch, 768, 256, 1]
-        
-        # shape => [batch, 768, 256, 1], but you want [batch, 256, 768]? 
-        # So we do the same transform:
-        x = tf.squeeze(x, axis=-1)             # => [batch, 768, 256]
-        x = tf.transpose(x, perm=[0, 2, 1])    # => [batch, 256, 768]
-        return x
+        x = self.deconv1(x)
+        x = self.deconv2(x)
+        x = self.deconv3(x)
+        x = self.deconv4(x)
+        x = tf.squeeze(x, axis=-1)
+        x = tf.transpose(x, perm=[0, 2, 1])
+        return x  # [B, 256, 768]
 
 # ----- VAE with Self-Attention in the Bottleneck -----
-class VAE(Model):
+class VAE(keras.Model):
     """
-    Full VAE with multi encoders and dual decoders.
-    Applies self-attention in the latent bottleneck and uses cross-attention in decoders.
-    Returns 7 items so your training loop can unpack them as:
-        (recon_ts, recon_mask,
-         (mu_raw,  logvar_raw,  pi_raw),
-         (mu_fft,  logvar_fft,  pi_fft),
-         (mu_rms,  logvar_rms,  pi_rms),
-         (mu_psd,  logvar_psd,  pi_psd),
-         (mu_mask, logvar_mask, pi_mask)) = model(...)
+    VAE that:
+      - Uses sub-encoders to extract deterministic feature vectors.
+      - Aggregates these features (plus test_id) into a shared latent distribution modeled as a MoG.
+      - Reparameterizes using a weighted average of the mixture components.
+      - Decodes the latent to produce raw time-series and mask outputs.
+      
+    Returns: recon_ts, recon_mask, (mu_final, logvar_final, pi_final)
     """
-    def __init__(self, latent_dim):
+    def __init__(self, latent_dim, feature_dim, num_mixtures=5):
         super(VAE, self).__init__()
-        self.encoder = MultiModalEncoder(latent_dim)  # holds raw_enc, fft_enc, etc.
+        self.num_mixtures = num_mixtures
+        self.encoder = MultiModalEncoder(latent_dim, feature_dim, num_mixtures)
         self.decoder_ts = TimeSeriesDecoder()
         self.decoder_mask = MaskDecoder()
         self.token_count = 8
         self.token_dim = latent_dim // self.token_count
         self.self_attention_layer = layers.MultiHeadAttention(num_heads=4, key_dim=self.token_dim)
-        
-    def call(self, raw_in, fft_in, rms_in, psd_in, mask_in, test_id_in, training=False):
-        """
-        We call each sub-encoder through self.encoder.<subencoder>.
-        Then we do any final combination or decoding. 
-        Finally, we return EXACTLY 7 items, matching your training loop's unpack.
-        """
 
-        # 1) Sub-encoders exist in self.encoder, so we call them like this:
-        mu_raw,  logvar_raw,  pi_raw  = self.encoder.raw_enc(raw_in,  training=training)
-        mu_fft,  logvar_fft,  pi_fft  = self.encoder.fft_enc(fft_in,  training=training)
-        mu_rms,  logvar_rms,  pi_rms  = self.encoder.rms_enc(rms_in,  training=training)
-        mu_psd,  logvar_psd,  pi_psd  = self.encoder.psd_enc(psd_in,  training=training)
-        mu_mask, logvar_mask, pi_mask = self.encoder.mask_enc(mask_in,training=training)
-
-        # 2) A trivial "reconstruction" for demonstration (just returns the inputs).
-        #    In a real VAE, you'd typically do some combination, reparam, decode, etc.
-        recon_ts   = raw_in
-        recon_mask = mask_in
-
-        # 3) Return the 7 top-level items that your training loop expects
-        return (
-            recon_ts,
-            recon_mask,
-            (mu_raw,  logvar_raw,  pi_raw),
-            (mu_fft,  logvar_fft,  pi_fft),
-            (mu_rms,  logvar_rms,  pi_rms),
-            (mu_psd,  logvar_psd,  pi_psd),
-            (mu_mask, logvar_mask, pi_mask)
-        )
-
-    def generate(self, z):
+    def reparameterize(self, mu, logvar, pi):
         """
-        Generates synthetic data from a *given latent vector* z.
-        z is shape [batch, latent_dim].
+        For simplicity, we compute the weighted average of the mixture means.
+        mu: [B, num_mixtures, latent_dim], pi: [B, num_mixtures]
+        Returns: z of shape [B, latent_dim]
         """
+        z = tf.reduce_sum(pi[..., tf.newaxis] * mu, axis=1)
+        return z
+
+    def call(self, raw_in, fft_in, rms_in, psd_in, mask_in, test_id, training=False):
+        # 1) Obtain aggregated latent MoG parameters from the MultiModalEncoder.
+        mu_final, logvar_final, pi_final, agg_features = self.encoder(raw_in, fft_in, rms_in, psd_in, mask_in, test_id, training=training)
+        # 2) Sample latent vector z using weighted average.
+        z = self.reparameterize(mu_final, logvar_final, pi_final)  # [B, latent_dim]
+        # 3) Optionally refine z with self-attention.
         z_tokens = tf.reshape(z, (-1, self.token_count, self.token_dim))
         attn_output = self.self_attention_layer(query=z_tokens, key=z_tokens, value=z_tokens)
         z_refined = tf.reshape(attn_output, (-1, tf.shape(z)[-1]))
-        
-        # For unconditional generation, we pass mask_features=None, ts_features=None
+        # 4) Decode z to produce reconstructions.
+        recon_ts = self.decoder_ts(z_refined, mask_features=agg_features, training=training)
+        recon_mask = self.decoder_mask(z_refined, ts_features=agg_features, training=training)
+        return recon_ts, recon_mask, (mu_final, logvar_final, pi_final)
+
+    def generate(self, z):
+        z_tokens = tf.reshape(z, (-1, self.token_count, self.token_dim))
+        attn_output = self.self_attention_layer(query=z_tokens, key=z_tokens, value=z_tokens)
+        z_refined = tf.reshape(attn_output, (-1, tf.shape(z)[-1]))
         recon_ts = self.decoder_ts(z_refined, mask_features=None, training=False)
         recon_mask = self.decoder_mask(z_refined, ts_features=None, training=False)
         return recon_ts, recon_mask
 
-
 # ----- Prior estimation -----
-def mixture_of_gaussians_log_prob(z, mus, logvars, pis):
+def mixture_of_gaussians_log_prob(z, mus, logvars, pis, eps=1e-8):
     """
     Evaluate log p(z) for a mixture of Gaussians:
-      p(z) = sum_k pi_k * N(z | mus[k], exp(logvars[k]))
-    z: shape (batch, latent_dim)
-    mus: shape (K, latent_dim)
-    logvars: shape (K, latent_dim)
-    pis: shape (K,) mixture weights
-    returns log p(z) of shape (batch,)
+      p(z) = sum_k pis[k] * N(z | mus[k], exp(logvars[k]))
+
+    Args:
+      z: shape (batch, latent_dim)
+      mus: shape (K, latent_dim)
+      logvars: shape (K, latent_dim)
+      pis: shape (K,) => mixture weights (should sum to 1)
+      eps: small constant to avoid log(0)
+
+    Returns:
+      log_p(z), shape (batch,)
     """
+    # 1) Safe clamp mixture weights => never zero
+    pis_safe = pis + eps
+    pis_safe = pis_safe / tf.reduce_sum(pis_safe)  # re-normalize
+
+    # 2) Clip logvars to safe range
+    logvars = tf.clip_by_value(logvars, -10.0, 10.0)
+
     # Expand dims to broadcast
-    K = mus.shape[0]
-    z_expanded = tf.expand_dims(z, axis=1)         # (batch, 1, latent_dim)
-    mus = tf.expand_dims(mus, axis=0)             # (1, K, latent_dim)
-    logvars = tf.expand_dims(logvars, axis=0)     # (1, K, latent_dim)
-    
-    # log p(z|component k)
-    # = -0.5 * [sum over dims of ((z - mu)^2 / exp(logvar) + logvar) ] - const
-    const_term = tf.cast(0.5 * z.shape[-1] * np.log(2 * np.pi), tf.float32)
+    K = tf.shape(mus)[0]  # K
+    z_expanded = tf.expand_dims(z, axis=1)      # (batch, 1, latent_dim)
+    mus = tf.expand_dims(mus, axis=0)           # (1, K, latent_dim)
+    logvars = tf.expand_dims(logvars, axis=0)   # (1, K, latent_dim)
+
+    # log p(z | comp k)
+    # = -0.5 * [(z - mu)^2 / var + log var] - const
+    const_term = 0.5 * tf.cast(z.shape[-1], tf.float32) * np.log(2.0 * np.pi)
     inv_var = tf.exp(-logvars)
     log_p_k = -0.5 * tf.reduce_sum(inv_var * tf.square(z_expanded - mus), axis=-1) \
               - 0.5 * tf.reduce_sum(logvars, axis=-1) \
-              - const_term  # shape (batch, K)
-    
-    # weighting by mixture pi_k
-    weighted_log_p_k = log_p_k + tf.math.log(pis)  # shape (batch, K)
-    
-    # stable log-sum-exp over k
-    log_p = tf.reduce_logsumexp(weighted_log_p_k, axis=-1)  # shape (batch,)
+              - const_term  # => shape (batch, K)
+
+    # weighting by mixture pi_k => log pi_k
+    weighted_log_p_k = log_p_k + tf.math.log(pis_safe)  # => shape (batch, K)
+
+    # stable log-sum-exp across k
+    log_p = tf.reduce_logsumexp(weighted_log_p_k, axis=-1)  # => (batch,)
+    tf.debugging.assert_all_finite(log_p, "NaN in mixture_of_gaussians_log_prob")
     return log_p
 
-def mog_log_prob_per_example(z, mu_q, logvar_q, pi_q):
+def mog_log_prob_per_example(z, mu_q, logvar_q, pi_q, eps=1e-8):
     """
     Evaluate log q_i(z_i), where q_i is a mixture of Gaussians specific
     to each batch example i.
 
-    z:        shape (batch, latent_dim)
-    mu_q:     shape (batch, K, latent_dim)
-    logvar_q: shape (batch, K, latent_dim)
-    pi_q:     shape (batch, K)
-    returns:  shape (batch,) => log of the mixture pdf at each z_i
+    Args:
+      z: shape (batch, latent_dim)
+      mu_q: shape (batch, K, latent_dim)
+      logvar_q: shape (batch, K, latent_dim)
+      pi_q: shape (batch, K)
+      eps: small constant to avoid log(0)
+
+    Returns:
+      shape (batch,) => log of the mixture pdf at each z_i
     """
+    # 1) clamp mixture weights => no zero
+    pi_q_safe = pi_q + eps
+    pi_q_safe = pi_q_safe / tf.reduce_sum(pi_q_safe, axis=1, keepdims=True)  # per example
+
+    # 2) clamp logvar => [-10, 10]
+    logvar_q = tf.clip_by_value(logvar_q, -10.0, 10.0)
+
     batch_size = tf.shape(z)[0]
     K = tf.shape(mu_q)[1]
 
-    # Expand z => [batch, 1, latent_dim]
-    z_expanded = tf.expand_dims(z, axis=1)  # => [batch, 1, latent_dim]
-    inv_var = tf.exp(-logvar_q)            # => [batch, K, latent_dim]
-    diff_sq = tf.square(z_expanded - mu_q) # => [batch, K, latent_dim]
+    # expand z => [batch, 1, latent_dim]
+    z_expanded = tf.expand_dims(z, axis=1)   # => [batch, 1, latent_dim]
+    inv_var = tf.exp(-logvar_q)             # => [batch, K, latent_dim]
+    diff_sq = tf.square(z_expanded - mu_q)  # => [batch, K, latent_dim]
 
-    # log N(z|mu, var) across latent_dim
+    # log N(z|mu, var)
     const_term = 0.5 * tf.cast(z.shape[-1], tf.float32) * np.log(2.0 * np.pi)
     log_probs_per_comp = -0.5 * tf.reduce_sum(inv_var * diff_sq, axis=-1) \
                          - 0.5 * tf.reduce_sum(logvar_q, axis=-1) \
                          - const_term
     # => shape [batch, K]
 
-    # weight by pi_q[i,j]
-    pi_q_safe = pi_q + 1e-10
+    # add log pi_q
     weighted = log_probs_per_comp + tf.math.log(pi_q_safe)  # => [batch, K]
+    log_mix = tf.reduce_logsumexp(weighted, axis=-1)        # => [batch]
 
-    # sum across j in log-space
-    log_mix = tf.reduce_logsumexp(weighted, axis=-1)  # => [batch]
+    tf.debugging.assert_all_finite(log_mix, "NaN in mog_log_prob_per_example")
     return log_mix
 
 def kl_q_p_mixture(
-    mu_q, logvar_q, pi_q,     # posterior mixture [batch, K, latent_dim], [batch, K], etc.
-    mu_p, logvar_p, pi_p,     # prior mixture [K, latent_dim], [K], etc.
-    num_samples=1
+    mu_q, logvar_q, pi_q,       # posterior mixture: shape [batch, K, latent_dim], [batch, K], etc.
+    mu_p, logvar_p, pi_p,       # prior mixture: shape [K, latent_dim], [K], etc.
+    num_samples=1,
+    eps=1e-8
 ):
+    """
+    KL( q(z) || p(z) ) where both q, p are mixture-of-Gaussians.
+
+    We do:
+    1) sample z ~ q
+    2) compute log_q(z) - log_p(z)
+    3) average over multiple samples if needed
+    """
+    # Quick checks
+    tf.debugging.assert_all_finite(mu_q,     "mu_q is NaN/Inf in kl_q_p_mixture")
+    tf.debugging.assert_all_finite(logvar_q, "logvar_q is NaN/Inf in kl_q_p_mixture")
+    tf.debugging.assert_all_finite(pi_q,     "pi_q is NaN/Inf in kl_q_p_mixture")
+    tf.debugging.assert_all_finite(mu_p,     "mu_p is NaN/Inf in kl_q_p_mixture")
+    tf.debugging.assert_all_finite(logvar_p, "logvar_p is NaN/Inf in kl_q_p_mixture")
+    tf.debugging.assert_all_finite(pi_p,     "pi_p is NaN/Inf in kl_q_p_mixture")
+
+    # clamp posterior mixture weights
+    pi_q_safe = pi_q + eps  # shape [batch, K]
+    pi_q_safe = pi_q_safe / tf.reduce_sum(pi_q_safe, axis=1, keepdims=True)
+
+    # clamp prior mixture weights
+    pi_p_safe = pi_p + eps  # shape [K,]
+    pi_p_safe = pi_p_safe / tf.reduce_sum(pi_p_safe)
+
+    # clamp logvar
+    logvar_q = tf.clip_by_value(logvar_q, -10.0, 10.0)
+    logvar_p = tf.clip_by_value(logvar_p, -10.0, 10.0)
+
     batch_size = tf.shape(mu_q)[0]
     K = tf.shape(mu_q)[1]
     latent_dim = tf.shape(mu_q)[2]
 
     kl_accum = 0.0
     for _ in range(num_samples):
-        # Force chosen_js to be int32
-        chosen_js = tf.random.categorical(tf.math.log(pi_q), num_samples=1, dtype=tf.int32)
+        # pick a mixture component j ~ pi_q
+        chosen_js = tf.random.categorical(tf.math.log(pi_q_safe), num_samples=1, dtype=tf.int32)
         chosen_js = tf.squeeze(chosen_js, axis=1)  # => shape (batch,)
 
         batch_idxs = tf.range(batch_size, dtype=tf.int32)
         gather_idxs = tf.stack([batch_idxs, chosen_js], axis=1)  # => shape (batch,2)
 
-        # pick mu_q[i,j], logvar_q[i,j]
+        # gather mu_q[i,j], logvar_q[i,j]
         chosen_mu = tf.gather_nd(mu_q, gather_idxs)      # => [batch, latent_dim]
         chosen_lv = tf.gather_nd(logvar_q, gather_idxs)  # => [batch, latent_dim]
 
-        eps = tf.random.normal(tf.shape(chosen_mu))
-        z_sample = chosen_mu + tf.exp(0.5 * chosen_lv) * eps  # => [batch, latent_dim]
+        # sample z
+        eps_ = tf.random.normal(tf.shape(chosen_mu))
+        chosen_lv = tf.clip_by_value(chosen_lv, -10.0, 10.0)  # again clamp
+        z_sample = chosen_mu + tf.exp(0.5 * chosen_lv) * eps_  # => [batch, latent_dim]
 
-        log_qz = mog_log_prob_per_example(z_sample, mu_q, logvar_q, pi_q)
-        log_pz = mixture_of_gaussians_log_prob(z_sample, mu_p, logvar_p, pi_p)
+        # Evaluate log q(z), log p(z)
+        log_qz = mog_log_prob_per_example(z_sample, mu_q, logvar_q, pi_q_safe, eps=eps)
+        log_pz = mixture_of_gaussians_log_prob(z_sample, mu_p, logvar_p, pi_p_safe, eps=eps)
 
-        kl_accum += (log_qz - log_pz)
+        diff = (log_qz - log_pz)
+        tf.debugging.assert_all_finite(diff, "NaN in (log_qz - log_pz)")
+
+        kl_accum += diff
 
     kl_values = kl_accum / tf.cast(num_samples, tf.float32)
     kl_mean = tf.reduce_mean(kl_values)
+    tf.debugging.assert_all_finite(kl_mean, "NaN in kl_mean (kl_q_p_mixture)")
     return kl_mean
 
 def gaussian_log_prob(z, mu, logvar):
@@ -831,26 +733,6 @@ def gaussian_log_prob(z, mu, logvar):
     tmp = tf.reduce_sum(inv_var * tf.square(z - mu), axis=-1)
     log_det = 0.5 * tf.reduce_sum(logvar, axis=-1)
     return tf.cast(const_term, tf.float32) + 0.5 * tmp + log_det
-
-def get_mog_params_per_branch():
-    """
-    Returns a dict of { 'raw': (mus, logvars, pis), 'fft': ..., ... }
-    for each branch's global MoG prior parameters:
-      mog_mus_raw, mog_logvars_raw, pis_raw, etc.
-    """
-    pis_raw  = tf.nn.softmax(mog_pis_logits_raw)
-    pis_fft  = tf.nn.softmax(mog_pis_logits_fft)
-    pis_rms  = tf.nn.softmax(mog_pis_logits_rms)
-    pis_psd  = tf.nn.softmax(mog_pis_logits_psd)
-    pis_mask = tf.nn.softmax(mog_pis_logits_mask)
-
-    return {
-        'raw':  (mog_mus_raw,  mog_logvars_raw,  pis_raw),
-        'fft':  (mog_mus_fft,  mog_logvars_fft,  pis_fft),
-        'rms':  (mog_mus_rms,  mog_logvars_rms,  pis_rms),
-        'psd':  (mog_mus_psd,  mog_logvars_psd,  pis_psd),
-        'mask': (mog_mus_mask, mog_logvars_mask, pis_mask)
-    }
 
 def sample_from_mog(mu, logvar, pi):
     """
@@ -872,36 +754,6 @@ def sample_from_mog(mu, logvar, pi):
     # shape [latent_dim], expand to [1, latent_dim] if needed
     return tf.expand_dims(z, axis=0)
 
-def initialize_mog_from_precomputed(branch, mus_init, logvars_init, pis_init):
-    """
-    branch: one of 'raw', 'fft', 'rms', 'psd', 'mask'
-    mus_init: shape [K, sub_latent_dim]
-    logvars_init: shape [K, sub_latent_dim]
-    pis_init: shape [K,]
-    """
-    if branch == 'raw':
-        mog_mus_raw.assign(mus_init)
-        mog_logvars_raw.assign(logvars_init)
-        mog_pis_logits_raw.assign(tf.math.log(pis_init + 1e-8))
-    elif branch == 'fft':
-        mog_mus_fft.assign(mus_init)
-        mog_logvars_fft.assign(logvars_init)
-        mog_pis_logits_fft.assign(tf.math.log(pis_init + 1e-8))
-    elif branch == 'rms':
-        mog_mus_rms.assign(mus_init)
-        mog_logvars_rms.assign(logvars_init)
-        mog_pis_logits_rms.assign(tf.math.log(pis_init + 1e-8))
-    elif branch == 'psd':
-        mog_mus_psd.assign(mus_init)
-        mog_logvars_psd.assign(logvars_init)
-        mog_pis_logits_psd.assign(tf.math.log(pis_init + 1e-8))
-    elif branch == 'mask':
-        mog_mus_mask.assign(mus_init)
-        mog_logvars_mask.assign(logvars_init)
-        mog_pis_logits_mask.assign(tf.math.log(pis_init + 1e-8))
-    else:
-        raise ValueError(f"Unknown branch: {branch}")
-
 # ~~~~~~~~~~~~~~~~ DEFINE PER-BRANCH MOG PARAMETERS ~~~~~~~~~~~~~~~~~
 K = 5  # Number of mixture components
 latent_dim_raw = 128 # Must match the latend_dim in main
@@ -910,184 +762,180 @@ latent_dim_rms = 128
 latent_dim_psd = 128
 latent_dim_mask = 128
 
-mog_mus_raw     = tf.Variable(tf.random.normal([K, latent_dim_raw]), name="mog_mus_raw", trainable=True)
-mog_logvars_raw = tf.Variable(tf.zeros([K, latent_dim_raw]), name="mog_logvars_raw", trainable=True)
-mog_pis_logits_raw = tf.Variable(tf.zeros([K]), name="mog_pis_logits_raw", trainable=True)
-
-mog_mus_fft     = tf.Variable(tf.random.normal([K, latent_dim_fft]), name="mog_mus_fft", trainable=True)
-mog_logvars_fft = tf.Variable(tf.zeros([K, latent_dim_fft]), name="mog_logvars_fft", trainable=True)
-mog_pis_logits_fft = tf.Variable(tf.zeros([K]), name="mog_pis_logits_fft", trainable=True)
-
-mog_mus_rms     = tf.Variable(tf.random.normal([K, latent_dim_rms]), name="mog_mus_rms", trainable=True)
-mog_logvars_rms = tf.Variable(tf.zeros([K, latent_dim_rms]), name="mog_logvars_rms", trainable=True)
-mog_pis_logits_rms = tf.Variable(tf.zeros([K]), name="mog_pis_logits_rms", trainable=True)
-
-mog_mus_psd     = tf.Variable(tf.random.normal([K, latent_dim_psd]), name="mog_mus_psd", trainable=True)
-mog_logvars_psd = tf.Variable(tf.zeros([K, latent_dim_psd]), name="mog_logvars_psd", trainable=True)
-mog_pis_logits_psd = tf.Variable(tf.zeros([K]), name="mog_pis_logits_psd", trainable=True)
-
-mog_mus_mask     = tf.Variable(tf.random.normal([K, latent_dim_mask]), name="mog_mus_mask", trainable=True)
-mog_logvars_mask = tf.Variable(tf.zeros([K, latent_dim_mask]), name="mog_logvars_mask", trainable=True)
-mog_pis_logits_mask = tf.Variable(tf.zeros([K]), name="mog_pis_logits_mask", trainable=True)
-
 # ----- Training Procedure -----
-def train_vae(model, dataset, optimizer, num_epochs=100, use_mog=True):
+def train_vae(
+    model,
+    train_dataset,
+    val_dataset,
+    optimizer,
+    num_epochs=100,
+    use_mog=True
+):
     """
-    Trains the VAE with per-branch MoG priors (if use_mog=True).
-    Balances reconstruction loss: 50% time-series, 50% mask.
-    Summation of KL from each encoder branch.
-
-    Args:
-        model: Your VAE model instance that returns:
-               recon_ts, recon_mask, sub-encoder stats per branch
-        dataset: A tf.data.Dataset yielding 6 items: 
-                 (raw_in, fft_in, rms_in, psd_in, mask_in, test_id_in)
-        optimizer: tf.keras.optimizers.* instance
-        num_epochs: Number of training epochs
-        use_mog: If True, we do separate KL with each branch's MoG prior
-
-    Returns:
-        The trained model
+    Train loop with added tf.debugging checks.
+    Returns 6 lists: train_total, train_recon, train_kl, val_total, val_recon, val_kl.
+    This version uses the aggregated MoG from the MultiModalEncoder.
     """
     mse_loss_fn = tf.keras.losses.MeanSquaredError()
-
-    # Collect trainable variables (model + your MoG parameters if needed)
+    
+    # Collect trainable variables from the model only.
     all_trainables = model.trainable_variables
-    if use_mog:
-        all_trainables += [
-            mog_mus_raw,  mog_logvars_raw,  mog_pis_logits_raw,
-            mog_mus_fft,  mog_logvars_fft,  mog_pis_logits_fft,
-            mog_mus_rms,  mog_logvars_rms,  mog_pis_logits_rms,
-            mog_mus_psd,  mog_logvars_psd,  mog_pis_logits_psd,
-            mog_mus_mask, mog_logvars_mask, mog_pis_logits_mask
-        ]
 
-    # Quick check of dataset size
-    dataset_size = 0
-    for _ in dataset:
-        dataset_size += 1
-    print(f"Dataset contains {dataset_size} batches")
-    if dataset_size == 0:
-        raise ValueError("Dataset is empty!")
+    # Lists to store the losses.
+    train_total_losses = []
+    train_recon_losses = []
+    train_kl_losses = []
+
+    val_total_losses = []
+    val_recon_losses = []
+    val_kl_losses = []
 
     for epoch in range(num_epochs):
-        print(f"\nStarting epoch {epoch+1}/{num_epochs}")
-        total_loss = 0.0
-        total_recon_ts = 0.0
-        total_recon_mask = 0.0
-        num_batches = 0
+        # ---- TRAINING ----
+        epoch_train_total = 0.0
+        epoch_train_recon = 0.0
+        epoch_train_kl = 0.0
+        train_steps = 0
 
-        for step, (raw_in, fft_in, rms_in, psd_in, mask_in, test_id_in) in enumerate(dataset):
+        for step, (raw_in, fft_in, rms_in, psd_in, mask_in, test_id_in) in enumerate(train_dataset):
             with tf.GradientTape() as tape:
-                # Forward pass
-                (
-                    recon_ts, 
-                    recon_mask, 
-                    (mu_raw,  logvar_raw,  pi_raw),
-                    (mu_fft,  logvar_fft,  pi_fft),
-                    (mu_rms,  logvar_rms,  pi_rms),
-                    (mu_psd,  logvar_psd,  pi_psd),
-                    (mu_mask, logvar_mask, pi_mask)
-                ) = model(raw_in, fft_in, rms_in, psd_in, mask_in, test_id_in, training=True)
+                # Forward pass: note the model now returns aggregated latent parameters.
+                (recon_ts, recon_mask, (mu_final, logvar_final, pi_final)) = model(
+                    raw_in, fft_in, rms_in, psd_in, mask_in, test_id_in, training=True
+                )
 
-                # Check for NaNs
-                if (tf.math.reduce_any(tf.math.is_nan(recon_ts)) or
-                    tf.math.reduce_any(tf.math.is_nan(recon_mask))):
-                    print("WARNING: NaN values detected in reconstruction.")
-                    continue
+                # DEBUG ASSERTS
+                tf.debugging.assert_all_finite(recon_ts, "NaN in recon_ts")
+                tf.debugging.assert_all_finite(recon_mask, "NaN in recon_mask")
+                tf.debugging.assert_all_finite(mu_final, "NaN in mu_final")
 
-                # Reconstruction losses
+                # 1) Time-series reconstruction loss
                 loss_ts = mse_loss_fn(raw_in, recon_ts)
-                loss_mask_mse = mse_loss_fn(mask_in, recon_mask)
+                tf.debugging.assert_all_finite(loss_ts, "NaN in loss_ts")
+
+                # 2) Mask reconstruction loss (using focal + dice)
+                loss_mask_focal = focal_loss(mask_in, recon_mask, alpha=0.25, gamma=2.0)
+                tf.debugging.assert_all_finite(loss_mask_focal, "NaN in focal_loss")
                 loss_mask_dice = dice_loss(recon_mask, mask_in)
+                tf.debugging.assert_all_finite(loss_mask_dice, "NaN in dice_loss")
+                mask_recon_loss = 0.5 * (loss_mask_focal + loss_mask_dice)
+                tf.debugging.assert_all_finite(mask_recon_loss, "NaN in mask_recon_loss")
 
+                # Weighted reconstruction loss: 50% TS, 50% mask.
+                recon_loss = 0.5 * (loss_ts + mask_recon_loss)
+                tf.debugging.assert_all_finite(recon_loss, "NaN in recon_loss")
+
+                # 3) KL Loss using the aggregated latent parameters.
                 if use_mog:
-                    # For each subencoder, do kl_q_p_mixture with that branch's posterior & prior
-                    mog_dict = get_mog_params_per_branch()
-
-                    # mog_dict['raw'] => (mog_mus_raw, mog_logvars_raw, pis_raw)
-                    # shape => ([K, latent_dim], [K, latent_dim], [K,])
-                    # Posterior => mu_raw (batch,K,latent_dim), logvar_raw (batch,K,latent_dim), pi_raw (batch,K)
-
-                    kl_raw = kl_q_p_mixture(
-                        mu_q=mu_raw,
-                        logvar_q=logvar_raw,
-                        pi_q=pi_raw,
-                        mu_p=mog_dict['raw'][0],
-                        logvar_p=mog_dict['raw'][1],
-                        pi_p=mog_dict['raw'][2],
+                    # Define the prior as a uniform MoG: zero mean, zero logvar, uniform pi.
+                    latent_dim = tf.shape(mu_final)[-1]
+                    num_mixtures = tf.shape(pi_final)[-1]  # pi_final shape: [B, num_mixtures]
+                    prior_mu = tf.zeros([num_mixtures, latent_dim])
+                    prior_logvar = tf.zeros([num_mixtures, latent_dim])
+                    prior_pi = tf.ones([num_mixtures]) / tf.cast(num_mixtures, tf.float32)
+                    
+                    kl_loss = kl_q_p_mixture(
+                        mu_q=mu_final, logvar_q=logvar_final, pi_q=pi_final,
+                        mu_p=prior_mu, logvar_p=prior_logvar, pi_p=prior_pi,
                         num_samples=1
                     )
-                    kl_fft = kl_q_p_mixture(
-                        mu_q=mu_fft,
-                        logvar_q=logvar_fft,
-                        pi_q=pi_fft,
-                        mu_p=mog_dict['fft'][0],
-                        logvar_p=mog_dict['fft'][1],
-                        pi_p=mog_dict['fft'][2],
-                        num_samples=1
-                    )
-                    kl_rms = kl_q_p_mixture(
-                        mu_q=mu_rms,
-                        logvar_q=logvar_rms,
-                        pi_q=pi_rms,
-                        mu_p=mog_dict['rms'][0],
-                        logvar_p=mog_dict['rms'][1],
-                        pi_p=mog_dict['rms'][2],
-                        num_samples=1
-                    )
-                    kl_psd = kl_q_p_mixture(
-                        mu_q=mu_psd,
-                        logvar_q=logvar_psd,
-                        pi_q=pi_psd,
-                        mu_p=mog_dict['psd'][0],
-                        logvar_p=mog_dict['psd'][1],
-                        pi_p=mog_dict['psd'][2],
-                        num_samples=1
-                    )
-                    kl_mask = kl_q_p_mixture(
-                        mu_q=mu_mask,
-                        logvar_q=logvar_mask,
-                        pi_q=pi_mask,
-                        mu_p=mog_dict['mask'][0],
-                        logvar_p=mog_dict['mask'][1],
-                        pi_p=mog_dict['mask'][2],
-                        num_samples=1
-                    )
-                    kl_loss = kl_raw + kl_fft + kl_rms + kl_psd + kl_mask
                 else:
-                    # Fallback: single Gaussian KL
-                    # (but be aware that mu_raw/logvar_raw might be shaped [batch,5,latent_dim]).
+                    # Fallback: single Gaussian KL (should not be used if use_mog=True)
                     kl_loss = -0.5 * tf.reduce_mean(
-                        1.0 + logvar_raw - tf.square(mu_raw) - tf.exp(logvar_raw)
+                        1.0 + logvar_final - tf.square(mu_final) - tf.exp(logvar_final)
                     )
+                tf.debugging.assert_all_finite(kl_loss, "NaN in kl_loss")
 
-                # Combine losses
-                weighted_ts = 0.5 * loss_ts
-                weighted_mask = 0.5 * (loss_mask_mse + loss_mask_dice)
-                loss_batch = weighted_ts + weighted_mask + kl_loss
+                total_loss = recon_loss + kl_loss
+                tf.debugging.assert_all_finite(total_loss, "NaN in total_loss")
 
-            # Backprop
-            grads = tape.gradient(loss_batch, all_trainables)
+            # ---- GRADIENTS & UPDATE ----
+            grads = tape.gradient(total_loss, all_trainables)
+            for i, g in enumerate(grads):
+                if g is not None:
+                    tf.debugging.assert_all_finite(g, f"NaN in grad {i}")
             optimizer.apply_gradients(zip(grads, all_trainables))
 
-            total_loss += loss_batch.numpy()
-            total_recon_ts += loss_ts.numpy()
-            total_recon_mask += (loss_mask_mse + loss_mask_dice).numpy()
-            num_batches += 1
+            epoch_train_total += total_loss.numpy()
+            epoch_train_recon += recon_loss.numpy()
+            epoch_train_kl += kl_loss.numpy()
+            train_steps += 1
 
-        # End of epoch
-        if num_batches > 0:
-            logging.info(
-                f"Epoch {epoch+1}/{num_epochs}, "
-                f"Total Loss: {total_loss/num_batches:.4f}, "
-                f"Reconstruction TS Loss: {total_recon_ts/num_batches:.4f}, "
-                f"Reconstruction Mask Loss: {total_recon_mask/num_batches:.4f}"
-            )
+        if train_steps > 0:
+            train_total_losses.append(epoch_train_total / train_steps)
+            train_recon_losses.append(epoch_train_recon / train_steps)
+            train_kl_losses.append(epoch_train_kl / train_steps)
         else:
-            print("Warning: No batches processed in this epoch!")
+            train_total_losses.append(None)
+            train_recon_losses.append(None)
+            train_kl_losses.append(None)
 
-    return model
+        # ---- VALIDATION ----
+        epoch_val_total = 0.0
+        epoch_val_recon = 0.0
+        epoch_val_kl = 0.0
+        val_steps = 0
+
+        for step, (raw_in, fft_in, rms_in, psd_in, mask_in, test_id_in) in enumerate(val_dataset):
+            (recon_ts, recon_mask, (mu_final, logvar_final, pi_final)) = model(
+                raw_in, fft_in, rms_in, psd_in, mask_in, test_id_in, training=False
+            )
+            loss_ts = mse_loss_fn(raw_in, recon_ts)
+            tf.debugging.assert_all_finite(loss_ts, "NaN in val loss_ts")
+
+            loss_mask_focal = focal_loss(mask_in, recon_mask, alpha=0.25, gamma=2.0)
+            tf.debugging.assert_all_finite(loss_mask_focal, "NaN in val focal_loss")
+            loss_mask_dice = dice_loss(recon_mask, mask_in)
+            tf.debugging.assert_all_finite(loss_mask_dice, "NaN in val dice_loss")
+            mask_recon_loss = 0.5 * (loss_mask_focal + loss_mask_dice)
+            tf.debugging.assert_all_finite(mask_recon_loss, "NaN in val mask_recon_loss")
+
+            recon_loss = 0.5 * (loss_ts + mask_recon_loss)
+            tf.debugging.assert_all_finite(recon_loss, "NaN in val recon_loss")
+
+            if use_mog:
+                latent_dim = tf.shape(mu_final)[-1]
+                num_mixtures = tf.shape(pi_final)[-1]
+                prior_mu = tf.zeros([num_mixtures, latent_dim])
+                prior_logvar = tf.zeros([num_mixtures, latent_dim])
+                prior_pi = tf.ones([num_mixtures]) / tf.cast(num_mixtures, tf.float32)
+                kl_loss = kl_q_p_mixture(
+                    mu_q=mu_final, logvar_q=logvar_final, pi_q=pi_final,
+                    mu_p=prior_mu, logvar_p=prior_logvar, pi_p=prior_pi,
+                    num_samples=1
+                )
+            else:
+                kl_loss = -0.5 * tf.reduce_mean(
+                    1.0 + logvar_final - tf.square(mu_final) - tf.exp(logvar_final)
+                )
+            tf.debugging.assert_all_finite(kl_loss, "NaN in val kl_loss")
+
+            total_loss = recon_loss + kl_loss
+            tf.debugging.assert_all_finite(total_loss, "NaN in val total_loss")
+
+            epoch_val_total += total_loss.numpy()
+            epoch_val_recon += recon_loss.numpy()
+            epoch_val_kl += kl_loss.numpy()
+            val_steps += 1
+
+        if val_steps > 0:
+            val_total_losses.append(epoch_val_total / val_steps)
+            val_recon_losses.append(epoch_val_recon / val_steps)
+            val_kl_losses.append(epoch_val_kl / val_steps)
+        else:
+            val_total_losses.append(None)
+            val_recon_losses.append(None)
+            val_kl_losses.append(None)
+
+        # Print epoch summary
+        print(f"\nEpoch {epoch+1}/{num_epochs}")
+        if train_steps > 0:
+            print(f"  Train => Total: {train_total_losses[-1]:.4f}, Recon: {train_recon_losses[-1]:.4f}, KL: {train_kl_losses[-1]:.4f}")
+        if val_steps > 0:
+            print(f"  Val   => Total: {val_total_losses[-1]:.4f}, Recon: {val_recon_losses[-1]:.4f}, KL: {val_kl_losses[-1]:.4f}")
+
+    return (train_total_losses, train_recon_losses, train_kl_losses,
+            val_total_losses, val_recon_losses, val_kl_losses)
 
 # Global variable to store the trained VAE model for external access.
 vae_model = None
@@ -1139,7 +987,7 @@ def load_trained_model(weights_path):
     """
     global vae_model
     latent_dim = 128  # Ensure this matches the latent_dim used in training.
-    model = VAE(latent_dim)
+    model = VAE(latent_dim, feature_dim=128)
     
     # Build the model's variables by calling it with dummy inputs.
     dummy_ts = tf.zeros((1, 12000, 12), dtype=tf.float32)
@@ -1170,10 +1018,10 @@ def main():
     configure_gpu()
     clear_gpu_memory()
     print_detailed_memory()
-    
+
     print("\nNum GPUs Available: ", len(tf.config.list_physical_devices('GPU')))
-    
-    # Load data
+
+    # 1) Load data
     accel_dict, mask_dict = data_loader.load_data()
 
     gen = segment_and_transform(accel_dict, mask_dict)
@@ -1181,52 +1029,112 @@ def main():
         raw_segments, fft_segments, rms_segments, psd_segments, mask_segments, test_ids = next(gen)
     except StopIteration:
         raise ValueError("segment_and_transform() did not yield any data.")
-    
+
     print("Finished segmenting data.")
     print(f"Data shapes after segmentation:")
-    print(f"Raw: {raw_segments.shape}")
-    print(f"FFT: {fft_segments.shape}")
-    print(f"RMS: {rms_segments.shape}")
-    print(f"PSD: {psd_segments.shape}")
-    print(f"Mask: {mask_segments.shape}")
-    
-    # Create dataset with smaller batch size
-    dataset = create_tf_dataset(
-        raw_segments.astype(np.float32),
-        fft_segments.astype(np.float32),
-        rms_segments.astype(np.float32),
-        psd_segments.astype(np.float32),
-        mask_segments.astype(np.float32),
-        test_ids.astype(np.float32),
-        batch_size=16  # Smaller batch size
-    )
-    
-    # Build & train model
-    latent_dim = 128
-    model = VAE(latent_dim)
-    optimizer = tf.keras.optimizers.Adam(1e-4)
-    
-    print_detailed_memory()
-    model = train_vae(model, dataset, optimizer, num_epochs=100, use_mog=True)
+    print(f"Raw: {raw_segments.shape}")   # (600, 1000, 12)
+    print(f"FFT: {fft_segments.shape}")   # (600, 501, 12)
+    print(f"RMS: {rms_segments.shape}")    # (600, 12)
+    print(f"PSD: {psd_segments.shape}")    # (600, 129, 12)
+    print(f"Mask: {mask_segments.shape}")  # (600, 256, 768)
+    print(f"IDs:  {test_ids.shape}")       # (600,)
 
-    # Save weights
+    # 2) Convert all to float32 (just in case)
+    raw_segments  = raw_segments.astype(np.float32)
+    fft_segments  = fft_segments.astype(np.float32)
+    rms_segments  = rms_segments.astype(np.float32)
+    psd_segments  = psd_segments.astype(np.float32)
+    mask_segments = mask_segments.astype(np.float32)
+    test_ids      = test_ids.astype(np.float32)
+
+    # 3) Shuffle + split arrays into train/val (80/20)
+    N = raw_segments.shape[0]  # e.g., 600
+    indices = np.random.permutation(N)
+    train_size = int(0.8 * N)  # 80% for training
+    train_idx = indices[:train_size]
+    val_idx   = indices[train_size:]
+
+    # Extract training subsets
+    train_raw   = raw_segments[train_idx]
+    train_fft   = fft_segments[train_idx]
+    train_rms   = rms_segments[train_idx]
+    train_psd   = psd_segments[train_idx]
+    train_mask  = mask_segments[train_idx]
+    train_ids   = test_ids[train_idx]
+
+    # Extract validation subsets
+    val_raw   = raw_segments[val_idx]
+    val_fft   = fft_segments[val_idx]
+    val_rms   = rms_segments[val_idx]
+    val_psd   = psd_segments[val_idx]
+    val_mask  = mask_segments[val_idx]
+    val_ids   = test_ids[val_idx]
+
+    # 4) Build tf.data Datasets from these arrays
+    train_dataset = tf.data.Dataset.from_tensor_slices(
+        (train_raw, train_fft, train_rms, train_psd, train_mask, train_ids)
+    ).batch(16)
+
+    val_dataset = tf.data.Dataset.from_tensor_slices(
+        (val_raw, val_fft, val_rms, val_psd, val_mask, val_ids)
+    ).batch(16)
+
+    print(f"Train batches: {len(train_dataset)}")
+    print(f"Val batches:   {len(val_dataset)}")
+
+    # 5) Build & train model
+    latent_dim = 128
+    feature_dim = 128
+    model = VAE(latent_dim, feature_dim)
+    optimizer = tf.keras.optimizers.Adam(1e-4)
+
+    print_detailed_memory()
+
+    (
+        train_total, train_recon, train_kl,
+        val_total,   val_recon,   val_kl
+    ) = train_vae(
+          model=model,
+          train_dataset=train_dataset,
+          val_dataset=val_dataset,
+          optimizer=optimizer,
+          num_epochs=300,
+          use_mog=True
+        )
+
+    # 6) Save weights
     model.save_weights("results/vae_mmodal_weights.h5")
     print("Saved model weights to results/vae_mmodal_weights.h5")
 
-    # Generate synthetic data
+    # 7) Plot the curves
+    plt.figure()
+    plt.plot(train_total, label='Train Total')
+    plt.plot(val_total,   label='Val Total')
+    plt.legend(); plt.title("Total Loss"); plt.show()
+
+    plt.figure()
+    plt.plot(train_recon, label='Train Recon')
+    plt.plot(val_recon,   label='Val Recon')
+    plt.legend(); plt.title("Reconstruction Loss"); plt.show()
+
+    plt.figure()
+    plt.plot(train_kl, label='Train KL')
+    plt.plot(val_kl,   label='Val KL')
+    plt.legend(); plt.title("KL Loss"); plt.show()
+
+    # 8) Generate synthetic data
     results_dir = "results/vae_results"
     os.makedirs(results_dir, exist_ok=True)
-    
+
     num_synthetic = 100
     for i in range(num_synthetic):
-        # For unconditional generation, we just sample standard Normal
         z_rand = tf.random.normal(shape=(1, latent_dim))
         gen_ts, gen_mask = model.generate(z_rand)
 
-        # Save outputs
         np.save(os.path.join(results_dir, f"gen_ts_{i}.npy"), gen_ts.numpy())
         np.save(os.path.join(results_dir, f"gen_mask_{i}.npy"), gen_mask.numpy())
         logging.info(f"Saved synthetic sample {i}")
+
 
 
 if __name__ == "__main__":
