@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 import umap
 import plotly.graph_objects as go
 import plotly.io as pio
+from plotly.subplots import make_subplots
 from scipy.stats import spearmanr
 from scipy.stats import ks_2samp
 from scipy.signal import welch
@@ -45,9 +46,9 @@ def load_real_data():
 
     # Debug: Print loaded test IDs
     print(f"[DEBUG] Loaded {len(test_ids)} real test IDs. First 10: {test_ids[:10]}")
-
-    return np.stack(signals), np.stack(masks), np.array(test_ids)
-
+    masks_array = np.stack(masks)
+    print(f"[DEBUG] Shape Masks: {masks_array.shape}")
+    return np.stack(signals), masks_array, np.array(test_ids)
 
 def load_synthetic_data(synthetic_folder):
     """Loads synthetic 5s segments and masks."""
@@ -70,8 +71,10 @@ def load_synthetic_data(synthetic_folder):
 
     # Debug: Print loaded synthetic test IDs
     print(f"[DEBUG] Loaded {len(test_ids)} synthetic test IDs. First 10: {test_ids[:10]}")
+    masks_array = np.stack(masks)
+    print(f"[DEBUG] Shape Masks: {masks_array.shape}")
+    return np.stack(signals), masks_array, np.array(test_ids)
 
-    return np.stack(signals), np.stack(masks), np.array(test_ids)
 
 ##########################
 # 2. Feature Computation
@@ -99,11 +102,9 @@ def compute_features(data, sample_rate=200):
 
     return np.array(fft_features), np.array(rms_features), np.array(psd_features)
 
-
 def compute_mask_features(masks):
     """Flattens masks for UMAP analysis."""
     return np.array([mask.flatten() for mask in masks])
-
 
 ##########################
 # 3. UMAP Visualization
@@ -173,7 +174,6 @@ def plot_umap_3d_combined(real_features, real_labels, synthetic_features, synthe
     pio.write_html(fig, file=os.path.join(output_dir, filename), auto_open=False)
     print(f"Saved interactive combined UMAP plot: {filename}")
 
-
 def check_damage_correlation_combined(real_features, real_labels, synthetic_features, synthetic_labels, dataset_name):
     """Computes Spearman correlation between UMAP components and damage progression for real & synthetic data."""
     reducer = umap.UMAP(n_components=3, random_state=42)
@@ -199,6 +199,114 @@ def check_damage_correlation_combined(real_features, real_labels, synthetic_feat
     print(f"    Synthetic Data - UMAP 1: {synthetic_corr_x:.4f}, UMAP 2: {synthetic_corr_y:.4f}, UMAP 3: {synthetic_corr_z:.4f}\n")
 
     return (real_corr_x, real_corr_y, real_corr_z), (synthetic_corr_x, synthetic_corr_y, synthetic_corr_z)
+
+def plot_3d_damage_mask(real_masks, synthetic_masks, output_dir="evaluation_plots"):
+    """Generates two separate 3D surface plots for real and synthetic damage masks, ensuring correct elevation order and solid color."""
+
+    def process_mask(mask_samples, invert=False):
+        """Sums up all masks across test IDs, removes zero-damage pixels, and optionally inverts elevation ordering."""
+        
+        # If mask_samples has an extra singleton dimension, remove it
+        if mask_samples.ndim == 4 and mask_samples.shape[1] == 1:
+            mask_samples = mask_samples.squeeze(1)  # Removes the second dimension, making it (100, 256, 768)
+
+        # If the mask is 3D (test_ids, H, W), sum across the first dimension to aggregate all test IDs
+        if mask_samples.ndim == 3:
+            mask_samples = np.sum(mask_samples, axis=0)
+
+        # Ensure the mask is 2D before proceeding
+        if mask_samples.ndim != 2:
+            raise ValueError(f"Expected a 2D mask, but got shape {mask_samples.shape}")
+
+        # **Invert the mask (flip vertically) if needed**
+        if invert:
+            mask_samples = np.flipud(mask_samples)
+
+        H, W = mask_samples.shape
+        x, y = np.meshgrid(np.arange(W), np.arange(H))
+
+        # Flatten arrays
+        x_flat, y_flat, z_flat = x.ravel(), y.ravel(), mask_samples.ravel()
+
+        # Filter out zero-damage pixels
+        nonzero_idx = np.where(z_flat > 0)
+        return x_flat[nonzero_idx], y_flat[nonzero_idx], z_flat[nonzero_idx]
+
+    # Ensure the output directory exists
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Process real and synthetic masks
+    x_real, y_real, z_real = process_mask(real_masks, invert=True)  # Flip real damage mask to correct elevation
+    x_synthetic, y_synthetic, z_synthetic = process_mask(synthetic_masks, invert=False)
+
+    # Create a grid for plotting
+    def create_grid(x, y, z):
+        """Reconstructs a structured grid from scattered (x, y, z) points for surface plotting."""
+        H = max(y) + 1
+        W = max(x) + 1
+        grid = np.zeros((H, W))  # Initialize empty grid
+
+        for i in range(len(x)):
+            grid[int(y[i]), int(x[i])] = z[i]  # Assign values at respective locations
+
+        return grid
+
+    # Convert scattered points back into a 2D grid
+    real_z_grid = create_grid(x_real.astype(int), y_real.astype(int), z_real)
+    synthetic_z_grid = create_grid(x_synthetic.astype(int), y_synthetic.astype(int), z_synthetic)
+
+    # **Plot for Real Damage Mask with SOLID COLOR**
+    fig_real = go.Figure()
+    fig_real.add_trace(go.Surface(z=real_z_grid, surfacecolor=np.ones_like(real_z_grid) * 0.8, colorscale=[[0, 'red'], [1, 'red']], showscale=False))
+    fig_real.update_layout(title="Real Damage Mask 3D",
+                           scene=dict(xaxis_title="X", yaxis_title="Y", zaxis_title="Damage Level"),
+                           margin=dict(l=0, r=0, b=0, t=40),
+                           height=600, width=800)
+
+    # Save HTML
+    real_filename = os.path.join(output_dir, "3D_Real_Damage_Mask.html")
+    pio.write_html(fig_real, file=real_filename, auto_open=False)
+    print(f"Saved 3D real damage mask plot: {real_filename}")
+
+    # **Plot for Synthetic Damage Mask with SOLID COLOR**
+    fig_synthetic = go.Figure()
+    fig_synthetic.add_trace(go.Surface(z=synthetic_z_grid, surfacecolor=np.ones_like(synthetic_z_grid) * 0.8, colorscale=[[0, 'blue'], [1, 'blue']], showscale=False))
+    fig_synthetic.update_layout(title="Synthetic Damage Mask 3D",
+                                scene=dict(xaxis_title="X", yaxis_title="Y", zaxis_title="Damage Level"),
+                                margin=dict(l=0, r=0, b=0, t=40),
+                                height=600, width=800)
+
+    # Save HTML
+    synthetic_filename = os.path.join(output_dir, "3D_Synthetic_Damage_Mask.html")
+    pio.write_html(fig_synthetic, file=synthetic_filename, auto_open=False)
+    print(f"Saved 3D synthetic damage mask plot: {synthetic_filename}")
+
+def print_sample_masks(real_masks, synthetic_masks):
+    """Prints two example 2D masks (one real, one synthetic) in the terminal."""
+    
+    # Ensure masks are properly shaped (remove singleton dimensions if necessary)
+    if real_masks.ndim == 4 and real_masks.shape[1] == 1:
+        real_masks = real_masks.squeeze(1)  # (N, 256, 768)
+    if synthetic_masks.ndim == 4 and synthetic_masks.shape[1] == 1:
+        synthetic_masks = synthetic_masks.squeeze(1)
+
+    # Select two random test cases (one from real, one from synthetic)
+    real_sample_idx = np.random.randint(0, real_masks.shape[0])
+    synthetic_sample_idx = np.random.randint(0, synthetic_masks.shape[0])
+
+    real_mask_sample = real_masks[real_sample_idx]
+    synthetic_mask_sample = synthetic_masks[synthetic_sample_idx]
+
+    # Print to the terminal
+    print("\n========== Sample Real Mask ==========")
+    np.set_printoptions(threshold=50, linewidth=150)  # Controls output format
+    print(real_mask_sample)
+
+    print("\n========== Sample Synthetic Mask ==========")
+    print(synthetic_mask_sample)
+
+    # Reset print options to default (avoid affecting other outputs)
+    np.set_printoptions(threshold=1000, linewidth=75)
 
 ##########################
 # 4. Evaluation Pipeline
@@ -265,6 +373,10 @@ def main(args):
     check_damage_correlation_combined(real_psd, real_ids, synthetic_psd, synthetic_ids, "PSD Features")
     check_damage_correlation_combined(real_mask_features, real_ids, synthetic_mask_features, synthetic_ids, "Mask Features")
 
+    print_sample_masks(real_masks, synthetic_masks)
+
+
+    plot_3d_damage_mask(real_masks, synthetic_masks)
 
 
 
