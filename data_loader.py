@@ -243,10 +243,16 @@ def load_labels_for_test(test_id, labels_dir=LABELS_DIR, image_shape=IMAGE_SHAPE
 def load_data():
     accel_dict = load_accelerometer_data(DATA_DIR, SKIP_TESTS)
     mask_dict = {}
+
     for test_id in accel_dict.keys():
+        # **Ensure `test_id` is always an integer**
+        test_id = int(test_id)  
+        
         mask = load_labels_for_test(test_id, LABELS_DIR, IMAGE_SHAPE, GAUSSIAN_SIGMA)
         mask_dict[test_id] = mask
+
     return accel_dict, mask_dict
+
 
 
 ######################################
