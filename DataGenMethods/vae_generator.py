@@ -25,6 +25,9 @@ import logging
 import numpy as np
 from scipy import signal
 import matplotlib.pyplot as plt
+import plotly.graph_objects as go
+import plotly.io as pio
+
 
 
 # Append parent directory to find data_loader.py
@@ -762,26 +765,15 @@ latent_dim_rms = 128
 latent_dim_psd = 128
 latent_dim_mask = 128
 
-# ----- Training Procedure -----
-def train_vae(
-    model,
-    train_dataset,
-    val_dataset,
-    optimizer,
-    num_epochs=100,
-    use_mog=True
-):
+def train_vae(model, train_dataset, val_dataset, optimizer, num_epochs=100, use_mog=True):
     """
-    Train loop with added tf.debugging checks.
+    Train loop with tf.debugging checks.
     Returns 6 lists: train_total, train_recon, train_kl, val_total, val_recon, val_kl.
-    This version uses the aggregated MoG from the MultiModalEncoder.
     """
     mse_loss_fn = tf.keras.losses.MeanSquaredError()
-    
-    # Collect trainable variables from the model only.
+    # Collect model variables.
     all_trainables = model.trainable_variables
 
-    # Lists to store the losses.
     train_total_losses = []
     train_recon_losses = []
     train_kl_losses = []
@@ -791,7 +783,6 @@ def train_vae(
     val_kl_losses = []
 
     for epoch in range(num_epochs):
-        # ---- TRAINING ----
         epoch_train_total = 0.0
         epoch_train_recon = 0.0
         epoch_train_kl = 0.0
@@ -799,21 +790,16 @@ def train_vae(
 
         for step, (raw_in, fft_in, rms_in, psd_in, mask_in, test_id_in) in enumerate(train_dataset):
             with tf.GradientTape() as tape:
-                # Forward pass: note the model now returns aggregated latent parameters.
                 (recon_ts, recon_mask, (mu_final, logvar_final, pi_final)) = model(
                     raw_in, fft_in, rms_in, psd_in, mask_in, test_id_in, training=True
                 )
-
-                # DEBUG ASSERTS
                 tf.debugging.assert_all_finite(recon_ts, "NaN in recon_ts")
                 tf.debugging.assert_all_finite(recon_mask, "NaN in recon_mask")
                 tf.debugging.assert_all_finite(mu_final, "NaN in mu_final")
 
-                # 1) Time-series reconstruction loss
                 loss_ts = mse_loss_fn(raw_in, recon_ts)
                 tf.debugging.assert_all_finite(loss_ts, "NaN in loss_ts")
 
-                # 2) Mask reconstruction loss (using focal + dice)
                 loss_mask_focal = focal_loss(mask_in, recon_mask, alpha=0.25, gamma=2.0)
                 tf.debugging.assert_all_finite(loss_mask_focal, "NaN in focal_loss")
                 loss_mask_dice = dice_loss(recon_mask, mask_in)
@@ -821,26 +807,21 @@ def train_vae(
                 mask_recon_loss = 0.5 * (loss_mask_focal + loss_mask_dice)
                 tf.debugging.assert_all_finite(mask_recon_loss, "NaN in mask_recon_loss")
 
-                # Weighted reconstruction loss: 50% TS, 50% mask.
                 recon_loss = 0.5 * (loss_ts + mask_recon_loss)
                 tf.debugging.assert_all_finite(recon_loss, "NaN in recon_loss")
 
-                # 3) KL Loss using the aggregated latent parameters.
                 if use_mog:
-                    # Define the prior as a uniform MoG: zero mean, zero logvar, uniform pi.
                     latent_dim = tf.shape(mu_final)[-1]
-                    num_mixtures = tf.shape(pi_final)[-1]  # pi_final shape: [B, num_mixtures]
+                    num_mixtures = tf.shape(pi_final)[-1]
                     prior_mu = tf.zeros([num_mixtures, latent_dim])
                     prior_logvar = tf.zeros([num_mixtures, latent_dim])
                     prior_pi = tf.ones([num_mixtures]) / tf.cast(num_mixtures, tf.float32)
-                    
                     kl_loss = kl_q_p_mixture(
                         mu_q=mu_final, logvar_q=logvar_final, pi_q=pi_final,
                         mu_p=prior_mu, logvar_p=prior_logvar, pi_p=prior_pi,
                         num_samples=1
                     )
                 else:
-                    # Fallback: single Gaussian KL (should not be used if use_mog=True)
                     kl_loss = -0.5 * tf.reduce_mean(
                         1.0 + logvar_final - tf.square(mu_final) - tf.exp(logvar_final)
                     )
@@ -849,7 +830,6 @@ def train_vae(
                 total_loss = recon_loss + kl_loss
                 tf.debugging.assert_all_finite(total_loss, "NaN in total_loss")
 
-            # ---- GRADIENTS & UPDATE ----
             grads = tape.gradient(total_loss, all_trainables)
             for i, g in enumerate(grads):
                 if g is not None:
@@ -870,7 +850,6 @@ def train_vae(
             train_recon_losses.append(None)
             train_kl_losses.append(None)
 
-        # ---- VALIDATION ----
         epoch_val_total = 0.0
         epoch_val_recon = 0.0
         epoch_val_kl = 0.0
@@ -882,14 +861,12 @@ def train_vae(
             )
             loss_ts = mse_loss_fn(raw_in, recon_ts)
             tf.debugging.assert_all_finite(loss_ts, "NaN in val loss_ts")
-
             loss_mask_focal = focal_loss(mask_in, recon_mask, alpha=0.25, gamma=2.0)
             tf.debugging.assert_all_finite(loss_mask_focal, "NaN in val focal_loss")
             loss_mask_dice = dice_loss(recon_mask, mask_in)
             tf.debugging.assert_all_finite(loss_mask_dice, "NaN in val dice_loss")
             mask_recon_loss = 0.5 * (loss_mask_focal + loss_mask_dice)
             tf.debugging.assert_all_finite(mask_recon_loss, "NaN in val mask_recon_loss")
-
             recon_loss = 0.5 * (loss_ts + mask_recon_loss)
             tf.debugging.assert_all_finite(recon_loss, "NaN in val recon_loss")
 
@@ -927,7 +904,6 @@ def train_vae(
             val_recon_losses.append(None)
             val_kl_losses.append(None)
 
-        # Print epoch summary
         print(f"\nEpoch {epoch+1}/{num_epochs}")
         if train_steps > 0:
             print(f"  Train => Total: {train_total_losses[-1]:.4f}, Recon: {train_recon_losses[-1]:.4f}, KL: {train_kl_losses[-1]:.4f}")
@@ -936,6 +912,49 @@ def train_vae(
 
     return (train_total_losses, train_recon_losses, train_kl_losses,
             val_total_losses, val_recon_losses, val_kl_losses)
+
+#-------plots-------------------------
+def plot_training_curves(train_total, train_recon, train_kl, val_total, val_recon, val_kl):
+    epochs = list(range(1, len(train_total) + 1))
+
+    # Total Loss Plot
+    fig_total = go.Figure()
+    fig_total.add_trace(go.Scatter(x=epochs, y=train_total, mode='lines+markers', name="Train Total"))
+    fig_total.add_trace(go.Scatter(x=epochs, y=val_total, mode='lines+markers', name="Val Total"))
+    fig_total.update_layout(title="Total Loss vs Epochs", xaxis_title="Epoch", yaxis_title="Loss")
+    pio.write_html(fig_total, file="train_val_total_loss.html", auto_open=True)
+
+    # Reconstruction Loss Plot
+    fig_recon = go.Figure()
+    fig_recon.add_trace(go.Scatter(x=epochs, y=train_recon, mode='lines+markers', name="Train Recon"))
+    fig_recon.add_trace(go.Scatter(x=epochs, y=val_recon, mode='lines+markers', name="Val Recon"))
+    fig_recon.update_layout(title="Reconstruction Loss vs Epochs", xaxis_title="Epoch", yaxis_title="Loss")
+    pio.write_html(fig_recon, file="train_val_recon_loss.html", auto_open=True)
+
+    # KL Loss Plot
+    fig_kl = go.Figure()
+    fig_kl.add_trace(go.Scatter(x=epochs, y=train_kl, mode='lines+markers', name="Train KL"))
+    fig_kl.add_trace(go.Scatter(x=epochs, y=val_kl, mode='lines+markers', name="Val KL"))
+    fig_kl.update_layout(title="KL Loss vs Epochs", xaxis_title="Epoch", yaxis_title="Loss")
+    pio.write_html(fig_kl, file="train_val_kl_loss.html", auto_open=True)
+
+def plot_generated_samples(model, latent_dim, num_samples=5):
+    for i in range(num_samples):
+        z_rand = tf.random.normal(shape=(1, latent_dim))
+        recon_ts, recon_mask = model.generate(z_rand)
+        
+        # Plot raw time-series (mean over channels)
+        ts = recon_ts.numpy().squeeze(0)  # shape: (1000, 12)
+        ts_mean = ts.mean(axis=1)
+        fig_ts = go.Figure(data=go.Scatter(x=list(range(ts_mean.shape[0])), y=ts_mean))
+        fig_ts.update_layout(title=f"Generated Time-Series Sample {i}", xaxis_title="Time", yaxis_title="Amplitude")
+        pio.write_html(fig_ts, file=f"generated_ts_sample_{i}.html", auto_open=True)
+        
+        # Plot mask as a heatmap
+        mask = recon_mask.numpy().squeeze(0)  # shape: (256, 768)
+        fig_mask = go.Figure(data=go.Heatmap(z=mask))
+        fig_mask.update_layout(title=f"Generated Mask Sample {i}")
+        pio.write_html(fig_mask, file=f"generated_mask_sample_{i}.html", auto_open=True)
 
 # Global variable to store the trained VAE model for external access.
 vae_model = None
@@ -1018,12 +1037,10 @@ def main():
     configure_gpu()
     clear_gpu_memory()
     print_detailed_memory()
-
     print("\nNum GPUs Available: ", len(tf.config.list_physical_devices('GPU')))
 
     # 1) Load data
     accel_dict, mask_dict = data_loader.load_data()
-
     gen = segment_and_transform(accel_dict, mask_dict)
     try:
         raw_segments, fft_segments, rms_segments, psd_segments, mask_segments, test_ids = next(gen)
@@ -1032,14 +1049,14 @@ def main():
 
     print("Finished segmenting data.")
     print(f"Data shapes after segmentation:")
-    print(f"Raw: {raw_segments.shape}")   # (600, 1000, 12)
-    print(f"FFT: {fft_segments.shape}")   # (600, 501, 12)
-    print(f"RMS: {rms_segments.shape}")    # (600, 12)
-    print(f"PSD: {psd_segments.shape}")    # (600, 129, 12)
-    print(f"Mask: {mask_segments.shape}")  # (600, 256, 768)
-    print(f"IDs:  {test_ids.shape}")       # (600,)
+    print(f"  Raw: {raw_segments.shape}")     # e.g., (600, 1000, 12)
+    print(f"  FFT: {fft_segments.shape}")     # e.g., (600, 501, 12)
+    print(f"  RMS: {rms_segments.shape}")      # e.g., (600, 12)
+    print(f"  PSD: {psd_segments.shape}")      # e.g., (600, 129, 12)
+    print(f"  Mask: {mask_segments.shape}")    # e.g., (600, 256, 768)
+    print(f"  IDs: {test_ids.shape}")          # e.g., (600,)
 
-    # 2) Convert all to float32 (just in case)
+    # 2) Convert to float32
     raw_segments  = raw_segments.astype(np.float32)
     fft_segments  = fft_segments.astype(np.float32)
     rms_segments  = rms_segments.astype(np.float32)
@@ -1047,14 +1064,13 @@ def main():
     mask_segments = mask_segments.astype(np.float32)
     test_ids      = test_ids.astype(np.float32)
 
-    # 3) Shuffle + split arrays into train/val (80/20)
-    N = raw_segments.shape[0]  # e.g., 600
+    # 3) Shuffle and split into train/val (80/20)
+    N = raw_segments.shape[0]
     indices = np.random.permutation(N)
-    train_size = int(0.8 * N)  # 80% for training
+    train_size = int(0.8 * N)
     train_idx = indices[:train_size]
-    val_idx   = indices[train_size:]
+    val_idx = indices[train_size:]
 
-    # Extract training subsets
     train_raw   = raw_segments[train_idx]
     train_fft   = fft_segments[train_idx]
     train_rms   = rms_segments[train_idx]
@@ -1062,7 +1078,6 @@ def main():
     train_mask  = mask_segments[train_idx]
     train_ids   = test_ids[train_idx]
 
-    # Extract validation subsets
     val_raw   = raw_segments[val_idx]
     val_fft   = fft_segments[val_idx]
     val_rms   = rms_segments[val_idx]
@@ -1070,11 +1085,10 @@ def main():
     val_mask  = mask_segments[val_idx]
     val_ids   = test_ids[val_idx]
 
-    # 4) Build tf.data Datasets from these arrays
+    # 4) Build tf.data Datasets.
     train_dataset = tf.data.Dataset.from_tensor_slices(
         (train_raw, train_fft, train_rms, train_psd, train_mask, train_ids)
     ).batch(16)
-
     val_dataset = tf.data.Dataset.from_tensor_slices(
         (val_raw, val_fft, val_rms, val_psd, val_mask, val_ids)
     ).batch(16)
@@ -1082,51 +1096,38 @@ def main():
     print(f"Train batches: {len(train_dataset)}")
     print(f"Val batches:   {len(val_dataset)}")
 
-    # 5) Build & train model
+    # 5) Build & train model.
     latent_dim = 128
     feature_dim = 128
     model = VAE(latent_dim, feature_dim)
-    optimizer = tf.keras.optimizers.Adam(1e-4)
-
+    optimizer = tf.keras.optimizers.Adam(1e-5)
     print_detailed_memory()
 
-    (
-        train_total, train_recon, train_kl,
-        val_total,   val_recon,   val_kl
-    ) = train_vae(
-          model=model,
-          train_dataset=train_dataset,
-          val_dataset=val_dataset,
-          optimizer=optimizer,
-          num_epochs=300,
-          use_mog=True
-        )
+    (train_total, train_recon, train_kl,
+     val_total, val_recon, val_kl) = train_vae(
+         model=model,
+         train_dataset=train_dataset,
+         val_dataset=val_dataset,
+         optimizer=optimizer,
+         num_epochs=300,
+         use_mog=True
+     )
 
-    # 6) Save weights
+    # 6) Save weights.
     model.save_weights("results/vae_mmodal_weights.h5")
     print("Saved model weights to results/vae_mmodal_weights.h5")
 
-    # 7) Plot the curves
-    plt.figure()
-    plt.plot(train_total, label='Train Total')
-    plt.plot(val_total,   label='Val Total')
-    plt.legend(); plt.title("Total Loss"); plt.show()
+    # 7) Plot training curves using Plotly.
+    plot_training_curves(train_total, train_recon, train_kl, val_total, val_recon, val_kl)
 
-    plt.figure()
-    plt.plot(train_recon, label='Train Recon')
-    plt.plot(val_recon,   label='Val Recon')
-    plt.legend(); plt.title("Reconstruction Loss"); plt.show()
-
-    plt.figure()
-    plt.plot(train_kl, label='Train KL')
-    plt.plot(val_kl,   label='Val KL')
-    plt.legend(); plt.title("KL Loss"); plt.show()
+    # 8) Generate and plot 5 random samples.
+    plot_generated_samples(model, latent_dim, num_samples=5)
 
     # 8) Generate synthetic data
     results_dir = "results/vae_results"
     os.makedirs(results_dir, exist_ok=True)
 
-    num_synthetic = 100
+    num_synthetic = 50
     for i in range(num_synthetic):
         z_rand = tf.random.normal(shape=(1, latent_dim))
         gen_ts, gen_mask = model.generate(z_rand)
@@ -1134,7 +1135,6 @@ def main():
         np.save(os.path.join(results_dir, f"gen_ts_{i}.npy"), gen_ts.numpy())
         np.save(os.path.join(results_dir, f"gen_mask_{i}.npy"), gen_mask.numpy())
         logging.info(f"Saved synthetic sample {i}")
-
 
 
 if __name__ == "__main__":
