@@ -787,7 +787,9 @@ def sum_and_fit_masks_3d(mask_samples, n_components=3, n_std=1.0):
     ax.set_ylabel("Y (Height)")
     ax.set_zlabel("Damage Frequency (Z)")
     plt.tight_layout()
-    plt.show()
+    plt.savefig("output_plot.png", dpi=300, bbox_inches="tight")
+    plt.close()  # Closes the figure to free memory
+
 
 #============= 3D Time-Series Analysis Workflow (Modified) =============
 def main_time_series_3d_analysis(accel_dict, sampling_rate=200):
@@ -838,15 +840,15 @@ def main_time_series_3d_analysis(accel_dict, sampling_rate=200):
 
 #============= Main: Putting it all together =============
 def main():
-    # acc_samples, mask_samples, test_ids = load_data_as_arrays()
+    acc_samples, mask_samples, test_ids = load_data_as_arrays()
     # print(f"Loaded {acc_samples.shape[0]} samples total.")
     # Example: Plot RMS threshold on first sample
     # plot_rms_threshold(acc_samples[0])
     # Focused stats on impact events and high-damage masks
     # basic_stats_and_histograms_focused(acc_samples, mask_samples)
     # frequency_analysis(acc_samples, sample_rate=200)
-    # sum_and_fit_masks(mask_samples, num_clusters=30, method='GMM')
-    # sum_and_fit_masks_3d(mask_samples, n_components=30, n_std=1)
+    sum_and_fit_masks(mask_samples, num_clusters=30, method='GMM')
+    sum_and_fit_masks_3d(mask_samples, n_components=30, n_std=1)
     # correlation_between_summaries(acc_samples, mask_samples)
     # 3D Time-Series Analysis: Use data from data_loader
     # Instead of combining the 5 recordings per test, we extract features per recording.
