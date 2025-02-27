@@ -1,5 +1,4 @@
 import tensorflow as tf
-import tensorflow_addons as tfa
 
 # This must be the very first TensorFlow-related code
 def configure_gpu():
@@ -22,7 +21,7 @@ import psutil
 import GPUtil
 import numpy as np
 import keras 
-from keras import layers, Model
+from keras import layers, Model, optimizers
 import logging
 import numpy as np
 from scipy import signal
@@ -309,6 +308,12 @@ def preprocess_all_masks(mask_dict):
         # ---- Initialize `ellipses` and `polygons` to Prevent Unpacking Error ----
         ellipses, polygons = [], []  
 
+        if test_id in [1, 5, 10]:  # Only for a few test IDs
+            plt.imshow(mask, cmap="gray")
+            plt.title(f"Test ID {test_id} - Preprocessed Mask")
+            plt.show()
+
+
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if len(contours) == 0:
             print(f"[WARNING] No contours found for Test ID {test_id}. Assigning empty ellipses/polygons.")
@@ -317,7 +322,9 @@ def preprocess_all_masks(mask_dict):
 
         reconstructed_mask = np.zeros_like(mask)
 
-        contours = sorted(contours, key=cv2.contourArea, reverse=True)[:3]  
+        contours = sorted(contours, key=cv2.contourArea, reverse=True)[:3]
+
+        print(f"[DEBUG] Test ID {test_id}: Found {len(contours)} contours.")
 
         for contour in contours:
             num_ellipses = 1  
@@ -781,7 +788,6 @@ class MaskDecoder(tf.keras.Model):
 
         return ellipses, polygons
 
-
 # ----- VAE with Self-Attention in the Bottleneck -----
 class VAE(keras.Model):
     """
@@ -1084,21 +1090,44 @@ def train_autoencoder(model, train_dataset, val_dataset, optimizer, num_epochs=5
 
         print(f"Epoch {epoch+1}/{num_epochs} - Recon Loss: {epoch_loss / steps:.4f}")
 
-def extract_latent_representations(model, dataset):
+def extract_latent_representations(model, dataset, preprocessed_masks):
     """Pass data through the encoder to get latent embeddings."""
     latent_vectors = []
     test_ids = []
 
     for raw_in, fft_in, rms_in, psd_in, mask_in, test_id_in in dataset:
-        mu_q, _, _ = model.encoder(raw_in, fft_in, rms_in, psd_in, mask_in, test_id_in, training=False)
+        # 🔹 Convert test_id_in to proper format
+        if isinstance(test_id_in, tf.Tensor):
+            test_id_in = test_id_in.numpy()
+        if isinstance(test_id_in, np.ndarray):
+            test_id_in = test_id_in.flatten().tolist()
+
+        # 🔹 Retrieve precomputed mask encodings
+        batch_ellipses = []
+        batch_polygons = []
+        for tid in test_id_in:
+            mask_data = preprocessed_masks.get(int(tid), {"ellipses": [], "polygons": []})
+            batch_ellipses.append(mask_data["ellipses"])
+            batch_polygons.append(mask_data["polygons"])
+
+        batch_ellipses = np.array(batch_ellipses, dtype=np.float32)
+        batch_polygons = np.array(batch_polygons, dtype=np.float32)
+        test_id_in = np.array([int(float(tid)) for tid in test_id_in], dtype=np.int32)
+
+        # ✅ Fix the Unpacking Issue - Use 4 Values
+        mu_q, logvar_q, pi_q, _ = model.encoder(
+            raw_in, fft_in, rms_in, psd_in, batch_ellipses, batch_polygons, test_id_in, training=False
+        )
+
         latent_vectors.append(mu_q.numpy())
-        test_ids.append(test_id_in.numpy())
+        test_ids.append(test_id_in)
 
     return np.concatenate(latent_vectors, axis=0), np.concatenate(test_ids, axis=0)
 
 def reduce_latent_dim_umap(latent_vectors):
     """Reduces latent space dimensionality to 3D using UMAP."""
     reducer = umap.UMAP(n_components=3, random_state=42)
+    latent_vectors = latent_vectors.reshape(latent_vectors.shape[0], -1)  # Flatten to 2D
     latent_3d = reducer.fit_transform(latent_vectors)
     return latent_3d
 
@@ -1150,9 +1179,13 @@ def train_vae(model, train_dataset, val_dataset, mask_dict, preprocessed_masks, 
     val_recon_losses = []
     val_kl_losses = []
 
+    print("🔄 Starting Training... First Batch Soon...")
+
     for epoch in range(num_epochs):
         epoch_train_total, epoch_train_recon, epoch_train_kl = 0.0, 0.0, 0.0
         train_steps = 0
+
+        print(f"🟢 Epoch {epoch+1}/{num_epochs} - Entering Training Loop")
 
         for step, (raw_in, fft_in, rms_in, psd_in, mask_in, test_id_in) in enumerate(train_dataset):
             # Convert test_id_in to list of integers
@@ -1181,7 +1214,7 @@ def train_vae(model, train_dataset, val_dataset, mask_dict, preprocessed_masks, 
                     raw_in, fft_in, rms_in, psd_in, batch_ellipses, batch_polygons, test_id_in, training=True
                 )
 
-                # 🔹 Extract predicted ellipses and polygons
+                # Extract predicted ellipses and polygons
                 pred_ellipses, pred_polygons = recon_mask
 
                 # Compute reconstruction loss (time-series)
@@ -1193,12 +1226,14 @@ def train_vae(model, train_dataset, val_dataset, mask_dict, preprocessed_masks, 
                 mask_recon_loss = 0.0
                 for true_e, true_p, pred_e, pred_p in zip(batch_ellipses, batch_polygons, pred_ellipses, pred_polygons):
                     if len(true_e) == 0 and len(true_p) == 0:
+                        # print(f"🔍 Debug: true_e len={len(true_e)}, true_p len={len(true_p)}")
                         if len(pred_e) == 0 and len(pred_p) == 0:
                             mask_recon_loss += 0.0  # ✅ Correctly predicts no damage → no loss
                         else:
                             mask_recon_loss += 1.0  # ❌ False positive → apply penalty
-                    else:
+                    else: 
                         loss_ellipses = LAMBDA_ELLIPSE * ellipse_loss(true_e, pred_e)
+                        print("✅ Ellipse Loss Computed")  # ✅ If stuck here, check true_e/pred_e
                         loss_polygons = LAMBDA_POLYGON * polygon_loss(true_p, pred_p)
                         mask_recon_loss += loss_ellipses + loss_polygons
 
@@ -1238,6 +1273,9 @@ def train_vae(model, train_dataset, val_dataset, mask_dict, preprocessed_masks, 
             train_total_losses.append(epoch_train_total / train_steps)
             train_recon_losses.append(epoch_train_recon / train_steps)
             train_kl_losses.append(epoch_train_kl / train_steps)
+
+        print(f"\nEpoch {epoch+1}/{num_epochs}")
+        print(f"  🟢 Train => Total: {train_total_losses[-1]:.4f}, Recon: {train_recon_losses[-1]:.4f}, KL: {train_kl_losses[-1]:.4f}")
 
         # 🔹 Compute validation loss
         epoch_val_total, epoch_val_recon, epoch_val_kl = 0.0, 0.0, 0.0
@@ -1287,6 +1325,8 @@ def train_vae(model, train_dataset, val_dataset, mask_dict, preprocessed_masks, 
             val_total_losses.append(epoch_val_total / val_steps)
             val_recon_losses.append(epoch_val_recon / val_steps)
             val_kl_losses.append(epoch_val_kl / val_steps)
+        
+        print(f"  🔵 Val   => Total: {val_total_losses[-1]:.4f}, Recon: {val_recon_losses[-1]:.4f}, KL: {val_kl_losses[-1]:.4f}")
 
     return train_total_losses, train_recon_losses, train_kl_losses, val_total_losses, val_recon_losses, val_kl_losses
 
@@ -1515,6 +1555,11 @@ def main():
     preprocessed_masks = preprocess_all_masks(mask_dict)  # Stores {test_id: (ellipses, polygons)}
     print("Preprocessing complete.")
 
+    print("\n🔎 Debug: Checking Preprocessed Masks")
+    for key in list(preprocessed_masks.keys())[:5]:  # Print first 5 entries
+        print(f"Test ID {key}: {preprocessed_masks[key]}")
+
+
     # 4) Build tf.data Datasets.
     BATCH_SIZE = 64
     train_dataset = create_tf_dataset(train_raw, train_fft, train_rms, train_psd, train_mask, train_ids, batch_size=BATCH_SIZE)
@@ -1527,7 +1572,13 @@ def main():
     latent_dim = 128
     feature_dim = 128
     model = VAE(latent_dim, feature_dim)
-    optimizer = tfa.optimizers.RectifiedAdam(learning_rate=1e-5)
+    # AdamW -> helps prevent overfitting
+    optimizer = keras.optimizers.AdamW(learning_rate=1e-5, weight_decay=1e-4)
+    # Nadam -> good for complex loss landscapes
+    #optimizer = keras.optimizers.Nadam(learning_rate=1e-5)
+    # Adafactor -> good for high-dim data
+    #optimizer = tf.keras.optimizers.experimental.Adafactor(learning_rate=1e-5)
+
     print_detailed_memory()
 
     (train_total, train_recon, train_kl,
@@ -1538,7 +1589,7 @@ def main():
          mask_dict=mask_dict, 
          preprocessed_masks=preprocessed_masks,
          optimizer=optimizer,
-         num_epochs=300,
+         num_epochs=10,
          use_mog=True
      )
 
@@ -1547,7 +1598,8 @@ def main():
     print("Saved model weights to results/vae_mmodal_weights.h5")
 
     # 1Extract latent representations
-    latent_vectors, test_ids = extract_latent_representations(model, train_dataset)
+    latent_vectors, test_ids = extract_latent_representations(model, train_dataset, preprocessed_masks)
+
 
     # Reduce to 3D with UMAP
     latent_3d = reduce_latent_dim_umap(latent_vectors)

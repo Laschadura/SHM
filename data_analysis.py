@@ -165,7 +165,7 @@ def plot_rms_threshold(sample, sample_rate=200):
     plt.ylabel("RMS Energy")
     plt.legend()
     plt.title("RMS Energy with Impact Detection Threshold")
-    plt.show()
+    plt.savefig("RMS with impact Detection", dpi=300, bbox_inches="tight")
 
 def extract_high_damage_masks(mask_samples, damage_percentile=90):
     """
@@ -250,7 +250,7 @@ def plot_fft_curves_by_test(accel_dict, sampling_rate=200):
     ax.set_title("FFT Curves for Each Recording Stacked by Test ID")
     ax.legend(loc="upper right", fontsize=8)
     plt.tight_layout()
-    plt.show()
+    plt.savefig("FFT by Test", dpi=300, bbox_inches="tight")
 
 def plot_rms_curves_by_test(accel_dict, sampling_rate=200):
     """
@@ -280,7 +280,7 @@ def plot_rms_curves_by_test(accel_dict, sampling_rate=200):
     ax.set_title("RMS Curves for Each Recording Stacked by Test ID")
     ax.legend(loc="upper right", fontsize=8)
     plt.tight_layout()
-    plt.show()
+    plt.savefig("RMS by test", dpi=300, bbox_inches="tight")
 
 def compute_event_features(event, sampling_rate=200):
     """
@@ -296,16 +296,14 @@ def compute_event_features(event, sampling_rate=200):
       'raw': the raw event (as is).
     """
     # --- FFT Feature ---
-    # Compute FFT for each channel (along time), then combine using L2 norm:
     fft_vals = np.abs(np.fft.rfft(event, axis=0))  # shape: [n_freqs, num_channels]
-    fft_combined = np.linalg.norm(fft_vals, axis=1)
-    freqs_fft = np.fft.rfftfreq(event.shape[0], d=1.0/sampling_rate)
-    
+    fft_combined = np.linalg.norm(fft_vals, axis=1)  # L2 norm across channels
+    freqs_fft = np.fft.rfftfreq(event.shape[0], d=1.0/sampling_rate)  # Ensure we return frequency values
+
     # --- RMS Feature ---
-    # Compute RMS across channels for each time step:
     rms_series = np.sqrt(np.mean(event**2, axis=1))
     max_rms = np.max(rms_series)
-    
+
     # --- PSD Feature ---
     psd_list = []
     freqs_psd = None
@@ -315,9 +313,9 @@ def compute_event_features(event, sampling_rate=200):
         if freqs_psd is None:
             freqs_psd = f
     psd_avg = np.mean(np.array(psd_list), axis=0)
-    
+
     return {
-        'fft': (freqs_fft, fft_combined),
+        'fft': (freqs_fft, fft_combined),  # Ensure we return a tuple
         'rms': rms_series,
         'max_rms': max_rms,
         'psd': (freqs_psd, psd_avg),
@@ -328,6 +326,11 @@ def plot_event_features(features, event_index=0):
     """
     Plot the features of a single impact event in a 2x2 subplot grid.
     """
+    # Debug: Check the structure of `features['fft']`
+    if not isinstance(features['fft'], tuple) or len(features['fft']) != 2:
+        print(f"Error: 'fft' feature is not a tuple. Got: {type(features['fft'])}, {features['fft'].shape if isinstance(features['fft'], np.ndarray) else features['fft']}")
+        return
+
     fig, axs = plt.subplots(2, 2, figsize=(12, 10))
     
     # FFT Plot
@@ -358,7 +361,8 @@ def plot_event_features(features, event_index=0):
     axs[1, 1].set_ylabel("Amplitude")
     
     plt.tight_layout()
-    plt.show()
+    plt.savefig(f"event_{event_index}_features.png", dpi=300, bbox_inches="tight")
+    print(f"Saved event {event_index} features plot.")
 
 def plot_raw_event_surfaces(accel_dict, sampling_rate=200, impact_window=5):
     """
@@ -390,7 +394,7 @@ def plot_raw_event_surfaces(accel_dict, sampling_rate=200, impact_window=5):
     ax.set_zlabel("Raw Amplitude")
     ax.set_title("Raw Signal Surfaces for Each Impact Event")
     plt.tight_layout()
-    plt.show()
+    plt.savefig("RAW event", dpi=300, bbox_inches="tight")
 
 def plot_fft_event_surfaces(accel_dict, sampling_rate=200, impact_window=5):
     """
@@ -424,7 +428,7 @@ def plot_fft_event_surfaces(accel_dict, sampling_rate=200, impact_window=5):
     ax.set_zlabel("FFT Amplitude")
     ax.set_title("FFT Surfaces for Each Impact Event")
     plt.tight_layout()
-    plt.show()
+    plt.savefig("FFT event", dpi=300, bbox_inches="tight")
 
 def plot_rms_event_surfaces(accel_dict, sampling_rate=200, impact_window=5):
     """
@@ -455,7 +459,7 @@ def plot_rms_event_surfaces(accel_dict, sampling_rate=200, impact_window=5):
     ax.set_zlabel("RMS Value")
     ax.set_title("RMS Surfaces for Each Impact Event")
     plt.tight_layout()
-    plt.show()
+    plt.savefig("RMS event", dpi=300, bbox_inches="tight")
 
 def plot_psd_event_surfaces(accel_dict, sampling_rate=200, impact_window=5):
     """
@@ -493,69 +497,39 @@ def plot_psd_event_surfaces(accel_dict, sampling_rate=200, impact_window=5):
     ax.set_zlabel("PSD Value")
     ax.set_title("PSD Surfaces for Each Impact Event")
     plt.tight_layout()
-    plt.show()
+    plt.savefig("PSD event", dpi=300, bbox_inches="tight")
 
 #========================== UMAP ==========================
-def compute_event_features(event, sampling_rate=200):
-    """
-    Given an impact event (shape: [window_size, num_channels]),
-    compute feature vectors for:
-      - raw: flatten the event.
-      - fft: compute FFT (L2 norm across channels) and return the resulting spectrum.
-      - rms: compute the RMS time series (L2 norm across channels).
-      - psd: compute the average PSD (using Welch's method) across channels.
-    Returns a dictionary of feature vectors.
-    """
-    # Raw feature: flatten event
-    raw_feature = event.flatten()
-    
-    # FFT feature:
-    fft_vals = np.abs(np.fft.rfft(event, axis=0))  # shape: [n_freqs, num_channels]
-    fft_feature = np.linalg.norm(fft_vals, axis=1)   # combine across channels
-    # (We drop the frequency axis labels for UMAP)
-    
-    # RMS feature:
-    rms_feature = np.sqrt(np.mean(event**2, axis=1))  # 1D array
-    
-    # PSD feature:
-    from scipy.signal import welch
-    psd_list = []
-    for ch in range(event.shape[1]):
-        f, pxx = welch(event[:, ch], fs=sampling_rate)
-        psd_list.append(pxx)
-    psd_feature = np.mean(np.array(psd_list), axis=0)  # average PSD across channels
-    
-    return {
-        'raw': raw_feature,
-        'fft': fft_feature,
-        'rms': rms_feature,
-        'psd': psd_feature
-    }
-
 def extract_events_features(accel_dict, sampling_rate=200, impact_window=5):
     """
-    For each test in accel_dict, segment each recording into impact events,
-    and compute a feature vector for each event (for raw, FFT, RMS, and PSD).
-    Returns a dictionary with keys 'raw', 'fft', 'rms', and 'psd'.
-    Each entry is a tuple (features, labels), where features is an array of shape (N, D)
-    and labels contains the corresponding test ID (as an integer).
+    Extract impact event features from accelerometer data and return them in 2D format for UMAP.
     """
     raw_feats, fft_feats, rms_feats, psd_feats, labels = [], [], [], [], []
     sorted_test_ids = sorted(accel_dict.keys())
+
     for i, test_id in enumerate(sorted_test_ids):
         recordings = accel_dict[test_id]  # list of recordings for this test
         for rec in recordings:
-            # Extract impact events (each event is a [window_size, num_channels] array)
             events = extract_impacts(rec[np.newaxis, ...], sample_rate=sampling_rate, impact_window=impact_window)
             for event in events:
                 feats = compute_event_features(event, sampling_rate=sampling_rate)
-                raw_feats.append(feats['raw'])
-                fft_feats.append(feats['fft'])
+                
+                # Flatten raw event data: [window_size, num_channels] -> [window_size * num_channels]
+                raw_feats.append(feats['raw'].flatten())
+                
+                # FFT feature is already 1D
+                fft_feats.append(feats['fft'][1])  # Only take the FFT combined norm
+                
+                # RMS is already 1D
                 rms_feats.append(feats['rms'])
-                psd_feats.append(feats['psd'])
+                
+                # PSD feature is already 1D
+                psd_feats.append(feats['psd'][1])  # Only take the averaged PSD
+                
                 labels.append(i)  # Test ID index
+
     return {
-        'raw': (np.array(raw_feats), np.array(labels)),
+        'raw': (np.array(raw_feats), np.array(labels)),  # Ensure shape (N, D)
         'fft': (np.array(fft_feats), np.array(labels)),
         'rms': (np.array(rms_feats), np.array(labels)),
         'psd': (np.array(psd_feats), np.array(labels))
@@ -611,7 +585,7 @@ def basic_stats_and_histograms_focused(acc_samples, mask_samples):
     plt.xlabel("Amplitude")
     plt.ylabel("Count")
     plt.tight_layout()
-    plt.show()
+    plt.savefig("Time-Series Amplitude Distribution (Impacts)", dpi=300, bbox_inches="tight")
     mask_flat = high_damage_masks.reshape(-1)
     print("\nHigh-Damage Mask Data Stats:")
     print(f"  Mean: {np.mean(mask_flat):.4f}")
@@ -623,7 +597,7 @@ def basic_stats_and_histograms_focused(acc_samples, mask_samples):
     plt.xlabel("Value (0 or 1 for binary mask)")
     plt.ylabel("Count")
     plt.tight_layout()
-    plt.show()
+    plt.savefig("Mask Value Distribution (High-Damage)", dpi=300, bbox_inches="tight")
 
 def frequency_analysis(acc_samples, sample_rate=200):
     num_samples = acc_samples.shape[0]
@@ -646,7 +620,7 @@ def frequency_analysis(acc_samples, sample_rate=200):
     plt.ylabel("Average Amplitude")
     plt.legend()
     plt.tight_layout()
-    plt.show()
+    plt.savefig("Frequency analysis", dpi=300, bbox_inches="tight")
 
 def dimensionality_reduction(acc_samples, mask_samples, method='PCA', n_components=2):
     max_len = min(2000, acc_samples.shape[1])
@@ -753,7 +727,7 @@ def sum_and_fit_masks(mask_samples, num_clusters=3, method='GMM'):
     ax.set_ylabel("Y (Height)", fontsize=14)
     ax.legend(fontsize=12)
     plt.tight_layout()
-    plt.show()
+    plt.savefig("Sum and fit masks", dpi=300, bbox_inches="tight")
 
 def sum_and_fit_masks_3d(mask_samples, n_components=3, n_std=1.0):
     summed_mask = np.sum(mask_samples, axis=0).astype(float)
@@ -843,10 +817,10 @@ def main():
     acc_samples, mask_samples, test_ids = load_data_as_arrays()
     # print(f"Loaded {acc_samples.shape[0]} samples total.")
     # Example: Plot RMS threshold on first sample
-    # plot_rms_threshold(acc_samples[0])
+    plot_rms_threshold(acc_samples[0])
     # Focused stats on impact events and high-damage masks
-    # basic_stats_and_histograms_focused(acc_samples, mask_samples)
-    # frequency_analysis(acc_samples, sample_rate=200)
+    basic_stats_and_histograms_focused(acc_samples, mask_samples)
+    frequency_analysis(acc_samples, sample_rate=200)
     sum_and_fit_masks(mask_samples, num_clusters=30, method='GMM')
     sum_and_fit_masks_3d(mask_samples, n_components=30, n_std=1)
     # correlation_between_summaries(acc_samples, mask_samples)
@@ -855,19 +829,19 @@ def main():
     accel_dict, _ = data_loader.load_data()
     # Run our modified time-series 3D analysis (both FFT-based and RMS-based) 
     # For FFT-based curves:
-    # plot_fft_curves_by_test(accel_dict, sampling_rate=200)
+    plot_fft_curves_by_test(accel_dict, sampling_rate=200)
 
-    # # For RMS-based curves:
-    # plot_rms_curves_by_test(accel_dict, sampling_rate=200)
+    # For RMS-based curves:
+    plot_rms_curves_by_test(accel_dict, sampling_rate=200)
 
-    # # After loading acc_samples...
-    # impacts = extract_impacts(acc_samples, sample_rate=200, impact_window=5)
-    # print(f"Extracted {impacts.shape[0]} impact events.")
+    # After loading acc_samples...
+    impacts = extract_impacts(acc_samples, sample_rate=200, impact_window=5)
+    print(f"Extracted {impacts.shape[0]} impact events.")
 
-    # # For example, plot features for the first 5 events:
-    # for idx in range(min(1, impacts.shape[0])):
-    #     features = compute_event_features(impacts[idx], sampling_rate=200)
-    #     plot_event_features(features, event_index=idx)
+    # For example, plot features for the first 5 events:
+    for idx in range(min(1, impacts.shape[0])):
+        features = compute_event_features(impacts[idx], sampling_rate=200)
+        plot_event_features(features, event_index=idx)
     
     # # Plot the event surfaces for each feature type:
     # plot_raw_event_surfaces(accel_dict, sampling_rate=200, impact_window=5)
