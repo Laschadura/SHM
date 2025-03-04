@@ -22,6 +22,7 @@ import GPUtil
 import numpy as np
 import keras 
 from keras import layers, Model, optimizers
+from keras.optimizers.schedules import ExponentialDecay
 import logging
 import numpy as np
 from scipy import signal
@@ -31,6 +32,7 @@ import plotly.io as pio
 import umap
 import plotly.express as px
 import pandas as pd
+from sklearn.mixture import GaussianMixture
 
 
 
@@ -516,72 +518,135 @@ def reparameterize(mu, logvar):
     return mu + eps * std
 
 # ----- Encoder Branches -----
-class RawEncoder(keras.Model):
-    """Convolutional encoder for raw time-series data.
-       Input shape: (1000, 12)
-       Outputs a feature vector of dimension feature_dim.
+class RawEncoder(Model):
     """
+    Convolution + LSTM encoder for raw time-series data.
+    Input shape: (batch_size, 1000, 12)
+    Output: A feature vector of dimension feature_dim.
+    """
+
     def __init__(self, feature_dim):
         super().__init__()
-        self.conv1 = layers.Conv1D(16, kernel_size=4, strides=2, padding='same', activation='relu')
+
+        # 1) First CNN block
+        self.conv1 = layers.Conv1D(
+            filters=16,
+            kernel_size=5,
+            strides=2,
+            padding='same',
+            activation='relu'
+        )
         self.dropout1 = layers.Dropout(0.3)
-        self.conv2 = layers.Conv1D(32, kernel_size=4, strides=2, padding='same', activation='relu')
+
+        # 2) Second CNN block
+        self.conv2 = layers.Conv1D(
+            filters=32,
+            kernel_size=5,
+            strides=2,
+            padding='same',
+            activation='relu'
+        )
         self.dropout2 = layers.Dropout(0.3)
-        self.flatten = layers.Flatten()
+
+        # 3) Third CNN block (optional deeper layer)
+        self.conv3 = layers.Conv1D(
+            filters=64,
+            kernel_size=5,
+            strides=2,
+            padding='same',
+            activation='relu'
+        )
+        self.dropout3 = layers.Dropout(0.3)
+
+        # 4) Bidirectional LSTM layer
+        #
+        # return_sequences=False ensures we only get the final hidden state,
+        # which is often enough for classification/encoding.
+        self.bilstm = layers.Bidirectional(
+            layers.LSTM(128, return_sequences=False)
+        )
+
+        # 5) Dense to reduce to 512 (you can change this size if desired)
         self.dense_reduce = layers.Dense(512, activation='relu')
-        self.feature_layer = layers.Dense(feature_dim)  # final feature vector
+
+        # 6) Final feature projection
+        self.feature_layer = layers.Dense(feature_dim)
 
     def call(self, x, training=False):
-        x = self.conv1(x)
+        """
+        x shape: (batch, 1000, 12)
+        """
+
+        # CNN block 1
+        x = self.conv1(x)                 # -> (batch, 500, 16)
         x = self.dropout1(x, training=training)
-        x = self.conv2(x)
+
+        # CNN block 2
+        x = self.conv2(x)                 # -> (batch, 250, 32)
         x = self.dropout2(x, training=training)
-        x = self.flatten(x)
-        x = self.dense_reduce(x)
-        feature = self.feature_layer(x)
-        return feature  # shape: [batch, feature_dim]
-    
-class FFTEncoder(keras.Model):
-    """Encoder for FFT features.
-       Input shape: (501, 12)
-       Outputs a feature vector of dimension feature_dim.
-    """
-    def __init__(self, feature_dim):
-        super().__init__()
-        self.conv1 = layers.Conv1D(8, 3, strides=1, padding='same', activation='relu')
-        self.dropout1 = layers.Dropout(0.3)
-        self.flatten = layers.Flatten()
-        self.dense_reduce = layers.Dense(128, activation='relu')
-        self.feature_layer = layers.Dense(feature_dim)
 
-    def call(self, x, training=False):
-        x = self.conv1(x)
-        x = self.dropout1(x, training=training)
-        x = self.flatten(x)
-        x = self.dense_reduce(x)
-        feature = self.feature_layer(x)
-        return feature  # shape: [batch, feature_dim]
-    
-class PSDEncoder(keras.Model):
+        # CNN block 3 (optional deeper layer)
+        x = self.conv3(x)                 # -> (batch, 125, 64)
+        x = self.dropout3(x, training=training)
+
+        # LSTM layer: returns final hidden state of shape (batch, 256)
+        x = self.bilstm(x, training=training)
+
+        # Dense + final
+        x = self.dense_reduce(x)          # -> (batch, 512)
+        feature = self.feature_layer(x)   # -> (batch, feature_dim)
+        return feature
+ 
+class PSDEncoder(Model):
     """Encoder for PSD features.
-       Input shape: (freq_bins, 12) e.g. (129, 12)
+       Input shape: (batch, freq_bins, 12), e.g., (batch, 129, 12)
        Outputs a feature vector of dimension feature_dim.
     """
+
     def __init__(self, feature_dim):
         super().__init__()
-        self.conv1 = layers.Conv1D(8, 3, strides=1, padding='same', activation='relu')
+
+        # First convolutional block
+        self.conv1 = layers.Conv1D(filters=16, kernel_size=5, strides=2, padding='same', activation='relu')
         self.dropout1 = layers.Dropout(0.3)
-        self.flatten = layers.Flatten()
+
+        # Second convolutional block
+        self.conv2 = layers.Conv1D(filters=32, kernel_size=5, strides=2, padding='same', activation='relu')
+        self.dropout2 = layers.Dropout(0.3)
+
+        # Third convolutional block (optional deeper layer)
+        self.conv3 = layers.Conv1D(filters=64, kernel_size=5, strides=2, padding='same', activation='relu')
+        self.dropout3 = layers.Dropout(0.3)
+
+        # Global pooling to reduce to a single feature vector
+        self.global_pool = layers.GlobalAveragePooling1D()
+
+        # Dense layers for final encoding
         self.dense_reduce = layers.Dense(128, activation='relu')
-        self.feature_layer = layers.Dense(feature_dim)
+        self.feature_layer = layers.Dense(feature_dim)  # Final feature vector
 
     def call(self, x, training=False):
-        x = self.conv1(x)
+        """
+        x shape: (batch, freq_bins, 12), e.g., (batch, 129, 12)
+        """
+
+        x = self.conv1(x)  # (batch, ~65, 16)
         x = self.dropout1(x, training=training)
-        x = self.flatten(x)
-        x = self.dense_reduce(x)
-        feature = self.feature_layer(x)
-        return feature  # shape: [batch, feature_dim]
+
+        x = self.conv2(x)  # (batch, ~33, 32)
+        x = self.dropout2(x, training=training)
+
+        x = self.conv3(x)  # (batch, ~17, 64)
+        x = self.dropout3(x, training=training)
+
+        # Global pooling collapses the sequence dimension
+        x = self.global_pool(x)  # (batch, 64)
+
+        # Fully connected layers
+        x = self.dense_reduce(x)  # (batch, 128)
+        feature = self.feature_layer(x)  # (batch, feature_dim)
+
+        return feature
 
 class RMSEncoder(keras.Model):
     """Encoder for RMS features.
@@ -650,37 +715,29 @@ class MaskEncoder(tf.keras.Model):
 # ----- Combined Encoder with Multi Branches -----
 class MultiModalEncoder(keras.Model):
     """
-    Aggregates feature vectors from raw, FFT, RMS, PSD, and mask encoders.
+    Aggregates feature vectors from raw, RMS, PSD, and mask encoders.
     Each sub-encoder outputs a deterministic feature vector.
     These are concatenated (along with test_id) and passed through an MLP to produce
     the final MoG parameters for the shared latent space.
-    
-    Outputs:
-      mu_final: [B, num_mixtures, latent_dim]
-      logvar_final: [B, num_mixtures, latent_dim]
-      pi_final: [B, num_mixtures]
-      combined_features: [B, combined_feature_dim] (for conditioning)
     """
     def __init__(self, latent_dim, feature_dim, num_ellipses=30, num_polygon_points=10, num_mixtures=5):
         super().__init__()
         self.num_mixtures = num_mixtures
         self.raw_enc = RawEncoder(feature_dim)
-        self.fft_enc = FFTEncoder(feature_dim)
         self.rms_enc = RMSEncoder(feature_dim)
         self.psd_enc = PSDEncoder(feature_dim)
         self.mask_enc = MaskEncoder(num_ellipses=num_ellipses, num_polygon_points=num_polygon_points)
-        
-        # Aggregator: concatenate features from all 5 modalities plus test_id.
+
+        # Aggregator: concatenate features from all 4 modalities plus test_id.
         self.fc_agg = layers.Dense(128, activation='relu')
         self.mu_layer = layers.Dense(latent_dim * num_mixtures)
         self.logvar_layer = layers.Dense(latent_dim * num_mixtures)
         self.pi_layer = layers.Dense(num_mixtures, activation="softmax")
 
-    def call(self, raw_in, fft_in, rms_in, psd_in, ellipses, polygons, test_id, training=False):
-        feat_raw  = self.raw_enc(raw_in, training=training)    
-        feat_fft  = self.fft_enc(fft_in, training=training)
-        feat_rms  = self.rms_enc(rms_in, training=training)
-        feat_psd  = self.psd_enc(psd_in, training=training)
+    def call(self, raw_in, rms_in, psd_in, ellipses, polygons, test_id, training=False):
+        feat_raw = self.raw_enc(raw_in, training=training)
+        feat_rms = self.rms_enc(rms_in, training=training)
+        feat_psd = self.psd_enc(psd_in, training=training)
 
         # Concatenate ellipses and polygons as a single mask encoding
         mask_encoding = tf.concat([ellipses, polygons], axis=-1)
@@ -689,14 +746,14 @@ class MultiModalEncoder(keras.Model):
         test_id = tf.cast(test_id, tf.float32)
         test_id = tf.expand_dims(test_id, axis=-1)
 
-        # Concatenate all features: [B, (5*feature_dim + 1)]
-        combined_features = tf.concat([feat_raw, feat_fft, feat_rms, feat_psd, mask_encoding, test_id], axis=-1)
+        # Concatenate all features: [B, (4*feature_dim + 1)]
+        combined_features = tf.concat([feat_raw, feat_rms, feat_psd, mask_encoding, test_id], axis=-1)
 
         # Pass through aggregator MLP.
-        agg = self.fc_agg(combined_features)  
-        mu_unshaped = self.mu_layer(agg)      
-        logvar_unshaped = self.logvar_layer(agg)  
-        pi_final = self.pi_layer(agg)        
+        agg = self.fc_agg(combined_features)
+        mu_unshaped = self.mu_layer(agg)
+        logvar_unshaped = self.logvar_layer(agg)
+        pi_final = self.pi_layer(agg)
 
         # Reshape mu and logvar to [B, num_mixtures, latent_dim]
         latent_dim = tf.shape(mu_unshaped)[-1] // self.num_mixtures
@@ -842,7 +899,7 @@ class VAE(keras.Model):
         """
         # 1) Encode inputs into MoG latent space
         mu_final, logvar_final, pi_final, agg_features = self.encoder(
-            raw_in, fft_in, rms_in, psd_in, ellipses, polygons, test_id
+        raw_in, rms_in, psd_in, ellipses, polygons, test_id
         )
 
         # 2) Sample latent vector z using the MoG reparameterization trick
@@ -967,6 +1024,23 @@ def mog_log_prob_per_example(z, mu_q, logvar_q, pi_q, eps=1e-8):
 
     tf.debugging.assert_all_finite(log_mix, "NaN in mog_log_prob_per_example")
     return log_mix
+
+def compute_vae_loss(recon_loss, kl_loss, current_epoch, total_epochs):
+    """
+    Computes the VAE loss with KL annealing.
+    
+    Args:
+        recon_loss: Reconstruction loss (MSE or BCE).
+        kl_loss: KL divergence loss.
+        current_epoch: Current training epoch.
+        total_epochs: Total training epochs.
+    
+    Returns:
+        Total loss with annealed KL term.
+    """
+    kl_weight = min(1.0, current_epoch / total_epochs)  # Gradually scale KL weight from 0 → 1
+    total_loss = recon_loss + kl_weight * kl_loss
+    return total_loss, kl_weight  # Return KL weight for monitoring
 
 def kl_q_p_mixture(
     mu_q, logvar_q, pi_q,       # posterior mixture: shape [batch, K, latent_dim], [batch, K], etc.
@@ -1112,7 +1186,7 @@ def extract_latent_representations(model, dataset, preprocessed_masks):
 
         batch_ellipses = np.array(batch_ellipses, dtype=np.float32)
         batch_polygons = np.array(batch_polygons, dtype=np.float32)
-        test_id_in = np.array([int(float(tid)) for tid in test_id_in], dtype=np.int32)
+        test_id_in = np.array(test_id_in, dtype=np.int32).flatten()
 
         # ✅ Fix the Unpacking Issue - Use 4 Values
         mu_q, logvar_q, pi_q, _ = model.encoder(
@@ -1126,22 +1200,33 @@ def extract_latent_representations(model, dataset, preprocessed_masks):
 
 def reduce_latent_dim_umap(latent_vectors):
     """Reduces latent space dimensionality to 3D using UMAP."""
-    reducer = umap.UMAP(n_components=3, random_state=42)
+    reducer = umap.UMAP(n_components=3, random_state=42, n_neighbors=100)
     latent_vectors = latent_vectors.reshape(latent_vectors.shape[0], -1)  # Flatten to 2D
     latent_3d = reducer.fit_transform(latent_vectors)
     return latent_3d
 
 def plot_latent_space_3d(latent_3d, test_ids, output_file="latent_space.html"):
-    """Plots and saves a 3D UMAP visualization of the latent space."""
-    
+    """Plots and saves a 3D UMAP visualization of the latent space with a continuous color gradient over Test ID."""
+
     # Create a Pandas DataFrame for Plotly
     df = pd.DataFrame(latent_3d, columns=["UMAP_1", "UMAP_2", "UMAP_3"])
-    df["Test ID"] = test_ids  # Add test_id labels
+    df["Test ID"] = test_ids  # Store original Test IDs
 
-    # Create 3D Scatter Plot
+    # Ensure Test ID is treated as a continuous variable
+    df["Test ID"] = pd.to_numeric(df["Test ID"], errors="coerce")  # Convert to numeric in case of issues
+
+    # Normalize Test IDs for a smooth color gradient
+    df["Test ID Normalized"] = (df["Test ID"] - df["Test ID"].min()) / (df["Test ID"].max() - df["Test ID"].min())
+
+    # Print some debug information
+    print(f"Test ID min: {df['Test ID'].min()}, max: {df['Test ID'].max()}")
+    print(f"Unique Test ID count: {df['Test ID'].nunique()}")
+
+    # Ensure color is treated as continuous
     fig = px.scatter_3d(
         df, x="UMAP_1", y="UMAP_2", z="UMAP_3",
-        color=df["Test ID"].astype(str),  # Color by test_id
+        color=df["Test ID"],  # Use actual Test ID values to ensure a gradient
+        color_continuous_scale="Viridis",  # Continuous color scale
         title="Latent Space Visualization (3D UMAP)",
         opacity=0.8
     )
@@ -1149,6 +1234,25 @@ def plot_latent_space_3d(latent_3d, test_ids, output_file="latent_space.html"):
     # Save as interactive HTML
     pio.write_html(fig, file=output_file, auto_open=True)
     print(f"✅ 3D UMAP plot saved as {output_file}")
+
+def plot_latent_histograms(latent_vectors):
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
+    for i in range(3):  # Plot 3 random latent dimensions
+        axes[i].hist(latent_vectors[:, i], bins=50, alpha=0.75)
+        axes[i].set_title(f"Latent Dimension {i}")
+    plt.show()
+
+def estimate_mog_components(latent_vectors, max_components=10):
+    bics = []
+    for n in range(1, max_components):
+        gmm = GaussianMixture(n_components=n, covariance_type="full")
+        gmm.fit(latent_vectors)
+        bics.append(gmm.bic(latent_vectors))  # Lower BIC is better
+    plt.plot(range(1, max_components), bics, marker='o')
+    plt.xlabel("Number of Mixture Components")
+    plt.ylabel("BIC Score")
+    plt.title("Estimating Best MoG Components for Z")
+    plt.show()
 
 # ~~~~~~~~~~~~~~~~ DEFINE MOG PARAMETERS ~~~~~~~~~~~~~~~~~
 K = 3  # Number of mixture components
@@ -1159,15 +1263,22 @@ latent_dim_psd = 128
 latent_dim_mask = 128
 
 #-------------------- Training -------------------------
-def train_vae(model, train_dataset, val_dataset, mask_dict, preprocessed_masks, optimizer, num_epochs=100, use_mog=True):
+def train_vae(
+    model, 
+    train_dataset, 
+    val_dataset, 
+    mask_dict, 
+    preprocessed_masks, 
+    optimizer, 
+    num_epochs=100, 
+    use_mog=True,
+    patience=10
+):
     """
     Train loop for VAE using adaptive ellipses/polygons for mask representation.
-    Ensures empty masks do not affect loss computation unless the model predicts false damage.
-
-    Returns:
-      - train_total_losses, train_recon_losses, train_kl_losses
-      - val_total_losses, val_recon_losses, val_kl_losses
+    Incorporates KL annealing, LR scheduling, and early stopping.
     """
+
     mse_loss_fn = tf.keras.losses.MeanSquaredError()
     all_trainables = model.trainable_variables
 
@@ -1179,13 +1290,17 @@ def train_vae(model, train_dataset, val_dataset, mask_dict, preprocessed_masks, 
     val_recon_losses = []
     val_kl_losses = []
 
-    print("🔄 Starting Training... First Batch Soon...")
+    # For early stopping
+    best_val_loss = float('inf')
+    no_improvement_count = 0
+
+    print("🔄 Starting Training...")
 
     for epoch in range(num_epochs):
-        epoch_train_total, epoch_train_recon, epoch_train_kl = 0.0, 0.0, 0.0
+        epoch_train_total = 0.0
+        epoch_train_recon = 0.0
+        epoch_train_kl = 0.0
         train_steps = 0
-
-        print(f"🟢 Epoch {epoch+1}/{num_epochs} - Entering Training Loop")
 
         for step, (raw_in, fft_in, rms_in, psd_in, mask_in, test_id_in) in enumerate(train_dataset):
             # Convert test_id_in to list of integers
@@ -1202,61 +1317,69 @@ def train_vae(model, train_dataset, val_dataset, mask_dict, preprocessed_masks, 
                 batch_ellipses.append(mask_data["ellipses"])
                 batch_polygons.append(mask_data["polygons"])
 
-            # Convert to proper format before passing to model
             batch_ellipses = np.array(batch_ellipses, dtype=np.float32)
             batch_polygons = np.array(batch_polygons, dtype=np.float32)
-
-            # Convert test_id_in to int32
             test_id_in = np.array([int(float(tid)) for tid in test_id_in], dtype=np.int32)
 
             with tf.GradientTape() as tape:
                 recon_ts, recon_mask, (mu_final, logvar_final, pi_final) = model(
-                    raw_in, fft_in, rms_in, psd_in, batch_ellipses, batch_polygons, test_id_in, training=True
+                    raw_in, fft_in, rms_in, psd_in,
+                    batch_ellipses, batch_polygons, test_id_in,
+                    training=True
                 )
+                # 🔹 Fix: Clip mu to prevent large values
+                mu_final = tf.clip_by_value(mu_final, -10.0, 10.0)
 
-                # Extract predicted ellipses and polygons
                 pred_ellipses, pred_polygons = recon_mask
 
-                # Compute reconstruction loss (time-series)
+                # Reconstruction loss (time-series)
                 LAMBDA_FFT, LAMBDA_MSE = 0.7, 0.3
-                loss_ts = LAMBDA_MSE * mse_loss_fn(raw_in, recon_ts) + LAMBDA_FFT * fft_loss(raw_in, recon_ts)
+                loss_ts = mse_loss_fn(raw_in, recon_ts)
 
-                # Compute reconstruction loss (mask)
+                # Reconstruction loss (mask)
                 LAMBDA_ELLIPSE, LAMBDA_POLYGON = 0.7, 0.3
                 mask_recon_loss = 0.0
-                for true_e, true_p, pred_e, pred_p in zip(batch_ellipses, batch_polygons, pred_ellipses, pred_polygons):
+                for true_e, true_p, pe, pp in zip(batch_ellipses, batch_polygons, pred_ellipses, pred_polygons):
                     if len(true_e) == 0 and len(true_p) == 0:
-                        # print(f"🔍 Debug: true_e len={len(true_e)}, true_p len={len(true_p)}")
-                        if len(pred_e) == 0 and len(pred_p) == 0:
-                            mask_recon_loss += 0.0  # ✅ Correctly predicts no damage → no loss
-                        else:
-                            mask_recon_loss += 1.0  # ❌ False positive → apply penalty
-                    else: 
-                        loss_ellipses = LAMBDA_ELLIPSE * ellipse_loss(true_e, pred_e)
-                        print("✅ Ellipse Loss Computed")  # ✅ If stuck here, check true_e/pred_e
-                        loss_polygons = LAMBDA_POLYGON * polygon_loss(true_p, pred_p)
-                        mask_recon_loss += loss_ellipses + loss_polygons
+                        # If the model predicts something when there's no true damage -> penalty
+                        if len(pe) != 0 or len(pp) != 0:
+                            mask_recon_loss += 1.0
+                    else:
+                        mask_recon_loss += (
+                            LAMBDA_ELLIPSE * ellipse_loss(true_e, pe)
+                            + LAMBDA_POLYGON * polygon_loss(true_p, pp)
+                        )
 
                 recon_loss = 0.5 * (loss_ts + mask_recon_loss)
 
-                # Compute KL loss
+                # KL loss
                 if use_mog:
                     kl_loss = kl_q_p_mixture(
                         mu_q=mu_final, logvar_q=logvar_final, pi_q=pi_final,
-                        mu_p=tf.zeros_like(mu_final), logvar_p=tf.zeros_like(logvar_final),
+                        mu_p=tf.zeros_like(mu_final),
+                        logvar_p=tf.zeros_like(logvar_final),
                         pi_p=tf.ones_like(pi_final) / tf.cast(tf.shape(pi_final)[-1], tf.float32),
                         num_samples=1
                     )
                 else:
+                    # Standard Gaussian prior
+                    # 🔹 Fix: Clip logvar to prevent variance explosion
+                    logvar_final = tf.clip_by_value(logvar_final, -5.0, 5.0)
+
+                    # Compute KL loss
                     kl_loss = -0.5 * tf.reduce_mean(
                         1.0 + logvar_final - tf.square(mu_final) - tf.exp(logvar_final)
                     )
 
-                # KL Annealing (Prevent Early Instability)
-                KL_ANNEALING_EPOCHS = 100
-                BETA_START = 1e-6
-                BETA_MAX = 0.0001
-                BETA = min(BETA_START + (BETA_MAX - BETA_START) * (epoch / KL_ANNEALING_EPOCHS), BETA_MAX)
+
+                # KL Annealing: linearly ramp beta from BETA_START -> BETA_MAX over KL_ANNEALING_EPOCHS
+                KL_ANNEALING_EPOCHS = 400
+                BETA_START = 1e-10
+                BETA_MAX   = 1e-4
+                BETA = min(
+                    BETA_START + (BETA_MAX - BETA_START) * (epoch / KL_ANNEALING_EPOCHS),
+                    BETA_MAX
+                )
 
                 total_loss = recon_loss + BETA * kl_loss
 
@@ -1268,16 +1391,22 @@ def train_vae(model, train_dataset, val_dataset, mask_dict, preprocessed_masks, 
             epoch_train_kl += kl_loss.numpy()
             train_steps += 1
 
-        # Store training loss
+        # Compute average training losses for the epoch
         if train_steps > 0:
             train_total_losses.append(epoch_train_total / train_steps)
             train_recon_losses.append(epoch_train_recon / train_steps)
             train_kl_losses.append(epoch_train_kl / train_steps)
 
-        print(f"\nEpoch {epoch+1}/{num_epochs}")
-        print(f"  🟢 Train => Total: {train_total_losses[-1]:.4f}, Recon: {train_recon_losses[-1]:.4f}, KL: {train_kl_losses[-1]:.4f}")
+        # 🔹 Debug: Print latent space mean and variance to check instability
+        print(f"Epoch {epoch+1}/{num_epochs} | Mean(μ): {tf.reduce_mean(mu_final).numpy():.4f}, "
+        f"Var(σ²): {tf.reduce_mean(tf.exp(logvar_final)).numpy():.4f}")
 
-        # 🔹 Compute validation loss
+        print(f"  🟢 Train => Total: {train_total_losses[-1]:.4f}, "
+              f"Recon: {train_recon_losses[-1]:.4f}, "
+              f"KL: {train_kl_losses[-1]:.4f}, "
+              f"Beta: {BETA:.7f}")
+
+        # ------------------ Validation Loop ------------------
         epoch_val_total, epoch_val_recon, epoch_val_kl = 0.0, 0.0, 0.0
         val_steps = 0
 
@@ -1298,22 +1427,47 @@ def train_vae(model, train_dataset, val_dataset, mask_dict, preprocessed_masks, 
             batch_polygons = np.array(batch_polygons, dtype=np.float32)
             test_id_in = np.array([int(float(tid)) for tid in test_id_in], dtype=np.int32)
 
+            # Forward pass
             recon_ts, recon_mask, (mu_final, logvar_final, pi_final) = model(
                 raw_in, fft_in, rms_in, psd_in, batch_ellipses, batch_polygons, test_id_in, training=False
             )
+            # 🔹 Fix: Clip `mu_final` to prevent extreme mean values
+            mu_final = tf.clip_by_value(mu_final, -10.0, 10.0)
+
+            # 🔹 Fix: Clip `logvar_final` to prevent variance explosion
+            logvar_final = tf.clip_by_value(logvar_final, -5.0, 5.0)
 
             pred_ellipses, pred_polygons = recon_mask
+
             loss_ts = LAMBDA_MSE * mse_loss_fn(raw_in, recon_ts) + LAMBDA_FFT * fft_loss(raw_in, recon_ts)
 
             mask_recon_loss = 0.0
-            for true_e, true_p, pred_e, pred_p in zip(batch_ellipses, batch_polygons, pred_ellipses, pred_polygons):
-                loss_ellipses = LAMBDA_ELLIPSE * ellipse_loss(true_e, pred_e)
-                loss_polygons = LAMBDA_POLYGON * polygon_loss(true_p, pred_p)
-                mask_recon_loss += loss_ellipses + loss_polygons
+            for true_e, true_p, pe, pp in zip(batch_ellipses, batch_polygons, pred_ellipses, pred_polygons):
+                if len(true_e) == 0 and len(true_p) == 0:
+                    if len(pe) != 0 or len(pp) != 0:
+                        mask_recon_loss += 1.0
+                else:
+                    mask_recon_loss += (
+                        LAMBDA_ELLIPSE * ellipse_loss(true_e, pe)
+                        + LAMBDA_POLYGON * polygon_loss(true_p, pp)
+                    )
 
             recon_loss = 0.5 * (loss_ts + mask_recon_loss)
-            kl_loss = -0.5 * tf.reduce_mean(1.0 + logvar_final - tf.square(mu_final) - tf.exp(logvar_final))
 
+            if use_mog:
+                kl_loss = kl_q_p_mixture(
+                    mu_q=mu_final, logvar_q=logvar_final, pi_q=pi_final,
+                    mu_p=tf.zeros_like(mu_final),
+                    logvar_p=tf.zeros_like(logvar_final),
+                    pi_p=tf.ones_like(pi_final) / tf.cast(tf.shape(pi_final)[-1], tf.float32),
+                    num_samples=1
+                )
+            else:
+                kl_loss = -0.5 * tf.reduce_mean(
+                    1.0 + logvar_final - tf.square(mu_final) - tf.exp(logvar_final)
+                )
+
+            # Use the same Beta so validation is consistent with training
             total_loss = recon_loss + BETA * kl_loss
 
             epoch_val_total += total_loss.numpy()
@@ -1325,10 +1479,34 @@ def train_vae(model, train_dataset, val_dataset, mask_dict, preprocessed_masks, 
             val_total_losses.append(epoch_val_total / val_steps)
             val_recon_losses.append(epoch_val_recon / val_steps)
             val_kl_losses.append(epoch_val_kl / val_steps)
-        
-        print(f"  🔵 Val   => Total: {val_total_losses[-1]:.4f}, Recon: {val_recon_losses[-1]:.4f}, KL: {val_kl_losses[-1]:.4f}")
 
-    return train_total_losses, train_recon_losses, train_kl_losses, val_total_losses, val_recon_losses, val_kl_losses
+        print(f"  🔵 Val   => Total: {val_total_losses[-1]:.4f}, "
+              f"Recon: {val_recon_losses[-1]:.4f}, "
+              f"KL: {val_kl_losses[-1]:.4f}")
+
+        # -------------- Early Stopping --------------
+        current_val_loss = val_total_losses[-1]
+        if current_val_loss < best_val_loss:
+            best_val_loss = current_val_loss
+            no_improvement_count = 0
+            # (Optional) Save best model weights
+            # model.save_weights("results/best_model_weights.h5")
+        else:
+            no_improvement_count += 1
+            print(f"🚨 No improvement for {no_improvement_count}/{patience} epochs.")
+
+        if no_improvement_count >= patience:
+            print(f"🛑 Early stopping triggered at epoch {epoch+1}. No improvement for {patience} epochs.")
+            break
+
+    return (
+        train_total_losses,
+        train_recon_losses,
+        train_kl_losses,
+        val_total_losses,
+        val_recon_losses,
+        val_kl_losses
+    )
 
 #--------------------- Plots ---------------------------
 def plot_training_curves(train_total, train_recon, train_kl, val_total, val_recon, val_kl):
@@ -1483,12 +1661,13 @@ def save_trained_model(weights_path):
 
 # ----- Main Script -----
 def main():
+    # ------------------------ GPU & Memory Setup ------------------------
     configure_gpu()
     clear_gpu_memory()
     print_detailed_memory()
     print("\nNum GPUs Available: ", len(tf.config.list_physical_devices('GPU')))
 
-    # 1) Load data
+    # ------------------------ 1) Load Data ------------------------
     accel_dict, mask_dict = data_loader.load_data()
     gen = segment_and_transform(accel_dict, mask_dict)
     try:
@@ -1519,9 +1698,9 @@ def main():
         if not isinstance(mask, np.ndarray):
             print(f"[ERROR] Mask for Test ID {key} is not a NumPy array! Found: {type(mask)}")
     
-    print("--------------------------------------------------")         
+    print("--------------------------------------------------")
 
-    # 2) Convert to float32
+    # ------------------------ 2) Convert to Float32 ------------------------
     raw_segments  = raw_segments.astype(np.float32)
     fft_segments  = fft_segments.astype(np.float32)
     rms_segments  = rms_segments.astype(np.float32)
@@ -1529,12 +1708,12 @@ def main():
     mask_segments = mask_segments.astype(np.float32)
     test_ids      = test_ids.astype(np.float32)
 
-    # 3) Shuffle and split into train/val (80/20)
+    # ------------------------ 3) Shuffle and Split into Train/Val ------------------------
     N = raw_segments.shape[0]
     indices = np.random.permutation(N)
     train_size = int(0.8 * N)
     train_idx = indices[:train_size]
-    val_idx = indices[train_size:]
+    val_idx   = indices[train_size:]
 
     train_raw   = raw_segments[train_idx]
     train_fft   = fft_segments[train_idx]
@@ -1550,82 +1729,103 @@ def main():
     val_mask  = mask_segments[val_idx]
     val_ids   = test_ids[val_idx]
 
-    # ---- Precompute Ellipse/Polygon Representations for Unique Test IDs ----
+    # ------------------------ 4) Precompute Ellipse/Polygon Representations ------------------------
     print("\nPrecomputing ellipse/polygon encodings for unique test IDs...")
-    preprocessed_masks = preprocess_all_masks(mask_dict)  # Stores {test_id: (ellipses, polygons)}
+    preprocessed_masks = preprocess_all_masks(mask_dict)  # {test_id: {"ellipses": [...], "polygons": [...]} }
     print("Preprocessing complete.")
 
     print("\n🔎 Debug: Checking Preprocessed Masks")
     for key in list(preprocessed_masks.keys())[:5]:  # Print first 5 entries
         print(f"Test ID {key}: {preprocessed_masks[key]}")
 
-
-    # 4) Build tf.data Datasets.
-    BATCH_SIZE = 64
-    train_dataset = create_tf_dataset(train_raw, train_fft, train_rms, train_psd, train_mask, train_ids, batch_size=BATCH_SIZE)
-    val_dataset = create_tf_dataset(val_raw, val_fft, val_rms, val_psd, val_mask, val_ids, batch_size=BATCH_SIZE)
+    # ------------------------ 5) Build tf.data Datasets ------------------------
+    BATCH_SIZE = 128
+    train_dataset = create_tf_dataset(
+        train_raw, train_fft, train_rms, train_psd, train_mask, train_ids, batch_size=BATCH_SIZE
+    )
+    val_dataset = create_tf_dataset(
+        val_raw, val_fft, val_rms, val_psd, val_mask, val_ids, batch_size=BATCH_SIZE
+    )
 
     print(f"Train batches: {len(train_dataset)}")
     print(f"Val batches:   {len(val_dataset)}")
 
-    # 5) Build & train model.
-    latent_dim = 128
+    # ------------------------ 6) Build & Train Model ------------------------
+    latent_dim  = 128
     feature_dim = 128
-    model = VAE(latent_dim, feature_dim)
-    # AdamW -> helps prevent overfitting
-    optimizer = keras.optimizers.AdamW(learning_rate=1e-5, weight_decay=1e-4)
-    # Nadam -> good for complex loss landscapes
-    #optimizer = keras.optimizers.Nadam(learning_rate=1e-5)
-    # Adafactor -> good for high-dim data
-    #optimizer = tf.keras.optimizers.experimental.Adafactor(learning_rate=1e-5)
+    model = VAE(latent_dim, feature_dim)  # Your custom VAE model
+
+    # (a) Learning Rate Scheduler
+    decay_steps = 20000
+    decay_rate  = 0.95
+    lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
+        initial_learning_rate=1e-6,  # start a bit higher
+        decay_steps=decay_steps,
+        decay_rate=decay_rate,
+        staircase=False  # smooth decay
+    )
+
+    # (b) Build Optimizer with LR Schedule
+    optimizer = keras.optimizers.AdamW(
+        learning_rate=lr_schedule,
+        weight_decay=1e-4
+    )
 
     print_detailed_memory()
 
-    (train_total, train_recon, train_kl,
-     val_total, val_recon, val_kl) = train_vae(
-         model=model,
-         train_dataset=train_dataset,
-         val_dataset=val_dataset,
-         mask_dict=mask_dict, 
-         preprocessed_masks=preprocessed_masks,
-         optimizer=optimizer,
-         num_epochs=10,
-         use_mog=True
-     )
+    # (c) Train using your custom train_vae function
+    (
+        train_total,
+        train_recon,
+        train_kl,
+        val_total,
+        val_recon,
+        val_kl
+    ) = train_vae(
+        model=model,
+        train_dataset=train_dataset,
+        val_dataset=val_dataset,
+        mask_dict=mask_dict,
+        preprocessed_masks=preprocessed_masks,
+        optimizer=optimizer,
+        num_epochs=800,   # or whichever number of epochs you want
+        use_mog=False,     # mixture-of-gaussians prior
+        patience=800       # early stopping patience
+    )
 
-    # 6) Save weights.
+    # ------------------------ 7) Save Weights ------------------------
     model.save_weights("results/vae_mmodal_weights.h5")
     print("Saved model weights to results/vae_mmodal_weights.h5")
 
-    # 1Extract latent representations
-    latent_vectors, test_ids = extract_latent_representations(model, train_dataset, preprocessed_masks)
-
-
-    # Reduce to 3D with UMAP
+    # ------------------------ 8) Visualize Latent Space with UMAP ------------------------
+    latent_vectors, test_ids_arr = extract_latent_representations(model, train_dataset, preprocessed_masks)
     latent_3d = reduce_latent_dim_umap(latent_vectors)
+    plot_latent_space_3d(latent_3d, test_ids_arr)
 
-    # Generate interactive 3D plot and save as HTML
-    plot_latent_space_3d(latent_3d, test_ids)
+    # Extract latent representations from the trained model
+    latent_vectors, _ = extract_latent_representations(model, train_dataset, preprocessed_masks)
 
+    # Plot histograms for 3 latent dimensions
+    plot_latent_histograms(latent_vectors)
 
-    # 7) Plot training curves using Plotly.
+    # ------------------------ 9) Plot Training Curves ------------------------
     plot_training_curves(train_total, train_recon, train_kl, val_total, val_recon, val_kl)
 
-    # 8) Generate and plot 5 random samples.
-    plot_generated_samples(model, latent_dim, num_samples=5)
+    # # 10) Generate and plot 5 random samples.
+    # plot_generated_samples(model, latent_dim, num_samples=5)
 
-    # 9) Generate synthetic data
-    results_dir = "results/vae_results"
-    os.makedirs(results_dir, exist_ok=True)
+    # # 11) Generate synthetic data
+    # results_dir = "results/vae_results"
+    # os.makedirs(results_dir, exist_ok=True)
 
-    num_synthetic = 50
-    for i in range(num_synthetic):
-        z_rand = tf.random.normal(shape=(1, latent_dim))
-        gen_ts, gen_mask = model.generate(z_rand)
+    # num_synthetic = 50
+    # for i in range(num_synthetic):
+    #     z_rand = tf.random.normal(shape=(1, latent_dim))
+    #     gen_ts, gen_mask = model.generate(z_rand)
 
-        np.save(os.path.join(results_dir, f"gen_ts_{i}.npy"), gen_ts.numpy())
-        np.save(os.path.join(results_dir, f"gen_mask_{i}.npy"), gen_mask.numpy())
-        logging.info(f"Saved synthetic sample {i}")
+    #     np.save(os.path.join(results_dir, f"gen_ts_{i}.npy"), gen_ts.numpy())
+    #     np.save(os.path.join(results_dir, f"gen_mask_{i}.npy"), gen_mask.numpy())
+    #     logging.info(f"Saved synthetic sample {i}")
 
 
 if __name__ == "__main__":
