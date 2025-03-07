@@ -89,7 +89,7 @@ def load_combined_label(test_id, labels_dir=LABELS_DIR, image_shape=IMAGE_SHAPE)
     return np.concatenate(images, axis=1)
 
 ######################################
-# Crack Detection and Processing
+# Mask and skeleton computations
 ######################################
 def compute_binary_mask(combined_image):
     # Your existing code - unchanged
@@ -110,13 +110,20 @@ def skeletonize_mask(mask):
     return skel
 
 def skeleton_to_components(skeleton):
-    # Your existing code - unchanged
+    """
+    Uses connected components analysis to identify individual crack segments
+    Each component (a group of connected pixels) represents a separate crack or crack segment
+    These components are then ordered, split into smaller segments, and analyzed
+    """
     num_labels, labels = cv2.connectedComponents(skeleton)
     return [np.column_stack(np.where(labels == label)) for label in range(1, num_labels)]
 
 def enhance_skeleton(skeleton, max_gap=8, curving_preference=True):
     """
     Enhanced skeleton processing with better handling of curved segments.
+    It identifies endpoints (pixels with only one neighbor)
+    For nearby endpoints, it creates connections (straight lines or Bezier curves)
+    This helps recover connections that might have been broken during processing
     
     Args:
         skeleton: Binary skeleton image
@@ -269,59 +276,6 @@ def enhance_skeleton(skeleton, max_gap=8, curving_preference=True):
     
     print(f"Enhanced skeleton with {connections_made} connections")
     return enhanced
-
-def detect_crack_extension(segment, prev_descriptors, keypoint_count=20, position_threshold=12):
-    """
-    Detects if a segment is an extension of an existing crack.
-    
-    Returns:
-        (is_extension, base_descriptor) - Boolean indicator and the base descriptor it extends
-    """
-    if not prev_descriptors or len(prev_descriptors) == 0:
-        return False, None
-    
-    # Compute temporary descriptor for comparison
-    temp_desc = compute_crack_descriptors(segment, keypoint_count, is_new=0)
-    if temp_desc is None or len(temp_desc) < 9:
-        return False, None
-    
-    # Extract base info
-    base = temp_desc[:9]
-    start = np.array([base[0], base[1]])
-    end = np.array([base[2], base[3]])
-    
-    # Check each previous descriptor for potential extension
-    for prev_desc in prev_descriptors:
-        if len(prev_desc) < 9:
-            continue
-            
-        prev_base = prev_desc[:9]
-        prev_start = np.array([prev_base[0], prev_base[1]])
-        prev_end = np.array([prev_base[2], prev_base[3]])
-        
-        # Check distances between endpoints
-        dist_start_start = np.linalg.norm(start - prev_start)
-        dist_start_end = np.linalg.norm(start - prev_end)
-        dist_end_start = np.linalg.norm(end - prev_start)
-        dist_end_end = np.linalg.norm(end - prev_end)
-        
-        # For a crack extension, exactly one endpoint should match closely
-        # and the other should be far away (the extended part)
-        if ((dist_start_start < position_threshold and dist_end_end > position_threshold * 1.5) or 
-            (dist_start_end < position_threshold and dist_end_start > position_threshold * 1.5) or
-            (dist_end_start < position_threshold and dist_start_end > position_threshold * 1.5) or
-            (dist_end_end < position_threshold and dist_start_start > position_threshold * 1.5)):
-            
-            # Check orientation similarity for better matching
-            orientation1 = base[5]
-            orientation2 = prev_base[5]
-            angle_diff = abs(orientation1 - orientation2)
-            angle_diff = min(angle_diff, np.pi - angle_diff)  # Handle circular wrapping
-            
-            if angle_diff < 0.7:  # Fairly relaxed angle constraint for extensions
-                return True, prev_desc
-                
-    return False, None
 
 ######################################
 # Improved Crack Representation
@@ -489,26 +443,6 @@ def split_crack_segments(ordered_pts, min_segment_length=2,
             segments.append(ordered_pts[start_idx:end_idx])
     
     return segments
-
-def fit_spline_to_segment(segment, smoothing=1.0, num_points=10):
-    """Fit a B-spline to points and extract control points for compact representation."""
-    if len(segment) < 4:  # Need at least 4 points for cubic spline
-        return None, None
-    
-    try:
-        # Fit a parametric spline to the points
-        tck, u = splprep([segment[:, 0], segment[:, 1]], s=smoothing, k=3)
-        
-        # Sample points along the spline for visualization/comparison
-        u_new = np.linspace(0, 1, num_points)
-        x_new, y_new = splev(u_new, tck)
-        
-        # Return both the spline parameters and sampled points
-        sampled_points = np.column_stack([x_new, y_new])
-        return tck, sampled_points
-    except Exception as e:
-        print(f"Warning: Spline fitting failed: {e}")
-        return None, None
 
 def compute_keypoints(ordered_pts, num_keypoints=18):
     """
@@ -684,15 +618,7 @@ def compute_keypoints(ordered_pts, num_keypoints=18):
 
 def compute_crack_descriptors(ordered_pts, keypoint_count=20, is_new=0):
     """
-    Compute descriptors without growth flag.
-    
-    Args:
-        ordered_pts: Points along the crack
-        keypoint_count: Number of keypoints to sample
-        is_new: Flag indicating a new crack (1) or existing (0)
-        
-    Returns:
-        Descriptor with base info and keypoints
+    Compute descriptors with improved orientation calculation
     """
     if len(ordered_pts) < 2:
         return None
@@ -702,10 +628,26 @@ def compute_crack_descriptors(ordered_pts, keypoint_count=20, is_new=0):
     row_end, col_end = ordered_pts[-1]
     path_length = np.sum(np.linalg.norm(np.diff(ordered_pts, axis=0), axis=1))
     
-    dy, dx = row_end - row_start, col_end - col_start
-    orientation = np.arctan2(dy, dx)
+    # IMPROVED: Calculate both endpoint-based orientation and local orientations at start/end
+    overall_orientation = np.arctan2(row_end - row_start, col_end - col_start)
     
-    # Calculate curvature
+    # Calculate local orientation at start (using first few points)
+    start_window = min(5, len(ordered_pts) - 1)
+    dy_start = ordered_pts[start_window][0] - ordered_pts[0][0]
+    dx_start = ordered_pts[start_window][1] - ordered_pts[0][1]
+    start_orientation = np.arctan2(dy_start, dx_start)
+    
+    # Calculate local orientation at end (using last few points)
+    end_window = max(0, len(ordered_pts) - 6)
+    dy_end = ordered_pts[-1][0] - ordered_pts[end_window][0]
+    dx_end = ordered_pts[-1][1] - ordered_pts[end_window][1]
+    end_orientation = np.arctan2(dy_end, dx_end)
+    
+    # Calculate orientation difference between start and end
+    orientation_diff = abs(start_orientation - end_orientation)
+    orientation_diff = min(orientation_diff, 2*np.pi - orientation_diff)  # Handle circular wrapping
+    
+    # Calculate curvature as before
     curvature_vals = []
     for i in range(1, len(ordered_pts) - 1):
         v1 = ordered_pts[i] - ordered_pts[i - 1]
@@ -728,11 +670,12 @@ def compute_crack_descriptors(ordered_pts, keypoint_count=20, is_new=0):
     # Extract keypoints along the path with improved sampling
     keypoints = compute_keypoints(ordered_pts, keypoint_count)
     
-    # Create base descriptor without growth flag
+    # Create base descriptor with orientation difference and local orientations
     base_descriptor = np.array([
         row_start, col_start, row_end, col_end, 
-        path_length, orientation, avg_curvature, 
-        len(ordered_pts), is_new
+        path_length, overall_orientation, avg_curvature, 
+        len(ordered_pts), is_new,  # Original 9 elements
+        start_orientation, end_orientation, orientation_diff  # New orientation metrics
     ])
     
     # Flatten keypoints into a 1D array
@@ -743,7 +686,92 @@ def compute_crack_descriptors(ordered_pts, keypoint_count=20, is_new=0):
     
     return full_descriptor
 
+def create_rasterized_mask(descriptors, image_shape):
+    """
+    Create a rasterized mask from crack descriptors.
+    This is used to identify pixels that belong to cracks in a given test.
+    
+    Args:
+        descriptors: List of crack descriptors
+        image_shape: Shape of the output mask
+        
+    Returns:
+        A binary mask where 1 indicates crack pixels
+    """
+    mask = np.zeros(image_shape, dtype=np.uint8)
+    
+    if not descriptors:
+        return mask
+    
+    for desc in descriptors:
+        if len(desc) < 10:  # Need at least one keypoint after base descriptor
+            continue
+            
+        # Extract keypoints
+        keypoints_flat = desc[9:]
+        
+        # Handle case where keypoints_flat has odd length
+        if len(keypoints_flat) % 2 != 0:
+            keypoints_flat = np.append(keypoints_flat, keypoints_flat[-1])
+        
+        num_keypoints = len(keypoints_flat) // 2
+        keypoints = keypoints_flat.reshape(num_keypoints, 2)
+        
+        # Draw lines between consecutive keypoints
+        for i in range(len(keypoints) - 1):
+            pt1 = keypoints[i].astype(int)
+            pt2 = keypoints[i + 1].astype(int)
+            
+            if (0 <= pt1[0] < image_shape[0] and 0 <= pt1[1] < image_shape[1] and
+                0 <= pt2[0] < image_shape[0] and 0 <= pt2[1] < image_shape[1]):
+                cv2.line(mask, (pt1[1], pt1[0]), (pt2[1], pt2[0]), 1, 1)
+    
+    return mask
+
 def is_similar_crack(desc1, desc2, position_threshold=12, angle_threshold=0.5):
+    """
+    Check if two crack descriptors represent the same crack.
+    Now handles extended descriptors with local orientations.
+    """
+    # Safety check for descriptor format - ensure we have at least the basic descriptor
+    base_desc_length = 12  # Updated to include the new orientation elements
+    if len(desc1) < base_desc_length or len(desc2) < base_desc_length:
+        # Fallback to original format if the new fields aren't available
+        return is_similar_crack_original(desc1, desc2, position_threshold, angle_threshold)
+    
+    # Extract base descriptors
+    base1 = desc1[:base_desc_length]
+    base2 = desc2[:base_desc_length]
+    
+    # Extract endpoints
+    start1 = np.array([base1[0], base1[1]])
+    end1 = np.array([base1[2], base1[3]])
+    start2 = np.array([base2[0], base2[1]])
+    end2 = np.array([base2[2], base2[3]])
+    
+    # Check distances between endpoints
+    dist_start_start = np.linalg.norm(start1 - start2)
+    dist_start_end = np.linalg.norm(start1 - end2)
+    dist_end_start = np.linalg.norm(end1 - start2)
+    dist_end_end = np.linalg.norm(end1 - end2)
+    
+    min_dist = min(dist_start_start, dist_start_end, dist_end_start, dist_end_end)
+    
+    # Compare local orientations and orientation differences
+    # This helps with curved cracks like half-circles
+    orientation_diff1 = base1[11]  # orientation_diff from first descriptor
+    orientation_diff2 = base2[11]  # orientation_diff from second descriptor
+    
+    # Similar curvature patterns should have similar orientation differences
+    curve_pattern_match = abs(orientation_diff1 - orientation_diff2) < angle_threshold * 2
+    
+    # For curved segments, also check if keypoints overlap
+    curve_overlap = check_keypoint_overlap(desc1, desc2, position_threshold)
+    
+    # Match criteria: endpoints are close OR keypoints overlap, AND curve patterns match
+    return ((min_dist < position_threshold or curve_overlap) and curve_pattern_match)
+
+def is_similar_crack_original(desc1, desc2, position_threshold=12, angle_threshold=0.5):
     """
     Improved crack comparison with better handling of curved segments.
     Considers both endpoints and midpoints for matching.
@@ -809,7 +837,61 @@ def is_similar_crack(desc1, desc2, position_threshold=12, angle_threshold=0.5):
     # Consider it a match if endpoints are close OR we have curve overlap
     return (min_dist < position_threshold or curve_overlap) and angle_match
 
-def process_test_cracks(mask, prev_test_descriptors=None, keypoint_count=20, max_gap=10, 
+def check_keypoint_overlap(desc1, desc2, position_threshold):
+    """Helper function to check if keypoints of two cracks overlap"""
+    # Make sure we have keypoints and they are of even length (pairs of coordinates)
+    if (len(desc1) > 12 and len(desc2) > 12 and 
+        (len(desc1) - 12) % 2 == 0 and (len(desc2) - 12) % 2 == 0):
+        
+        # Reshape safely with the correct number of points
+        keypoints1 = desc1[12:].reshape(-1, 2)
+        keypoints2 = desc2[12:].reshape(-1, 2)
+        
+        # Check middle keypoint distance (helps with curved segments)
+        if len(keypoints1) > 0 and len(keypoints2) > 0:
+            mid1 = keypoints1[len(keypoints1)//2]
+            
+            # Find closest point in the other crack
+            min_mid_dist = float('inf')
+            for kp2 in keypoints2:
+                dist = np.linalg.norm(mid1 - kp2)
+                min_mid_dist = min(min_mid_dist, dist)
+            
+            # If middle points are close, consider it a match
+            if min_mid_dist < position_threshold:
+                return True
+    
+    return False
+
+def process_test_cracks(mask, prev_test_skeleton=None, keypoint_count=20, max_gap=10):
+    """
+    Process cracks with improved new crack identification using skeleton subtraction.
+    
+    Args:
+        mask: Binary mask of cracks
+        prev_test_skeleton: Skeleton from previous test (None for first test)
+        keypoint_count: Number of keypoints for each crack
+        max_gap: Maximum gap to connect in skeleton enhancement
+        
+    Returns:
+        descriptors: List of crack descriptors
+    """
+    # Create skeleton from mask
+    skeleton = skeletonize_mask(mask)
+    
+    # Enhanced skeleton - try to connect broken segments
+    enhanced_skeleton = enhance_skeleton(skeleton, max_gap=max_gap, curving_preference=True)
+    
+    # Identify new vs. continued cracks using skeleton subtraction
+    new_descriptors, continued_descriptors = identify_new_cracks(
+        enhanced_skeleton, prev_test_skeleton, keypoint_count)
+    
+    # Combine all descriptors
+    all_descriptors = new_descriptors + continued_descriptors
+    
+    return all_descriptors, enhanced_skeleton  # Return skeleton for next test
+
+def process_test_cracks_original(mask, prev_test_descriptors=None, keypoint_count=20, max_gap=10, 
                        curved_threshold=10, curved_angle_threshold=85, 
                        straight_angle_threshold=20, min_segment_length=2):
     """
@@ -890,10 +972,135 @@ def process_test_cracks(mask, prev_test_descriptors=None, keypoint_count=20, max
     
     return crack_descriptors
 
+def identify_new_cracks(current_skeleton, previous_skeleton, keypoint_count=20):
+    """
+    Identify new cracks by subtracting previous skeleton from current.
+    Handles both entirely new cracks and extensions of existing cracks.
+    
+    Args:
+        current_skeleton: Binary skeleton image from current test
+        previous_skeleton: Binary skeleton image from previous test
+        keypoint_count: Number of keypoints for descriptor generation
+        
+    Returns:
+        List of descriptors for new cracks, List of descriptors for continued cracks
+    """
+    if previous_skeleton is None:
+        # If no previous skeleton, all cracks are new
+        components = skeleton_to_components(current_skeleton)
+        new_crack_descriptors = []
+        
+        for component in components:
+            if len(component) < 3:
+                continue
+                
+            ordered_pts = order_points_along_path(component)
+            segments = split_crack_segments(ordered_pts)
+            
+            for segment in segments:
+                if len(segment) < 3:
+                    continue
+                    
+                descriptor = compute_crack_descriptors(segment, keypoint_count, is_new=1)
+                if descriptor is not None:
+                    new_crack_descriptors.append(descriptor)
+                    
+        return new_crack_descriptors, []
+    
+    # Create a dilated version of previous skeleton to better match pixel locations
+    dilated_previous = cv2.dilate(previous_skeleton, np.ones((3,3), np.uint8))
+    
+    # 1. Find completely new cracks (not present in previous test)
+    new_regions = np.logical_and(current_skeleton > 0, dilated_previous == 0).astype(np.uint8)
+    
+    # 2. Find continued/existing cracks (present in both tests)
+    continued_regions = np.logical_and(current_skeleton > 0, dilated_previous > 0).astype(np.uint8)
+    
+    # Process new crack regions
+    new_components = skeleton_to_components(new_regions)
+    new_crack_descriptors = []
+    
+    for component in new_components:
+        if len(component) < 3:
+            continue
+            
+        ordered_pts = order_points_along_path(component)
+        segments = split_crack_segments(ordered_pts)
+        
+        for segment in segments:
+            if len(segment) < 3:
+                continue
+                
+            descriptor = compute_crack_descriptors(segment, keypoint_count, is_new=1)
+            if descriptor is not None:
+                new_crack_descriptors.append(descriptor)
+    
+    # Process continued crack regions
+    continued_components = skeleton_to_components(continued_regions)
+    continued_crack_descriptors = []
+    
+    for component in continued_components:
+        if len(component) < 3:
+            continue
+            
+        ordered_pts = order_points_along_path(component)
+        segments = split_crack_segments(ordered_pts)
+        
+        for segment in segments:
+            if len(segment) < 3:
+                continue
+                
+            descriptor = compute_crack_descriptors(segment, keypoint_count, is_new=0)
+            if descriptor is not None:
+                continued_crack_descriptors.append(descriptor)
+    
+    # 3. Handle special case: crack extensions
+    # Check if any new crack connects to a continued crack
+    # This identifies cracks that have grown from existing ones
+    extension_descriptors = []
+    indices_to_remove = []  # Track indices instead of removing items during iteration
+    
+    for i, new_desc in enumerate(new_crack_descriptors):
+        is_extension = False
+        
+        for cont_desc in continued_crack_descriptors:
+            # Extract endpoints
+            new_start = np.array([new_desc[0], new_desc[1]])
+            new_end = np.array([new_desc[2], new_desc[3]])
+            cont_start = np.array([cont_desc[0], cont_desc[1]])
+            cont_end = np.array([cont_desc[2], cont_desc[3]])
+            
+            # Check if any endpoint is close to an endpoint of a continued crack
+            dist_start_start = np.linalg.norm(new_start - cont_start)
+            dist_start_end = np.linalg.norm(new_start - cont_end)
+            dist_end_start = np.linalg.norm(new_end - cont_start)
+            dist_end_end = np.linalg.norm(new_end - cont_end)
+            
+            # Consider it an extension if one endpoint is close
+            min_dist = min(dist_start_start, dist_start_end, dist_end_start, dist_end_end)
+            if min_dist < 8:  # Threshold for connecting points
+                is_extension = True
+                # This is an extension part (keep it marked as new)
+                extension_descriptors.append(new_desc)
+                indices_to_remove.append(i)
+                break
+    
+    # Remove items from original list in reverse order to maintain valid indices
+    for idx in sorted(indices_to_remove, reverse=True):
+        new_crack_descriptors.pop(idx)
+                
+    # Add extension descriptors back to new crack descriptors
+    new_crack_descriptors.extend(extension_descriptors)
+                
+    return new_crack_descriptors, continued_crack_descriptors
+
+######################################
+# Reconstruction
+######################################
 def reconstruct_mask_from_descriptors(descriptors, image_shape, line_thickness=1):
     """
     Reconstructs a binary mask with thickness that matches the original mask.
-    Properly handles descriptors with potentially uneven keypoint lengths.
+    Updated to handle the extended descriptor format.
     """
     # Create empty mask
     mask = np.zeros(image_shape, dtype=np.uint8)
@@ -902,12 +1109,11 @@ def reconstruct_mask_from_descriptors(descriptors, image_shape, line_thickness=1
         return mask
     
     for desc in descriptors:
-        if len(desc) < 10:  # Need at least one keypoint after base descriptor
-            continue
-            
-        # Extract base descriptor and keypoints
-        base = desc[:9]
-        keypoints_flat = desc[9:]
+        # Check if we have the extended descriptor format (12 base elements)
+        base_length = 12 if len(desc) >= 12 else 9
+        
+        # Extract keypoints
+        keypoints_flat = desc[base_length:]
         
         # Handle case where keypoints_flat has odd length
         if len(keypoints_flat) % 2 != 0:
@@ -929,18 +1135,14 @@ def reconstruct_mask_from_descriptors(descriptors, image_shape, line_thickness=1
     
     return mask
 
-def validate_crack_detection(test_ids, crack_dict, binary_masks, extension_segments=None, output_dir="debug_validation"):
+def validate_crack_detection(test_ids, crack_dict, binary_masks, skeletons, output_dir="improved_validation"):
     """
-    Simplified validation function without extension tracking.
-    
-    Args:
-        test_ids: List of test IDs to validate
-        crack_dict: Dictionary mapping test ID to crack descriptors
-        binary_masks: Dictionary mapping test ID to original masks
-        extension_segments: Dictionary of extension segments by test_id (optional) - can be None
-        output_dir: Directory to save validation images
+    Improved validation function with simplified visualization focusing on:
+    - New damage (green)
+    - Old damage (gray)
+    - False negatives (red)
+    - False positives (blue)
     """
-    import os
     os.makedirs(output_dir, exist_ok=True)
     
     # For each consecutive pair of test IDs
@@ -958,81 +1160,32 @@ def validate_crack_detection(test_ids, crack_dict, binary_masks, extension_segme
         if not curr_cracks or not next_cracks:
             continue
         
-        # Create visualization
+        # Create visualization with black background
         shape = binary_masks[curr_id].shape
         vis_img = np.zeros((shape[0], shape[1], 3), dtype=np.uint8)
         
-        # Draw original masks as a red overlay (semi-transparent)
-        original_mask = np.zeros_like(vis_img)
-        original_mask[binary_masks[next_id] > 0] = [0, 0, 128]  # Dark red for original
-        vis_img = cv2.addWeighted(vis_img, 1.0, original_mask, 0.3, 0)  # 30% opacity
+        # Create a plain black background
+        # (no original mask or skeleton as requested)
         
-        # Draw existing cracks in blue - from previous test
-        existing_segments = 0
-        for desc in curr_cracks:
-            if len(desc) < 10:
-                continue
-                
-            # Extract keypoints properly
-            keypoints_flat = desc[9:]
-            
-            # Handle case where keypoints_flat has odd length
-            if len(keypoints_flat) % 2 != 0:
-                # Pad with a duplicate of the last valid coordinate
-                keypoints_flat = np.append(keypoints_flat, keypoints_flat[-1])
-            
-            keypoints = keypoints_flat.reshape(-1, 2)
-            
-            for i in range(len(keypoints) - 1):
-                pt1 = keypoints[i].astype(int)
-                pt2 = keypoints[i + 1].astype(int)
-                
-                if (0 <= pt1[0] < shape[0] and 0 <= pt1[1] < shape[1] and
-                    0 <= pt2[0] < shape[0] and 0 <= pt2[1] < shape[1]):
-                    cv2.line(vis_img, (pt1[1], pt1[0]), (pt2[1], pt2[0]), (255, 0, 0), 1)
-                    existing_segments += 1
+        # Detect extended descriptor format
+        base_length = 12 if len(next_cracks[0]) >= 12 else 9
         
-        # Draw continued (not new) cracks from current test in cyan
-        continued_count = 0
-        for desc in next_cracks:
-            if len(desc) < 10:
-                continue
-                
-            # Extract keypoints properly
-            keypoints_flat = desc[9:]
-            
-            # Handle case where keypoints_flat has odd length
-            if len(keypoints_flat) % 2 != 0:
-                # Pad with a duplicate of the last valid coordinate
-                keypoints_flat = np.append(keypoints_flat, keypoints_flat[-1])
-            
-            keypoints = keypoints_flat.reshape(-1, 2)
-            
-            # Check if it's flagged as existing (not new)
-            is_new = desc[8]
-            
-            if is_new < 0.5:  # Using threshold to handle floating point
-                continued_count += 1
-                for i in range(len(keypoints) - 1):
-                    pt1 = keypoints[i].astype(int)
-                    pt2 = keypoints[i + 1].astype(int)
-                    
-                    if (0 <= pt1[0] < shape[0] and 0 <= pt1[1] < shape[1] and
-                        0 <= pt2[0] < shape[0] and 0 <= pt2[1] < shape[1]):
-                        cv2.line(vis_img, (pt1[1], pt1[0]), (pt2[1], pt2[0]), (255, 255, 0), 1)
+        # Create reconstructed mask for calculating false positives/negatives
+        reconstructed = np.zeros_like(binary_masks[next_id])
         
-        # Draw new cracks in green
+        # Draw new and existing cracks with different colors
         new_count = 0
+        existing_count = 0
+        
         for desc in next_cracks:
-            if len(desc) < 10:
+            if len(desc) < base_length:
                 continue
                 
             # Extract keypoints properly
-            keypoints_flat = desc[9:]
+            keypoints_flat = desc[base_length:]
             
             # Handle case where keypoints_flat has odd length
             if len(keypoints_flat) % 2 != 0:
-                # Pad with a duplicate of the last valid coordinate
                 keypoints_flat = np.append(keypoints_flat, keypoints_flat[-1])
             
             keypoints = keypoints_flat.reshape(-1, 2)
@@ -1040,104 +1193,87 @@ def validate_crack_detection(test_ids, crack_dict, binary_masks, extension_segme
             # Check if it's flagged as new
             is_new = desc[8]
             
-            if is_new > 0.5:  # Using threshold to handle floating point
+            if is_new > 0.5:  # New crack
                 new_count += 1
-                for i in range(len(keypoints) - 1):
-                    pt1 = keypoints[i].astype(int)
-                    pt2 = keypoints[i + 1].astype(int)
-                    
-                    if (0 <= pt1[0] < shape[0] and 0 <= pt1[1] < shape[1] and
-                        0 <= pt2[0] < shape[0] and 0 <= pt2[1] < shape[1]):
-                        cv2.line(vis_img, (pt1[1], pt1[0]), (pt2[1], pt2[0]), (0, 255, 0), 1)
-        
-        # Calculate false negatives and false positives
-        # Create reconstructed mask from next_cracks
-        reconstructed = np.zeros_like(binary_masks[next_id])
-        for desc in next_cracks:
-            if len(desc) < 10:
-                continue
+                color = (0, 255, 0)  # Green for new damage
+            else:  # Existing crack
+                existing_count += 1
+                color = (128, 128, 128)  # Gray for old damage
                 
-            # Extract keypoints properly
-            keypoints_flat = desc[9:]
-            
-            # Handle case where keypoints_flat has odd length
-            if len(keypoints_flat) % 2 != 0:
-                # Pad with a duplicate of the last valid coordinate
-                keypoints_flat = np.append(keypoints_flat, keypoints_flat[-1])
-            
-            keypoints = keypoints_flat.reshape(-1, 2)
-            
+            # Draw on visualization image
             for i in range(len(keypoints) - 1):
                 pt1 = keypoints[i].astype(int)
                 pt2 = keypoints[i + 1].astype(int)
                 
                 if (0 <= pt1[0] < shape[0] and 0 <= pt1[1] < shape[1] and
                     0 <= pt2[0] < shape[0] and 0 <= pt2[1] < shape[1]):
+                    cv2.line(vis_img, (pt1[1], pt1[0]), (pt2[1], pt2[0]), color, 1)
+                    
+                    # Also draw on reconstructed mask (for FP/FN calculation)
                     cv2.line(reconstructed, (pt1[1], pt1[0]), (pt2[1], pt2[0]), 255, 1)
         
-        # Calculate FN and FP
-        original = binary_masks[next_id]
-        fn_mask = np.logical_and(original > 0, reconstructed == 0)
-        fp_mask = np.logical_and(original == 0, reconstructed > 0)
+        # Calculate false negatives (in original but not in reconstruction)
+        fn_mask = np.logical_and(binary_masks[next_id] > 0, reconstructed == 0)
+        vis_img[fn_mask] = [0, 0, 255]  # Red for false negatives
         
-        # Add FN in magenta
-        vis_img[fn_mask] = [255, 0, 255]
+        # Calculate false positives (in reconstruction but not in original)
+        fp_mask = np.logical_and(binary_masks[next_id] == 0, reconstructed > 0)
+        vis_img[fp_mask] = [255, 0, 0]  # Blue for false positives
         
-        # Add FP in cyan
-        vis_img[fp_mask] = [255, 255, 0]
-        
-        # Calculate IoU
-        intersection = np.logical_and(reconstructed > 0, original > 0)
-        union = np.logical_or(reconstructed > 0, original > 0)
+        # Calculate IoU 
+        intersection = np.logical_and(reconstructed > 0, binary_masks[next_id] > 0)
+        union = np.logical_or(reconstructed > 0, binary_masks[next_id] > 0)
         iou = np.sum(intersection) / np.sum(union) if np.sum(union) > 0 else 0
         
-        # Create legend and info section
-        legend_height = 180
+        # Create simplified legend and info section
+        legend_height = 160
         info_img = np.ones((legend_height, shape[1], 3), dtype=np.uint8) * 255
+        
+        # Title
+        cv2.putText(info_img, f"Test {curr_id} -> {next_id}  (IoU: {iou:.4f})", (10, 20), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
         
         # Draw color swatches and labels
         swatch_size = 15
         text_offset = swatch_size + 5
-        y_start = 30
+        y_start = 40
         y_step = 25
         
-        # Title
-        cv2.putText(info_img, f"Test {curr_id} -> {next_id}", (10, 20), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 0), 2)
-        
-        # Original mask (semi-transparent red)
-        cv2.rectangle(info_img, (10, y_start), (10+swatch_size, y_start+swatch_size), (0, 0, 128), -1)
-        cv2.putText(info_img, "Original mask (transparent red)", (10+text_offset, y_start+swatch_size//2+4), 
+        # New damage (green)
+        cv2.rectangle(info_img, (10, y_start), (10+swatch_size, y_start+swatch_size), (0, 255, 0), -1)
+        cv2.putText(info_img, f"New damage ({new_count})", (10+text_offset, y_start+swatch_size//2+4), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
         
-        # Existing cracks (blue)
-        cv2.rectangle(info_img, (10, y_start+y_step), (10+swatch_size, y_start+y_step+swatch_size), (255, 0, 0), -1)
-        cv2.putText(info_img, f"Existing cracks from Test {curr_id} (blue)", (10+text_offset, y_start+y_step+swatch_size//2+4), 
+        # Old damage (gray)
+        cv2.rectangle(info_img, (10, y_start+y_step), (10+swatch_size, y_start+y_step+swatch_size), (128, 128, 128), -1)
+        cv2.putText(info_img, f"Old damage ({existing_count})", (10+text_offset, y_start+y_step+swatch_size//2+4), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
         
-        # Continued cracks (cyan)
-        cv2.rectangle(info_img, (10, y_start+2*y_step), (10+swatch_size, y_start+2*y_step+swatch_size), (255, 255, 0), -1)
-        cv2.putText(info_img, f"Continued cracks in Test {next_id} (cyan)", (10+text_offset, y_start+2*y_step+swatch_size//2+4), 
+        # False negatives (red)
+        cv2.rectangle(info_img, (10, y_start+2*y_step), (10+swatch_size, y_start+2*y_step+swatch_size), (0, 0, 255), -1)
+        cv2.putText(info_img, f"Missed damage (false negatives)", (10+text_offset, y_start+2*y_step+swatch_size//2+4), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
         
-        # New cracks (green)
-        cv2.rectangle(info_img, (10, y_start+3*y_step), (10+swatch_size, y_start+3*y_step+swatch_size), (0, 255, 0), -1)
-        cv2.putText(info_img, f"New cracks in Test {next_id} (green)", (10+text_offset, y_start+3*y_step+swatch_size//2+4), 
+        # False positives (blue)
+        cv2.rectangle(info_img, (10, y_start+3*y_step), (10+swatch_size, y_start+3*y_step+swatch_size), (255, 0, 0), -1)
+        cv2.putText(info_img, f"Extra damage (false positives)", (10+text_offset, y_start+3*y_step+swatch_size//2+4), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
         
-        # False Negatives (magenta)
-        cv2.rectangle(info_img, (10, y_start+5*y_step), (10+swatch_size, y_start+5*y_step+swatch_size), (255, 0, 255), -1)
-        cv2.putText(info_img, "False Negatives (magenta)", (10+text_offset, y_start+5*y_step+swatch_size//2+4), 
+        # Statistics
+        stat_x = shape[1] // 2 + 20
+        cv2.putText(info_img, f"Total detected cracks: {len(next_cracks)}", (stat_x, y_start), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
         
-        # Add crack statistics on the right side
-        cv2.putText(info_img, f"Total cracks: {len(next_cracks)}", (shape[1]//2 + 20, y_start), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
-        cv2.putText(info_img, f"New cracks: {new_count} ({new_count/len(next_cracks)*100:.1f}% if len(next_cracks) > 0 else 0))", (shape[1]//2 + 20, y_start+y_step), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
-        cv2.putText(info_img, f"Continued cracks: {continued_count}", (shape[1]//2 + 20, y_start+3*y_step), 
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
-        cv2.putText(info_img, f"IoU: {iou:.4f}", (shape[1]//2 + 20, y_start+4*y_step), 
+        # Show percentages only if there are cracks
+        if len(next_cracks) > 0:
+            new_percent = 100 * new_count / len(next_cracks)
+            existing_percent = 100 * existing_count / len(next_cracks)
+            cv2.putText(info_img, f"New: {new_count} ({new_percent:.1f}%)", (stat_x, y_start+y_step), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+            cv2.putText(info_img, f"Existing: {existing_count} ({existing_percent:.1f}%)", (stat_x, y_start+2*y_step), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
+        
+        cv2.putText(info_img, f"IoU with original mask: {iou:.4f}", (stat_x, y_start+3*y_step), 
                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1)
         
         # Draw divider line
@@ -1149,7 +1285,7 @@ def validate_crack_detection(test_ids, crack_dict, binary_masks, extension_segme
         # Save result
         cv2.imwrite(os.path.join(output_dir, f"validate_{curr_id}_to_{next_id}.png"), combined)
         
-    print(f"Validation images saved to {output_dir}")
+    print(f"Improved validation images saved to {output_dir}")
 
 def print_descriptor_guide():
     """
@@ -1235,8 +1371,7 @@ def print_descriptor_guide():
 ######################################
 def load_data(params):
     """
-    Loads accelerometer data and progressive crack descriptors without extension tracking.
-    Centralized parameter control for easy tuning.
+    Loads accelerometer data and processes cracks with improved new crack identification.
     
     Args:
         params: Dictionary of parameters for crack detection and processing
@@ -1245,16 +1380,18 @@ def load_data(params):
         accel_dict: Dictionary of accelerometer data by test_id
         crack_dict: Dictionary of crack descriptors by test_id
         binary_masks: Dictionary of binary masks by test_id
+        skeletons: Dictionary of enhanced skeletons by test_id
     """
     accel_dict = load_accelerometer_data(DATA_DIR, SKIP_TESTS)
     crack_dict = {}
     binary_masks = {}
+    skeletons = {}
     
     # Get all test IDs and sort them
     test_ids = sorted(list(accel_dict.keys()))
     
     # Process each test in order
-    prev_test_descriptors = []  # Start with empty list
+    previous_skeleton = None
     
     for test_id in test_ids:
         if test_id in SKIP_TESTS:
@@ -1267,64 +1404,49 @@ def load_data(params):
         # Store the binary mask for validation
         binary_masks[test_id] = binary_mask
         
-        # Process cracks with reference to previous test - without extension tracking
-        descriptors = process_test_cracks(
+        # Process cracks with improved identification
+        descriptors, current_skeleton = process_test_cracks(
             binary_mask, 
-            prev_test_descriptors,
+            previous_skeleton,
             keypoint_count=params['keypoint_count'],
-            max_gap=params['max_gap'],
-            curved_threshold=params['curved_threshold'],
-            curved_angle_threshold=params['curved_angle_threshold'],
-            straight_angle_threshold=params['straight_angle_threshold'],
-            min_segment_length=params['min_segment_length']
+            max_gap=params['max_gap']
         )
         
-        # Store descriptors
+        # Store descriptors and skeleton
         crack_dict[test_id] = descriptors
+        skeletons[test_id] = current_skeleton
         
         # Update for next test
-        prev_test_descriptors = descriptors
+        previous_skeleton = current_skeleton
     
-    return accel_dict, crack_dict, binary_masks
-
+    return accel_dict, crack_dict, binary_masks, skeletons
 ######################################
 # For testing and validation
 ######################################
 def main():
     """
-    Main function with centralized parameter control.
+    Main function with centralized parameter control to test the improved crack tracking.
+    Added additional debugging to troubleshoot IoU issues.
     """
-    print("INFO: Loading accelerometer data and processing cracks...")
+    print("INFO: Loading accelerometer data and processing cracks with improved methods...")
     
-    # ----------------------------------------------------------------
-    # TUNABLE PARAMETERS - Centralized for easy experimentation
-    # ----------------------------------------------------------------
+    # TUNABLE PARAMETERS
     params = {
-        # Number of keypoints for crack representation
-        'keypoint_count': 20,  # Default: 20 (Higher for complex curves)
-        
-        # Skeleton enhancement parameters
-        'max_gap': 10,  # Default: 10 (Higher connects more distant cracks)
-        
-        # Curve detection parameters
-        'curved_threshold': 10,  # Default: 10 (Degrees, higher identifies more as curved)
-        'curved_angle_threshold': 85,  # Default: 85 (Higher allows more curvature without splitting)
-        'straight_angle_threshold': 20,  # Default: 20 (Lower is more sensitive to ladders)
-        
-        # Segment filtering
-        'min_segment_length': 2,  # Default: 2 (Higher ignores more short segments)
-        
-        # Reconstruction parameters
-        'line_thickness': 1,  # Default: 1 (Keep at 1 to match original)
+        'keypoint_count': 20,
+        'max_gap': 3,
+        'curved_threshold': 10,
+        'curved_angle_threshold': 85,
+        'straight_angle_threshold': 20,
+        'min_segment_length': 2,
+        'line_thickness': 1,
     }
     
-    # Print parameter settings for reference
     print("\nCurrent parameter settings:")
     for param, value in params.items():
         print(f"  {param}: {value}")
     
-    # Load data with centralized parameters - without extension tracking
-    accel_data, crack_dict, binary_masks = load_data(params)
+    # Load data with improved methods that use skeleton subtraction
+    accel_data, crack_dict, binary_masks, skeletons = load_data(params)
     
     # Validation: Check if we can reconstruct masks from descriptors
     print(f"\nINFO: Validating crack representation for {len(crack_dict)} tests...")
@@ -1335,7 +1457,7 @@ def main():
     # Get test IDs for validation
     test_ids = sorted(list(crack_dict.keys()))
     
-    # Optional: Visual debugging
+    # Create debug directory
     debug_dir = "debug_images"
     os.makedirs(debug_dir, exist_ok=True)
     
@@ -1345,11 +1467,19 @@ def main():
             print(f"  Test {test_id}: No cracks found")
             continue
             
+        # Verify descriptor format
+        extended_format = any(len(desc) >= 12 for desc in descriptors)
+        base_length = 12 if extended_format else 9
+        
         # Count new vs. existing cracks
         new_count = sum(1 for desc in descriptors if len(desc) > 8 and desc[8] > 0.5)
         existing_count = len(descriptors) - new_count
         
         print(f"  Test {test_id}: {len(descriptors)} cracks ({new_count} new, {existing_count} existing)")
+        
+        # Save original skeleton and mask
+        if test_id in skeletons:
+            cv2.imwrite(os.path.join(debug_dir, f"test_{test_id}_skeleton.png"), skeletons[test_id])
         
         # Reconstruct mask from descriptors
         reconstructed = reconstruct_mask_from_descriptors(
@@ -1357,27 +1487,39 @@ def main():
         
         # Compare with original mask
         original = binary_masks[test_id]
+        
+        # Calculate non-zero pixels in each mask
+        orig_nonzero = np.sum(original > 0)
+        recon_nonzero = np.sum(reconstructed > 0)
+        
+        print(f"    Original mask pixels: {orig_nonzero}")
+        print(f"    Reconstructed mask pixels: {recon_nonzero}")
+        
         intersection = np.logical_and(reconstructed > 0, original > 0)
         union = np.logical_or(reconstructed > 0, original > 0)
         
+        intersection_count = np.sum(intersection)
+        union_count = np.sum(union)
+        
+        print(f"    Intersection pixels: {intersection_count}")
+        print(f"    Union pixels: {union_count}")
+        
         # Calculate IoU (Intersection over Union)
-        iou = np.sum(intersection) / np.sum(union) if np.sum(union) > 0 else 0
+        iou = intersection_count / union_count if union_count > 0 else 0
         total_iou += iou
         test_count += 1
         
         print(f"    Reconstruction IoU: {iou:.4f}")
         
-        # Save debug images for individual tests
-        # Original mask
+        # Save debug images
         cv2.imwrite(os.path.join(debug_dir, f"test_{test_id}_original.png"), original)
-        # Reconstructed mask
         cv2.imwrite(os.path.join(debug_dir, f"test_{test_id}_reconstructed.png"), reconstructed)
         
-        # Difference mask (Green = TP, Red = FP, Blue = FN)
+        # Create overlay visualization
         diff_mask = np.zeros((original.shape[0], original.shape[1], 3), dtype=np.uint8)
-        diff_mask[intersection > 0] = [0, 255, 0]  # True positive
-        diff_mask[np.logical_and(reconstructed > 0, original == 0)] = [0, 0, 255]  # False positive
-        diff_mask[np.logical_and(reconstructed == 0, original > 0)] = [255, 0, 0]  # False negative
+        diff_mask[intersection > 0] = [0, 255, 0]  # True positive (green)
+        diff_mask[np.logical_and(reconstructed > 0, original == 0)] = [255, 0, 0]  # False positive (red)
+        diff_mask[np.logical_and(reconstructed == 0, original > 0)] = [0, 0, 255]  # False negative (blue)
         
         cv2.imwrite(os.path.join(debug_dir, f"test_{test_id}_diff.png"), diff_mask)
     
@@ -1385,8 +1527,8 @@ def main():
     avg_iou = total_iou / test_count if test_count > 0 else 0
     print(f"\nAverage IoU across all tests: {avg_iou:.4f}")
     
-    # Run simplified validation - without extension segments
-    validate_crack_detection(test_ids, crack_dict, binary_masks, None, "simplified_validation")
+    # Run improved validation
+    validate_crack_detection(test_ids, crack_dict, binary_masks, skeletons, "improved_validation")
     
     print("\nINFO: Processing complete.")
 
