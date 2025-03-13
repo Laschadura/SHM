@@ -40,7 +40,6 @@ from sklearn.mixture import GaussianMixture
 # Append parent directory to find data_loader.py
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-# Import your data loader
 import data_loader
 
 # ----- Recource Monitoring and Usage -----
@@ -76,27 +75,60 @@ def print_detailed_memory():
         print(f"  Memory Free: {gpu.memoryFree}MB")
 
 # ----- Utility -----
-def segment_and_transform(accel_dict, mask_dict, chunk_size=1, sample_rate=200, segment_duration=5.0, percentile=99):
-    """Generator version of segment_and_transform that yields data in chunks"""
+def load_and_prepare_data():
+    """
+    Load data using the data_loader module with proper parameters.
+    Extract the required dictionaries and prepare data for the VAE.
+    Now using padded descriptor data instead of mask data.
+    """
+    # Define parameters for the data_loader
+    params = {
+        'keypoint_count': 15,
+        'max_gap': 3,
+        'curved_threshold': 10,
+        'curved_angle_threshold': 75,
+        'straight_angle_threshold': 15,
+        'min_segment_length': 2,
+        'line_thickness': 1,
+    }
+    
+    # Call load_data with the required params argument
+    # The function should now return padded_dict as well
+    accel_dict, crack_dict, binary_masks, skeletons, padded_dict = data_loader.load_data(params)
+    
+    print(f"Loaded data for {len(accel_dict)} tests")
+    
+    # Check descriptor data shape
+    sample_descriptor = next(iter(padded_dict.values()))
+    print(f"Descriptor shape sample: {sample_descriptor.shape}")
+    
+    return accel_dict, padded_dict
+
+def segment_and_transform(
+    accel_dict, 
+    descriptor_dict,
+    chunk_size=1, 
+    sample_rate=200, 
+    segment_duration=5.0, 
+    percentile=99
+):
+    """Generator that yields data in chunks, with descriptors from descriptor_dict."""
     
     window_size = int(sample_rate * segment_duration)
     half_window = window_size // 2
     
-    # Process test_ids in chunks
     test_ids = list(accel_dict.keys())
     for i in range(0, len(test_ids), chunk_size):
         chunk_ids = test_ids[i:i + chunk_size]
         
         raw_segments = []
-        fft_segments = []
         rms_segments = []
         psd_segments = []
-        mask_segments = []
+        descriptor_segments = []
         test_ids_out = []
         
         for test_id in chunk_ids:
             all_ts = accel_dict[test_id]
-            mask_data = mask_dict[test_id]
             
             for ts_raw in all_ts:
                 rms_each_sample = np.sqrt(np.mean(ts_raw**2, axis=1))
@@ -118,77 +150,62 @@ def segment_and_transform(accel_dict, mask_dict, chunk_size=1, sample_rate=200, 
                     segment_raw = ts_raw[start:end, :]
 
                     # Compute features
-                    seg_fft = compute_fft(segment_raw, sample_rate)
                     seg_rms = compute_rms(segment_raw)
                     seg_psd = compute_psd(segment_raw, sample_rate)
 
                     raw_segments.append(segment_raw)
-                    fft_segments.append(seg_fft)
                     rms_segments.append(seg_rms)
                     psd_segments.append(seg_psd)
-                    mask_segments.append(mask_data)
-
-                    # **Ensure `test_id` is an integer**
-                    test_ids_out.append(int(test_id))  
+                    
+                    # Get descriptor data for this test_id
+                    descriptor_segments.append(descriptor_dict[test_id])
+                    test_ids_out.append(int(test_id))
         
-        # Convert chunk to arrays and yield
         if raw_segments:  # Only yield if we have data
-            yield (np.array(raw_segments, dtype=np.float32),
-                  np.array(fft_segments, dtype=np.float32),
-                  np.array(rms_segments, dtype=np.float32),
-                  np.array(psd_segments, dtype=np.float32),
-                  np.array(mask_segments, dtype=np.float32),
-                  np.array(test_ids_out, dtype=np.int32))  # Ensure test_id is int32
-           
-def create_tf_dataset(raw_segments, fft_segments, rms_segments, psd_segments, mask_segments, test_ids, batch_size=8):
+            yield (
+                np.array(raw_segments, dtype=np.float32),
+                np.array(rms_segments, dtype=np.float32),
+                np.array(psd_segments, dtype=np.float32),
+                np.array(descriptor_segments, dtype=np.float32),
+                np.array(test_ids_out, dtype=np.int32)
+            )
+
+def create_tf_dataset(
+    raw_segments, rms_segments, psd_segments, descriptor_segments, test_ids,
+    batch_size=8
+):
     print(f"Creating dataset with shapes:")
     print(f"  Raw segments: {raw_segments.shape}")
-    print(f"  FFT segments: {fft_segments.shape}")
     print(f"  RMS segments: {rms_segments.shape}")
     print(f"  PSD segments: {psd_segments.shape}")
-    print(f"  Mask segments: {mask_segments.shape}")
+    print(f"  Descriptor segments: {descriptor_segments.shape}")
     print(f"  Test IDs: {test_ids.shape}\n")
 
-    # Ensure test_ids are integers
     test_ids = np.array(test_ids, dtype=np.int32)
 
-    dataset = tf.data.Dataset.from_tensor_slices((
-        raw_segments.astype(np.float32),
-        fft_segments.astype(np.float32),
-        rms_segments.astype(np.float32),
-        psd_segments.astype(np.float32),
-        mask_segments.astype(np.float32),
-        test_ids
-    ))
+    dataset = tf.data.Dataset.from_tensor_slices(
+        (
+            raw_segments.astype(np.float32),
+            rms_segments.astype(np.float32),
+            psd_segments.astype(np.float32),
+            descriptor_segments.astype(np.float32),
+            test_ids
+        )
+    )
     
     dataset = dataset.shuffle(1000)
     dataset = dataset.batch(batch_size)
     dataset = dataset.prefetch(tf.data.AUTOTUNE)
     
-    # Verify dataset
     for batch in dataset.take(1):
         print("\nFirst batch shapes:")
         print(f"  Raw: {batch[0].shape}")
-        print(f"  FFT: {batch[1].shape}")
-        print(f"  RMS: {batch[2].shape}")
-        print(f"  PSD: {batch[3].shape}")
-        print(f"  Mask: {batch[4].shape}")
-        print(f"  Test ID: {batch[5].shape}")
+        print(f"  RMS: {batch[1].shape}")
+        print(f"  PSD: {batch[2].shape}")
+        print(f"  Descriptor: {batch[3].shape}")
+        print(f"  Test ID: {batch[4].shape}")
 
     return dataset
-
-def compute_fft(segment, sample_rate):
-    """
-    Example: compute a simple FFT over time for each channel
-    `segment` shape: (window_size, num_channels)
-    Return shape could be (window_size//2, num_channels) if you keep only the positive frequencies
-    Adjust as needed.
-    """
-    # Example using np.fft. This is just a placeholder.
-    # Real code might do windowing, etc.
-    fft_out = np.fft.rfft(segment, axis=0)
-    fft_out = np.abs(fft_out)  # or complex if you prefer
-    return fft_out
 
 def compute_rms(segment):
     """
@@ -211,183 +228,7 @@ def compute_psd(segment, sample_rate):
     psds = np.array(psds).T  # shape: (freq_bins, num_channels)
     return psds
 
-def mask_to_ellipses_and_polygons(mask):
-    """
-    Convert a binary mask into an adaptive set of ellipses and polygons.
-    Handles TensorFlow tensors by converting them to NumPy arrays.
-
-    Returns:
-        - A list of fitted ellipses: [(x, y, major_axis, minor_axis, angle), ...]
-        - A list of polygon points (if needed)
-    """
-    # Ensure mask is in NumPy format
-    if isinstance(mask, tf.Tensor):
-        mask = mask.numpy()  # Convert from TensorFlow tensor to NumPy
-
-    mask = (mask > 0.5).astype(np.uint8)  # Convert to binary (0, 1) format for OpenCV
-
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if len(contours) == 0:
-        return [], []  # No damage detected
-
-    ellipses, polygons = [], []
-    reconstructed_mask = np.zeros_like(mask)
-
-    # Sort contours by area (largest first)
-    contours = sorted(contours, key=cv2.contourArea, reverse=True)[:3]  # Focus on top 3 regions
-
-    for contour in contours:
-        num_ellipses = 1  # Start with a single ellipse
-        step = max(len(contour) // num_ellipses, 5)
-        sub_contour = contour[::step].astype(np.float32)
-
-        while num_ellipses <= 30:  # Adaptive number of ellipses
-            if len(sub_contour) >= 5:
-                ellipse = cv2.fitEllipse(sub_contour)
-                ellipses.append(ellipse)
-
-                # Draw ellipses to reconstruct mask
-                cv2.ellipse(reconstructed_mask, ellipse, 1, -1)
-
-                # Compute IoU
-                intersection = np.logical_and(mask, reconstructed_mask)
-                union = np.logical_or(mask, reconstructed_mask)
-                iou = np.sum(intersection) / np.sum(union) if np.sum(union) > 0 else 0
-
-                # Stop adding ellipses if IoU is high enough
-                if iou >= 0.9:
-                    break
-
-            num_ellipses += 1
-            step = max(len(contour) // num_ellipses, 5)
-            sub_contour = contour[::step].astype(np.float32)
-
-        # If ellipses fail to reach target accuracy, use polygon approximation
-        if iou < 0.9:
-            epsilon = 0.02 * cv2.arcLength(contour, True)  # Adjust accuracy
-            approx_polygon = cv2.approxPolyDP(contour, epsilon, True)
-            polygons.append(approx_polygon)
-
-    return ellipses, polygons
-
-def preprocess_all_masks(mask_dict):
-    """
-    Precomputes ellipse and polygon encodings for unique test IDs.
-    Ensures all masks are properly formatted as NumPy arrays.
-
-    Returns:
-        preprocessed_masks (dict): {test_id: {"ellipses": ellipses, "polygons": polygons}}
-    """
-    preprocessed_masks = {}
-
-    for test_id, mask_data in mask_dict.items():
-        # ---- Extract Only the Mask (Ignore Extra Tuple Elements) ----
-        if isinstance(mask_data, tuple):  
-            mask = mask_data[0]  
-        else:
-            mask = mask_data  
-
-        # ---- Ensure the Mask is a NumPy Array ----
-        if isinstance(mask, list):  
-            mask = np.array(mask)  
-
-        if isinstance(mask, tf.Tensor):  
-            mask = mask.numpy()
-
-        if not isinstance(mask, np.ndarray):
-            print(f"[ERROR] Mask for Test ID {test_id} is not a NumPy array! Skipping...")
-            preprocessed_masks[test_id] = {"ellipses": [], "polygons": []}
-            continue
-
-        # ---- Debugging Print ----
-        print(f"Processing Test ID {test_id}, Mask Type: {type(mask)}, Shape: {mask.shape}")
-
-        if len(mask.shape) == 3 and mask.shape[-1] == 1:  
-            mask = mask.squeeze(-1)  
-
-        mask = (mask > 0.5).astype(np.uint8) * 255  
-
-        # ---- Initialize `ellipses` and `polygons` to Prevent Unpacking Error ----
-        ellipses, polygons = [], []  
-
-        if test_id in [1, 5, 10]:  # Only for a few test IDs
-            plt.imshow(mask, cmap="gray")
-            plt.title(f"Test ID {test_id} - Preprocessed Mask")
-            plt.show()
-
-
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if len(contours) == 0:
-            print(f"[WARNING] No contours found for Test ID {test_id}. Assigning empty ellipses/polygons.")
-            preprocessed_masks[test_id] = {"ellipses": [], "polygons": []}
-            continue  
-
-        reconstructed_mask = np.zeros_like(mask)
-
-        contours = sorted(contours, key=cv2.contourArea, reverse=True)[:3]
-
-        print(f"[DEBUG] Test ID {test_id}: Found {len(contours)} contours.")
-
-        for contour in contours:
-            num_ellipses = 1  
-            step = max(len(contour) // num_ellipses, 5)
-            sub_contour = contour[::step].astype(np.float32)
-
-            while num_ellipses <= 30:  
-                if len(sub_contour) >= 5:
-                    ellipse = cv2.fitEllipse(sub_contour)
-                    ellipses.append(ellipse)
-
-                    cv2.ellipse(reconstructed_mask, ellipse, 1, -1)
-
-                    intersection = np.logical_and(mask, reconstructed_mask)
-                    union = np.logical_or(mask, reconstructed_mask)
-                    iou = np.sum(intersection) / np.sum(union) if np.sum(union) > 0 else 0
-
-                    if iou >= 0.9:
-                        break
-
-                num_ellipses += 1
-                step = max(len(contour) // num_ellipses, 5)
-                sub_contour = contour[::step].astype(np.float32)
-
-            if iou < 0.9:
-                epsilon = 0.02 * cv2.arcLength(contour, True)  
-                approx_polygon = cv2.approxPolyDP(contour, epsilon, True)
-                polygons.append(approx_polygon)
-
-        # ---- Store `ellipses` and `polygons` as a Dictionary ----
-        preprocessed_masks[test_id] = {"ellipses": ellipses, "polygons": polygons}
-
-    return preprocessed_masks
-
 # ----- Loss Functions -----
-def dice_loss(pred, target, smooth=1e-6):
-    """
-    Dice loss with epsilon to avoid divide-by-zero.
-    """
-    # Assert that incoming pred/target don't contain NaNs/infs
-    tf.debugging.assert_all_finite(pred, "dice_loss: pred contains NaN or Inf")
-    tf.debugging.assert_all_finite(target, "dice_loss: target contains NaN or Inf")
-
-    # Clip predictions to [0, 1] just in case
-    pred = tf.clip_by_value(pred, 0.0, 1.0)
-
-    # Flatten
-    pred_flat = tf.reshape(pred, [tf.shape(pred)[0], -1])
-    target_flat = tf.reshape(target, [tf.shape(target)[0], -1])
-
-    intersection = tf.reduce_sum(pred_flat * target_flat, axis=1)
-    # Add smooth to denominator and numerator to avoid zero
-    dice = (2.0 * intersection + smooth) / (
-        tf.reduce_sum(pred_flat, axis=1) + tf.reduce_sum(target_flat, axis=1) + smooth
-    )
-
-    # Check that dice ratio is still finite
-    tf.debugging.assert_all_finite(dice, "dice_loss: dice ratio is NaN or Inf")
-
-    return 1.0 - tf.reduce_mean(dice)
-
 def focal_loss(y_true, y_pred, alpha=0.25, gamma=2.0, eps=1e-7):
     """
     Focal loss with clipping to avoid log(0).
@@ -426,106 +267,198 @@ def fft_loss(y_true, y_pred):
     y_pred_fft = tf.abs(tf.signal.rfft(y_pred))
     return tf.reduce_mean(tf.square(y_true_fft - y_pred_fft))
 
-def ellipse_loss(true_ellipses, pred_ellipses, max_ellipses=30):
+def weighted_descriptor_mse_loss(y_true, y_pred):
     """
-    Computes L2 loss between true and predicted ellipses.
+    MSE loss for descriptor reconstruction that only considers non-zero (valid) elements.
     
     Args:
-      - true_ellipses: (B, variable_num_ellipses, 5)
-      - pred_ellipses: (B, max_ellipses, 5)
-    
+        y_true: Ground truth descriptor array [batch, max_cracks, desc_length]
+        y_pred: Predicted descriptor array [batch, max_cracks, desc_length]
+        
     Returns:
-      - MSE loss between true and predicted ellipses
+        Weighted MSE loss
     """
-    # 🔹 Check if true_ellipses is completely empty
-    if tf.shape(true_ellipses)[0] == 0:
-        return tf.constant(0.0, dtype=tf.float32)
+    # Create mask for valid (non-zero) descriptors
+    # A descriptor is considered valid if any of its elements are non-zero
+    valid_mask = tf.reduce_any(tf.not_equal(y_true, 0), axis=-1)
+    valid_mask = tf.cast(valid_mask, dtype=tf.float32)
+    
+    # Expand mask to match descriptor dimensions
+    valid_mask = tf.expand_dims(valid_mask, axis=-1)
+    
+    # Calculate squared error
+    squared_error = tf.square(y_true - y_pred)
+    
+    # Apply mask to error
+    masked_error = squared_error * valid_mask
+    
+    # Get number of valid elements for averaging
+    num_valid = tf.maximum(tf.reduce_sum(valid_mask), 1.0)
+    
+    # Compute mean over valid elements only
+    loss = tf.reduce_sum(masked_error) / num_valid
+    
+    return loss
 
-    # Get current shape
-    true_shape = tf.shape(true_ellipses)
-    pred_shape = tf.shape(pred_ellipses)
-
-    # Extract batch size
-    batch_size = true_shape[0]
-
-    # Handle shape mismatches
-    num_true_ellipses = tf.cond(
-        tf.shape(true_ellipses)[0] > 0, 
-        lambda: tf.shape(true_ellipses)[1], 
-        lambda: tf.constant(0, dtype=tf.int32)
-    )
-
-    num_pred_ellipses = pred_shape[1]
-
-    if num_true_ellipses < max_ellipses:
-        pad_size = max_ellipses - num_true_ellipses
-        pad_tensor = tf.zeros((batch_size, pad_size, 5), dtype=tf.float32)
-        true_ellipses = tf.concat([true_ellipses, pad_tensor], axis=1)
-    elif num_true_ellipses > max_ellipses:
-        true_ellipses = true_ellipses[:, :max_ellipses, :]
-
-    return tf.reduce_mean(tf.square(true_ellipses - pred_ellipses))
-
-def polygon_loss(true_polygons, pred_polygons, max_points=20):
+def dynamic_mask_loss_weight(epoch, max_epochs, min_weight=0.3, max_weight=0.7):
     """
-    Computes L2 loss between true and predicted polygons.
+    Gradually increases the weight of mask loss relative to time-series loss.
+    This helps focus on mask reconstruction once time-series learns good patterns.
     
     Args:
-      - true_polygons: (B, variable_num_points, 2)
-      - pred_polygons: (B, max_points, 2)
+        epoch: Current epoch
+        max_epochs: Total epochs
+        min_weight: Starting weight for mask loss
+        max_weight: Maximum weight for mask loss
+        
+    Returns:
+        Current mask loss weight
+    """
+    # Linear increase over time
+    progress = min(1.0, epoch / (max_epochs * 0.5))  # Reach max_weight halfway through training
+    return min_weight + progress * (max_weight - min_weight)
+
+def feature_weighted_descriptor_loss(y_true, y_pred, position_weight=2.0, shape_weight=1.5, other_weight=1.0):
+    """
+    Custom loss function that weights different descriptor features differently.
+    
+    Args:
+        y_true: Ground truth descriptor array [batch, max_cracks, desc_length]
+        y_pred: Predicted descriptor array [batch, max_cracks, desc_length]
+        position_weight: Weight for position-related features
+        shape_weight: Weight for shape-related features
+        other_weight: Weight for other features
+        
+    Returns:
+        Weighted MSE loss with different weights per feature
+    """
+    # Create mask for valid (non-zero) descriptors
+    valid_mask = tf.reduce_any(tf.not_equal(y_true, 0), axis=-1)
+    valid_mask = tf.cast(valid_mask, dtype=tf.float32)
+    valid_mask = tf.expand_dims(valid_mask, axis=-1)
+    
+    # Assuming descriptor structure: first features are position, then shape, then others
+    # Adjust these indices based on your actual descriptor layout
+    position_indices = tf.range(0, 4)  # Example: first 4 features are position (x, y, etc.)
+    shape_indices = tf.range(4, 10)    # Example: next 6 features are shape (width, length, etc.)
+    
+    # Create feature weight mask of shape [desc_length]
+    desc_length = y_true.shape[-1]
+    feature_weights = tf.ones([desc_length], dtype=tf.float32) * other_weight
+    
+    # Update weights for specific features
+    for idx in position_indices:
+        feature_weights = tf.tensor_scatter_nd_update(
+            feature_weights, 
+            tf.expand_dims([idx], axis=1), 
+            [position_weight]
+        )
+    
+    for idx in shape_indices:
+        feature_weights = tf.tensor_scatter_nd_update(
+            feature_weights, 
+            tf.expand_dims([idx], axis=1), 
+            [shape_weight]
+        )
+    
+    # Expand feature weights to match input shape for broadcasting
+    feature_weights = tf.reshape(feature_weights, [1, 1, desc_length])
+    
+    # Calculate weighted squared error
+    squared_error = tf.square(y_true - y_pred) * feature_weights
+    
+    # Apply valid mask
+    masked_error = squared_error * valid_mask
+    
+    # Get number of valid elements for averaging
+    num_valid = tf.maximum(tf.reduce_sum(valid_mask), 1.0)
+    
+    # Compute mean over valid elements only
+    loss = tf.reduce_sum(masked_error) / num_valid
+    
+    return loss
+
+def combined_descriptor_loss(y_true, y_pred, mse_weight=0.7, feature_weight=0.3):
+    """
+    Combines regular MSE loss with feature-weighted loss for robustness.
+    
+    Args:
+        y_true: Ground truth descriptor array
+        y_pred: Predicted descriptor array
+        mse_weight: Weight for basic MSE loss
+        feature_weight: Weight for feature-weighted loss
+        
+    Returns:
+        Combined loss
+    """
+    mse_loss = weighted_descriptor_mse_loss(y_true, y_pred)
+    feat_loss = feature_weighted_descriptor_loss(y_true, y_pred)
+    
+    return mse_weight * mse_loss + feature_weight * feat_loss
+
+def get_beta_schedule(epoch, max_epochs, schedule_type='linear'):
+    """
+    Compute the beta coefficient for the JS divergence loss term.
+    Implements various scheduling options.
+    
+    Args:
+        epoch: Current epoch number (0-indexed)
+        max_epochs: Total number of epochs
+        schedule_type: Type of schedule ('linear', 'exponential', 'cyclical')
     
     Returns:
-      - MSE loss between true and predicted polygons
+        beta: Beta coefficient for current epoch
     """
-    if tf.shape(true_polygons)[0] == 0:
-        return tf.constant(0.0, dtype=tf.float32)
-
-    true_shape = tf.shape(true_polygons)
-    pred_shape = tf.shape(pred_polygons)
-
-    batch_size = true_shape[0]
-
-    num_true_points = tf.cond(
-        tf.shape(true_polygons)[0] > 0, 
-        lambda: tf.shape(true_polygons)[1], 
-        lambda: tf.constant(0, dtype=tf.int32)
-    )
-
-    num_pred_points = pred_shape[1]
-
-    if num_true_points < max_points:
-        pad_size = max_points - num_true_points
-        pad_tensor = tf.zeros((batch_size, pad_size, 2), dtype=tf.float32)
-        true_polygons = tf.concat([true_polygons, pad_tensor], axis=1)
-    elif num_true_points > max_points:
-        true_polygons = true_polygons[:, :max_points, :]
-
-    return tf.reduce_mean(tf.square(true_polygons - pred_polygons))
-
-def mask_reconstruction_loss(true_mask, reconstructed_mask):
-    """
-    Computes Intersection over Union (IoU) loss.
-    Ensures the final reconstructed mask aligns with the original.
-    """
-    intersection = tf.reduce_sum(true_mask * reconstructed_mask)
-    union = tf.reduce_sum(true_mask) + tf.reduce_sum(reconstructed_mask) - intersection
-    iou = intersection / (union + 1e-8)
-    return 1 - iou  # IoU Loss (lower is better)
-
-def reparameterize(mu, logvar):
-    std = tf.exp(0.5 * logvar)
-    eps = tf.random.normal(shape=tf.shape(std))
-    return mu + eps * std
-
+    # Define beta limits
+    BETA_MIN = 1e-8   # Start with very small value
+    BETA_MAX = 0.02   # Significantly higher than the original 0.001
+    
+    # Define warmup phase length (in epochs)
+    WARMUP_EPOCHS = 50  # Adjust based on your dataset and training dynamics
+    
+    # Define schedule based on type
+    if schedule_type == 'linear':
+        # Linear ramp-up during warmup, then constant
+        if epoch < WARMUP_EPOCHS:
+            return BETA_MIN + (BETA_MAX - BETA_MIN) * (epoch / WARMUP_EPOCHS)
+        else:
+            return BETA_MAX
+            
+    elif schedule_type == 'exponential':
+        # Exponential ramp-up (slower at start, faster later)
+        if epoch < WARMUP_EPOCHS:
+            # Normalized epoch in [0, 1]
+            t = epoch / WARMUP_EPOCHS
+            # Exponential curve that starts at BETA_MIN and ends at BETA_MAX
+            return BETA_MIN + (BETA_MAX - BETA_MIN) * (np.exp(3 * t) - 1) / (np.exp(3) - 1)
+        else:
+            return BETA_MAX
+            
+    elif schedule_type == 'cyclical':
+        # Cyclical schedule that peaks at BETA_MAX and falls to BETA_MAX/5
+        if epoch < WARMUP_EPOCHS:
+            # Linear warmup
+            return BETA_MIN + (BETA_MAX - BETA_MIN) * (epoch / WARMUP_EPOCHS)
+        else:
+            # Cycle with period of 50 epochs
+            cycle_period = 50
+            cycle_position = ((epoch - WARMUP_EPOCHS) % cycle_period) / cycle_period
+            # Cosine cycle between BETA_MAX and BETA_MAX/5
+            beta_min_cycle = BETA_MAX / 5
+            return beta_min_cycle + (BETA_MAX - beta_min_cycle) * 0.5 * (1 + np.cos(2 * np.pi * cycle_position))
+    
+    else:
+        raise ValueError(f"Unknown schedule_type: {schedule_type}")
+    
 # ----- Encoder Branches -----
 class RawEncoder(Model):
     """
     Convolution + LSTM encoder for raw time-series data.
     Input shape: (batch_size, 1000, 12)
-    Output: A feature vector of dimension feature_dim.
+    Output: Mean and logvariance for latent distribution.
     """
 
-    def __init__(self, feature_dim):
+    def __init__(self, latent_dim):
         super().__init__()
 
         # 1) First CNN block
@@ -548,7 +481,7 @@ class RawEncoder(Model):
         )
         self.dropout2 = layers.Dropout(0.3)
 
-        # 3) Third CNN block (optional deeper layer)
+        # 3) Third CNN block
         self.conv3 = layers.Conv1D(
             filters=64,
             kernel_size=5,
@@ -559,24 +492,21 @@ class RawEncoder(Model):
         self.dropout3 = layers.Dropout(0.3)
 
         # 4) Bidirectional LSTM layer
-        #
-        # return_sequences=False ensures we only get the final hidden state,
-        # which is often enough for classification/encoding.
         self.bilstm = layers.Bidirectional(
             layers.LSTM(128, return_sequences=False)
         )
 
-        # 5) Dense to reduce to 512 (you can change this size if desired)
+        # 5) Dense to reduce to 512
         self.dense_reduce = layers.Dense(512, activation='relu')
 
-        # 6) Final feature projection
-        self.feature_layer = layers.Dense(feature_dim)
+        # 6) Mean and logvariance projections
+        self.mu_layer = layers.Dense(latent_dim)
+        self.logvar_layer = layers.Dense(latent_dim)
 
     def call(self, x, training=False):
         """
         x shape: (batch, 1000, 12)
         """
-
         # CNN block 1
         x = self.conv1(x)                 # -> (batch, 500, 16)
         x = self.dropout1(x, training=training)
@@ -585,25 +515,30 @@ class RawEncoder(Model):
         x = self.conv2(x)                 # -> (batch, 250, 32)
         x = self.dropout2(x, training=training)
 
-        # CNN block 3 (optional deeper layer)
+        # CNN block 3
         x = self.conv3(x)                 # -> (batch, 125, 64)
         x = self.dropout3(x, training=training)
 
-        # LSTM layer: returns final hidden state of shape (batch, 256)
-        x = self.bilstm(x, training=training)
+        # LSTM layer
+        x = self.bilstm(x, training=training)  # -> (batch, 256)
 
-        # Dense + final
+        # Dense
         x = self.dense_reduce(x)          # -> (batch, 512)
-        feature = self.feature_layer(x)   # -> (batch, feature_dim)
-        return feature
- 
+        
+        # Output distribution parameters
+        mu = self.mu_layer(x)             # -> (batch, latent_dim)
+        logvar = self.logvar_layer(x)     # -> (batch, latent_dim)
+        
+        return mu, logvar
+    
 class PSDEncoder(Model):
-    """Encoder for PSD features.
-       Input shape: (batch, freq_bins, 12), e.g., (batch, 129, 12)
-       Outputs a feature vector of dimension feature_dim.
+    """
+    Encoder for PSD features.
+    Input shape: (batch, freq_bins, 12), e.g., (batch, 129, 12)
+    Output: Mean and logvariance for latent distribution.
     """
 
-    def __init__(self, feature_dim):
+    def __init__(self, latent_dim):
         super().__init__()
 
         # First convolutional block
@@ -614,22 +549,24 @@ class PSDEncoder(Model):
         self.conv2 = layers.Conv1D(filters=32, kernel_size=5, strides=2, padding='same', activation='relu')
         self.dropout2 = layers.Dropout(0.3)
 
-        # Third convolutional block (optional deeper layer)
+        # Third convolutional block
         self.conv3 = layers.Conv1D(filters=64, kernel_size=5, strides=2, padding='same', activation='relu')
         self.dropout3 = layers.Dropout(0.3)
 
-        # Global pooling to reduce to a single feature vector
+        # Global pooling
         self.global_pool = layers.GlobalAveragePooling1D()
 
-        # Dense layers for final encoding
+        # Dense layers
         self.dense_reduce = layers.Dense(128, activation='relu')
-        self.feature_layer = layers.Dense(feature_dim)  # Final feature vector
+        
+        # Mean and logvariance projections
+        self.mu_layer = layers.Dense(latent_dim)
+        self.logvar_layer = layers.Dense(latent_dim)
 
     def call(self, x, training=False):
         """
-        x shape: (batch, freq_bins, 12), e.g., (batch, 129, 12)
+        x shape: (batch, freq_bins, 12)
         """
-
         x = self.conv1(x)  # (batch, ~65, 16)
         x = self.dropout1(x, training=training)
 
@@ -639,128 +576,102 @@ class PSDEncoder(Model):
         x = self.conv3(x)  # (batch, ~17, 64)
         x = self.dropout3(x, training=training)
 
-        # Global pooling collapses the sequence dimension
+        # Global pooling
         x = self.global_pool(x)  # (batch, 64)
 
-        # Fully connected layers
+        # Fully connected layer
         x = self.dense_reduce(x)  # (batch, 128)
-        feature = self.feature_layer(x)  # (batch, feature_dim)
-
-        return feature
-
+        
+        # Output distribution parameters
+        mu = self.mu_layer(x)         # -> (batch, latent_dim)
+        logvar = self.logvar_layer(x) # -> (batch, latent_dim)
+        
+        return mu, logvar
+    
 class RMSEncoder(keras.Model):
-    """Encoder for RMS features.
-       Input shape: (batch, 12) (one value per channel)
-       Outputs a feature vector of dimension feature_dim.
     """
-    def __init__(self, feature_dim):
+    Encoder for RMS features.
+    Input shape: (batch, 12) (one value per channel)
+    Output: Mean and logvariance for latent distribution.
+    """
+    def __init__(self, latent_dim):
         super().__init__()
         self.dense1 = layers.Dense(16, activation='relu')
         self.drop1 = layers.Dropout(0.3)
-        self.feature_layer = layers.Dense(feature_dim)
+        
+        # Mean and logvariance projections
+        self.mu_layer = layers.Dense(latent_dim)
+        self.logvar_layer = layers.Dense(latent_dim)
 
     def call(self, x, training=False):
         x = self.dense1(x)
         x = self.drop1(x, training=training)
-        feature = self.feature_layer(x)
-        return feature  # shape: [batch, feature_dim]
+        
+        # Output distribution parameters
+        mu = self.mu_layer(x)         # -> (batch, latent_dim)
+        logvar = self.logvar_layer(x) # -> (batch, latent_dim)
+        
+        return mu, logvar
 
-class MaskEncoder(tf.keras.Model):
-    def __init__(self, num_ellipses=30, num_polygon_points=10):
+class DescriptorEncoder(tf.keras.Model):
+    """
+    Encoder for crack descriptor data.
+    Input shape: (batch_size, max_num_cracks=770, desc_length=42)
+    Output: Mean and logvariance for latent distribution.
+    """
+    def __init__(self, latent_dim):
         super().__init__()
-        self.num_ellipses = num_ellipses
-        self.num_polygon_points = num_polygon_points
+        
+        # First 1D convolutional layer
+        self.conv1 = layers.Conv1D(64, 3, padding='same', activation='relu')
+        self.drop1 = layers.Dropout(0.3)
+        
+        # Second 1D convolutional layer
+        self.conv2 = layers.Conv1D(128, 3, padding='same', activation='relu')
+        self.drop2 = layers.Dropout(0.3)
+        
+        # Global pooling for variable input lengths
+        self.global_pool = layers.GlobalMaxPooling1D()
+        
+        # Dense layers for encoding
+        self.dense1 = layers.Dense(256, activation='relu')
+        self.drop3 = layers.Dropout(0.3)
+        
+        # Latent projections
+        self.mu_layer = layers.Dense(latent_dim)
+        self.logvar_layer = layers.Dense(latent_dim)
 
-        self.conv1 = layers.Conv2D(32, kernel_size=4, strides=2, padding='same', activation='relu')
-        self.conv2 = layers.Conv2D(64, kernel_size=4, strides=2, padding='same', activation='relu')
-        self.conv3 = layers.Conv2D(128, kernel_size=4, strides=2, padding='same', activation='relu')
-        self.conv4 = layers.Conv2D(256, kernel_size=4, strides=2, padding='same', activation='relu')
-
-        self.spp1 = layers.GlobalMaxPooling2D()
-        self.spp2 = layers.AveragePooling2D(pool_size=(4, 4))
-        self.spp3 = layers.AveragePooling2D(pool_size=(8, 8))
-
-        self.attention = layers.MultiHeadAttention(num_heads=4, key_dim=64)
-
-        self.dense_reduce = layers.Dense(256, activation='relu')
-
-        # Output layers for ellipse and polygon parameters
-        self.ellipse_layer = layers.Dense(self.num_ellipses * 5)  # Each ellipse has 5 params (x, y, major, minor, angle)
-        self.polygon_layer = layers.Dense(self.num_polygon_points * 2)  # Each point has (x, y)
-
-    def call(self, x):
+    def call(self, x, training=False):
+        """
+        x shape: (batch, max_num_cracks, desc_length)
+        """
+        # Create a mask for valid descriptors (non-zero entries)
+        # This assumes zeros indicate padding
+        input_mask = tf.reduce_any(tf.not_equal(x, 0), axis=-1)
+        input_mask = tf.cast(input_mask, dtype=tf.float32)
+        input_mask = tf.expand_dims(input_mask, axis=-1)
+        
+        # Apply convolutions with masking to ignore padded entries
         x = self.conv1(x)
+        x = x * input_mask  # Apply mask
+        x = self.drop1(x, training=training)
+        
         x = self.conv2(x)
-        x = self.conv3(x)
-        x = self.conv4(x)
-
-        x1 = self.spp1(x)
-        x2 = tf.reshape(self.spp2(x), [-1, self.spp2(x).shape[-1]])
-        x3 = tf.reshape(self.spp3(x), [-1, self.spp3(x).shape[-1]])
-
-        x_spp = tf.concat([x1, x2, x3], axis=-1)
-
-        batch_size, h, w, c = x.shape
-        x = tf.reshape(x, [batch_size, h * w, c])
-        x = self.attention(x, x, x)
-        x = tf.reshape(x, [batch_size, h, w, c])
-
-        x = self.dense_reduce(x_spp)
-
-        ellipses = self.ellipse_layer(x)  # Output ellipse parameters
-        polygons = self.polygon_layer(x)  # Output polygon points
-
-        return ellipses, polygons
-
-# ----- Combined Encoder with Multi Branches -----
-class MultiModalEncoder(keras.Model):
-    """
-    Aggregates feature vectors from raw, RMS, PSD, and mask encoders.
-    Each sub-encoder outputs a deterministic feature vector.
-    These are concatenated (along with test_id) and passed through an MLP to produce
-    the final MoG parameters for the shared latent space.
-    """
-    def __init__(self, latent_dim, feature_dim, num_ellipses=30, num_polygon_points=10, num_mixtures=5):
-        super().__init__()
-        self.num_mixtures = num_mixtures
-        self.raw_enc = RawEncoder(feature_dim)
-        self.rms_enc = RMSEncoder(feature_dim)
-        self.psd_enc = PSDEncoder(feature_dim)
-        self.mask_enc = MaskEncoder(num_ellipses=num_ellipses, num_polygon_points=num_polygon_points)
-
-        # Aggregator: concatenate features from all 4 modalities plus test_id.
-        self.fc_agg = layers.Dense(128, activation='relu')
-        self.mu_layer = layers.Dense(latent_dim * num_mixtures)
-        self.logvar_layer = layers.Dense(latent_dim * num_mixtures)
-        self.pi_layer = layers.Dense(num_mixtures, activation="softmax")
-
-    def call(self, raw_in, rms_in, psd_in, ellipses, polygons, test_id, training=False):
-        feat_raw = self.raw_enc(raw_in, training=training)
-        feat_rms = self.rms_enc(rms_in, training=training)
-        feat_psd = self.psd_enc(psd_in, training=training)
-
-        # Concatenate ellipses and polygons as a single mask encoding
-        mask_encoding = tf.concat([ellipses, polygons], axis=-1)
-
-        # Process test_id: convert to float and expand dimension => [B, 1]
-        test_id = tf.cast(test_id, tf.float32)
-        test_id = tf.expand_dims(test_id, axis=-1)
-
-        # Concatenate all features: [B, (4*feature_dim + 1)]
-        combined_features = tf.concat([feat_raw, feat_rms, feat_psd, mask_encoding, test_id], axis=-1)
-
-        # Pass through aggregator MLP.
-        agg = self.fc_agg(combined_features)
-        mu_unshaped = self.mu_layer(agg)
-        logvar_unshaped = self.logvar_layer(agg)
-        pi_final = self.pi_layer(agg)
-
-        # Reshape mu and logvar to [B, num_mixtures, latent_dim]
-        latent_dim = tf.shape(mu_unshaped)[-1] // self.num_mixtures
-        mu_final = tf.reshape(mu_unshaped, [-1, self.num_mixtures, latent_dim])
-        logvar_final = tf.reshape(logvar_unshaped, [-1, self.num_mixtures, latent_dim])
-
-        return mu_final, logvar_final, pi_final, combined_features
+        x = x * input_mask  # Apply mask
+        x = self.drop2(x, training=training)
+        
+        # Global pooling across crack descriptors
+        x = self.global_pool(x)
+        
+        # Dense encoding
+        x = self.dense1(x)
+        x = self.drop3(x, training=training)
+        
+        # Output distribution parameters
+        mu = self.mu_layer(x)
+        logvar = self.logvar_layer(x)
+        
+        return mu, logvar
 
 # ----- Decoders with Cross-Attention -----
 class TimeSeriesDecoder(keras.Model):
@@ -802,229 +713,314 @@ class TimeSeriesDecoder(keras.Model):
         x = self.conv_out(x)
         return x  # [B, 1000, 12]
  
-class MaskDecoder(tf.keras.Model):
-    def __init__(self, num_ellipses=30, num_polygon_points=10):
+class DescriptorDecoder(tf.keras.Model):
+    """
+    Decoder for crack descriptor data.
+    Input: latent vector z
+    Output shape: (batch_size, max_num_cracks=770, desc_length=42)
+    """
+    def __init__(self, max_num_cracks=770, desc_length=42):
         super().__init__()
-        self.num_ellipses = num_ellipses
-        self.num_polygon_points = num_polygon_points
+        self.max_num_cracks = max_num_cracks
+        self.desc_length = desc_length
+        
+        # Project latent to initial dense representation
+        self.fc1 = layers.Dense(256, activation='relu')
+        self.drop1 = layers.Dropout(0.3)
+        
+        # Project to shape that can be reshaped to (batch, max_cracks/10, 10*hidden_dim)
+        # We'll reshape and then use Conv1DTranspose to expand
+        hidden_dim = 64
+        self.reshaped_cracks = max_num_cracks // 10  # Compress by factor of 10
+        self.fc2 = layers.Dense(self.reshaped_cracks * hidden_dim * 10, activation='relu')
+        self.drop2 = layers.Dropout(0.3)
+        
+        # Reshape layer
+        self.reshape = layers.Reshape((self.reshaped_cracks, hidden_dim * 10))
+        
+        # Upsampling with Conv1DTranspose
+        self.conv_t1 = layers.Conv1DTranspose(128, 3, strides=2, padding='same', activation='relu')
+        self.drop3 = layers.Dropout(0.3)
+        
+        self.conv_t2 = layers.Conv1DTranspose(64, 3, strides=2, padding='same', activation='relu')
+        self.drop4 = layers.Dropout(0.3)
+        
+        # Final projection to descriptor space
+        self.conv_t3 = layers.Conv1DTranspose(32, 3, strides=2, padding='same', activation='relu')
+        self.drop5 = layers.Dropout(0.3)
+        
+        # Output layer - no activation as descriptors can have any range of values
+        self.output_layer = layers.Conv1D(desc_length, 1, padding='same')
 
-        self.fc = layers.Dense(256, activation='relu')
-
-        # **Cross-Attention on Time-Series Features**
-        self.attention_layer = layers.MultiHeadAttention(num_heads=4, key_dim=64)
-        self.ts_proj_layer = layers.Dense(64)  # Projects time-series features
-
-        # **Output layers for ellipses and polygons**
-        self.ellipse_layer = layers.Dense(self.num_ellipses * 5)  # (x, y, major, minor, angle)
-        self.polygon_layer = layers.Dense(self.num_polygon_points * 2)  # (x, y)
-
-    def call(self, z, ts_features=None):
-        """
-        Decodes z into ellipses and polygons, optionally conditioning on ts_features.
-
-        Args:
-            z: Latent vector [B, latent_dim]
-            ts_features: Time-series encoded features for conditioning (optional)
-
-        Returns:
-            ellipses: Predicted ellipse parameters [B, num_ellipses * 5]
-            polygons: Predicted polygon parameters [B, num_polygon_points * 2]
-        """
-        x = self.fc(z)  # Pass latent vector through FC layer
-
-        # **Apply Cross-Attention if Time-Series Features are Available**
-        if ts_features is not None:
-            ts_proj = self.ts_proj_layer(ts_features)  # Project time-series features
-            ts_proj = tf.expand_dims(ts_proj, axis=1)  # Expand dims for attention
-            attn_output = self.attention_layer(query=tf.expand_dims(x, axis=1), value=ts_proj, key=ts_proj)
-            x = x + tf.squeeze(attn_output, axis=1)  # Add residual connection
-
-        # Predict ellipses and polygons
-        ellipses = self.ellipse_layer(x)
-        polygons = self.polygon_layer(x)
-
-        return ellipses, polygons
-
-# ----- VAE with Self-Attention in the Bottleneck -----
-class VAE(keras.Model):
+    def call(self, z, training=False):
+        # Initial dense projection
+        x = self.fc1(z)
+        x = self.drop1(x, training=training)
+        
+        # Project to reshapable dimension
+        x = self.fc2(x)
+        x = self.drop2(x, training=training)
+        
+        # Reshape to begin 1D convolution sequence
+        x = self.reshape(x)
+        
+        # Upsample with transposed convolutions
+        x = self.conv_t1(x)
+        x = self.drop3(x, training=training)
+        
+        x = self.conv_t2(x)
+        x = self.drop4(x, training=training)
+        
+        x = self.conv_t3(x)
+        x = self.drop5(x, training=training)
+        
+        # Final output projection to descriptor space
+        x = self.output_layer(x)
+        
+        # Apply padding and truncation to match expected output shape
+        current_shape = tf.shape(x)[1]
+        if current_shape < self.max_num_cracks:
+            # Pad with zeros if we have fewer than max_num_cracks
+            paddings = [[0, 0], [0, self.max_num_cracks - current_shape], [0, 0]]
+            x = tf.pad(x, paddings)
+        elif current_shape > self.max_num_cracks:
+            # Truncate if we have more than max_num_cracks
+            x = x[:, :self.max_num_cracks, :]
+        
+        return x
+          
+# ----- VAE -----
+class MMVM_VAE(tf.keras.Model):
     """
-    VAE with a Mixture of Gaussians (MoG) latent space:
-      - Uses MultiModalEncoder to encode time-series and mask features.
-      - Represents the latent space using a MoG prior.
-      - Reparameterizes using a weighted sum of MoG components.
-      - Decodes the latent vector into raw time-series and damage masks.
-
-    Returns: recon_ts, recon_mask, (mu_final, logvar_final, pi_final)
+    Improved Multimodal VAE with true Variational Mixture-of-Experts prior (MMVM VAE).
+    Updated to use descriptor data instead of mask data.
     """
-    def __init__(self, latent_dim, feature_dim, num_mixtures=5):
-        super(VAE, self).__init__()
-        self.num_mixtures = num_mixtures
-        self.encoder = MultiModalEncoder(latent_dim, feature_dim, num_mixtures)
-        self.decoder_ts = TimeSeriesDecoder()
-        self.decoder_mask = MaskDecoder()
+    def __init__(self, latent_dim, max_num_cracks=770, desc_length=42):
+        super(MMVM_VAE, self).__init__()
+        
+        # Independent encoders for each modality
+        self.raw_encoder = RawEncoder(latent_dim)
+        self.rms_encoder = RMSEncoder(latent_dim)
+        self.psd_encoder = PSDEncoder(latent_dim)
+        self.descriptor_encoder = DescriptorEncoder(latent_dim)
+        
+        # Decoders
+        self.raw_decoder = TimeSeriesDecoder()
+        # Replace mask decoder with descriptor decoder
+        self.descriptor_decoder = DescriptorDecoder(max_num_cracks=max_num_cracks, desc_length=desc_length)
+        
+        # For self-attention refinement
         self.token_count = 8
         self.token_dim = latent_dim // self.token_count
         self.self_attention_layer = layers.MultiHeadAttention(num_heads=4, key_dim=self.token_dim)
+        
+        # Store latent dimension
+        self.latent_dim = latent_dim
+        
+        # Store descriptor dimensions
+        self.max_num_cracks = max_num_cracks
+        self.desc_length = desc_length
+        
+        # Monte Carlo samples for KL estimation
+        self.mc_samples = 100
+    
+    def call(self, raw_in, rms_in, psd_in, descriptor_in, test_id, training=False):
+            """
+            Forward pass of the improved MMVM VAE model.
+            Each modality is encoded independently and decoded from its own latent representation.
+            Now using descriptor data instead of mask data.
+            """
+            # Encode each modality to its own latent distribution
+            mu_raw, logvar_raw = self.raw_encoder(raw_in, training=training)
+            mu_rms, logvar_rms = self.rms_encoder(rms_in, training=training)
+            mu_psd, logvar_psd = self.psd_encoder(psd_in, training=training)
+            mu_desc, logvar_desc = self.descriptor_encoder(descriptor_in, training=training)
+            
+            # Collect all distribution parameters
+            all_mus = [mu_raw, mu_rms, mu_psd, mu_desc]
+            all_logvars = [logvar_raw, logvar_rms, logvar_psd, logvar_desc]
+            
+            # Compute JS divergence with true mixture-of-experts prior
+            js_div = self.compute_mixture_js_divergence(all_mus, all_logvars)
+            
+            # Sample from each unimodal posterior
+            z_raw = self.reparameterize(mu_raw, logvar_raw)
+            z_desc = self.reparameterize(mu_desc, logvar_desc)
+            
+            # Apply self-attention to refine latent vectors
+            z_raw_refined = self.apply_self_attention(z_raw)
+            z_desc_refined = self.apply_self_attention(z_desc)
+            
+            # Decode each modality from its own latent vector
+            recon_ts = self.raw_decoder(z_raw_refined, training=training)
+            
+            # Decode descriptors instead of mask
+            recon_desc = self.descriptor_decoder(z_desc_refined, training=training)
+            
+            # Return reconstructions, latent parameters, and JS divergence
+            return recon_ts, recon_desc, (all_mus, all_logvars, js_div)
 
-    def reparameterize(self, mu, logvar, pi):
+    def compute_mixture_js_divergence(self, mus, logvars):
         """
-        Performs the reparameterization trick using a Mixture of Gaussians.
-        Instead of sampling, we take a weighted sum of the mixture means.
+        Compute Jensen–Shannon divergence using the 'all-modalities-included' mixture-of-experts prior.
+        Each modality's prior is the average of ALL modality encoders, including its own.
+        
+        In the paper notation (Equation (3)):
+            h(z_m | X) = 1/M * sum_{m'=1..M} q_{m'}(z_m | x_{m'})
+        which is used in KL(q_m || h), producing M * JS(...) total. (Paper: Unity by Diversity - Thomas. M. Sutter et.al)
 
         Args:
-            mu: [B, num_mixtures, latent_dim] -> Mean of latent Gaussian components
-            logvar: [B, num_mixtures, latent_dim] -> Log-variance of latent Gaussian components
-            pi: [B, num_mixtures] -> Mixture weights (should sum to 1 per batch sample)
-
+            mus: list of Tensors (shape [batch_size, latent_dim]) for each modality’s mu
+            logvars: list of Tensors (same shape) for each modality’s log-variance
         Returns:
-            z: [B, latent_dim] -> Sampled latent vector
+            js_div: A scalar Tensor for the mean KL(q_m || mixture_of_all_modalities), i.e. the JS divergence
         """
-        z = tf.reduce_sum(pi[..., tf.newaxis] * mu, axis=1)
-        return z
+        M = len(mus)
+        if M <= 1:
+            # No JS-div penalty if only one modality
+            return tf.constant(0.0, dtype=tf.float32)
 
-    def call(self, raw_in, fft_in, rms_in, psd_in, ellipses, polygons, test_id, training=False):
+        kl_divs = []
+        for m in range(M):
+            # Current modality's distribution parameters
+            mu_m = mus[m]
+            logvar_m = tf.clip_by_value(logvars[m], -8.0, 8.0)
+
+            # === Mixture includes *all* M modalities (including this one) ===
+            mixture_mus = mus           
+            mixture_logvars = logvars    
+
+            # Compute KL( q_m || mixture_of_all_mods )
+            current_kl = self._kl_to_mixture(
+                mu_m,
+                logvar_m,
+                mixture_mus,
+                mixture_logvars
+            )
+            kl_divs.append(current_kl)
+
+        # JS divergence is the average of those M KL terms
+        js_div = tf.reduce_mean(kl_divs)
+
+        # Safety check
+        tf.debugging.assert_all_finite(js_div, "JS divergence is not finite.")
+        return js_div
+
+
+    def _kl_to_mixture(self, mu, logvar, mixture_mus, mixture_logvars):
         """
-        Forward pass of the VAE.
-
+        Compute KL(q || mixture) where q is a single Gaussian and mixture is a mixture of Gaussians.
+        Uses Monte Carlo approximation for the expectation.
+        
         Args:
-            raw_in, fft_in, rms_in, psd_in: Time-series features.
-            ellipses, polygons: Damage representation encodings.
-            test_id: Test identifier.
-            training: Whether the model is in training mode.
-
+            mu: Mean of q distribution
+            logvar: Log variance of q distribution
+            mixture_mus: List of means for mixture components
+            mixture_logvars: List of log variances for mixture components
+        
         Returns:
-            recon_ts: Reconstructed time-series data.
-            recon_mask: Reconstructed damage mask.
-            (mu_final, logvar_final, pi_final): MoG latent space parameters.
+            KL(q || mixture) averaged over batch
         """
-        # 1) Encode inputs into MoG latent space
-        mu_final, logvar_final, pi_final, agg_features = self.encoder(
-        raw_in, rms_in, psd_in, ellipses, polygons, test_id
+        # Number of mixture components
+        K = len(mixture_mus)
+        
+        # Number of Monte Carlo samples
+        n_samples = self.mc_samples
+        
+        # Sample from q
+        std = tf.exp(0.5 * logvar)
+        eps = tf.random.normal(shape=[n_samples, *tf.shape(std)])
+        z_samples = mu + eps * std  # Shape: [n_samples, batch_size, latent_dim]
+        
+        # Compute log p(z|q) for each sample
+        log_q = self._log_normal_pdf(z_samples, mu, logvar)  # Shape: [n_samples, batch_size]
+        
+        # Compute log p(z|mixture) for each sample and mixture component
+        log_mixture = []
+        for k in range(K):
+            log_p_k = self._log_normal_pdf(z_samples, mixture_mus[k], mixture_logvars[k])
+            log_mixture.append(log_p_k)
+        
+        # Log of average: log(1/K * sum_k exp(log_p_k))
+        log_mixture = tf.reduce_logsumexp(tf.stack(log_mixture, axis=0), axis=0) - tf.math.log(tf.cast(K, tf.float32))
+        
+        # KL = E_q[log q(z) - log mixture(z)]
+        kl = log_q - log_mixture  # Shape: [n_samples, batch_size]
+        
+        # Average over samples and batch
+        return tf.reduce_mean(kl)
+
+    def _log_normal_pdf(self, sample, mu, logvar):
+        """
+        Compute log probability of sample under Normal(mu, exp(logvar)).
+        
+        Args:
+            sample: Tensor of shape [n_samples, batch_size, latent_dim]
+            mu: Tensor of shape [batch_size, latent_dim]
+            logvar: Tensor of shape [batch_size, latent_dim]
+        
+        Returns:
+            Log probability of shape [n_samples, batch_size]
+        """
+        log_2pi = tf.math.log(2. * np.pi)
+        
+        # Expand dimensions for broadcasting
+        mu = tf.expand_dims(mu, axis=0)  # [1, batch_size, latent_dim]
+        logvar = tf.expand_dims(logvar, axis=0)  # [1, batch_size, latent_dim]
+        
+        # Compute log PDF
+        log_prob = -0.5 * (
+            log_2pi + 
+            logvar + 
+            tf.exp(-logvar) * tf.square(sample - mu)
         )
-
-        # 2) Sample latent vector z using the MoG reparameterization trick
-        z = self.reparameterize(mu_final, logvar_final, pi_final)  
-
-        # 3) Apply self-attention to refine z (optional)
+        
+        # Sum over latent dimensions
+        return tf.reduce_sum(log_prob, axis=-1)
+    
+    def reparameterize(self, mu, logvar):
+        """Sample from a Gaussian distribution with given parameters"""
+        std = tf.exp(0.5 * logvar)
+        eps = tf.random.normal(shape=tf.shape(std))
+        return mu + eps * std
+    
+    def apply_self_attention(self, z):
+        """Apply self-attention to refine latent vector"""
         z_tokens = tf.reshape(z, (-1, self.token_count, self.token_dim))
         attn_output = self.self_attention_layer(query=z_tokens, key=z_tokens, value=z_tokens)
-        z_refined = tf.reshape(attn_output, (-1, tf.shape(z)[-1]))
-
-        # 4) Decode time-series and damage mask using the refined latent vector
-        recon_ts = self.decoder_ts(z_refined, mask_features=agg_features)
-        recon_mask = self.decoder_mask(z_refined, ts_features=agg_features)
-
-        return recon_ts, recon_mask, (mu_final, logvar_final, pi_final)
-
-    def generate(self, z):
+        z_refined = tf.reshape(attn_output, tf.shape(z))
+        return z_refined
+    
+    def generate(self, modality='ts', conditioning_latent=None):
         """
-        Generate synthetic time-series and masks from a latent vector.
-
+        Generate samples from the prior or conditioned on another modality.
+        
         Args:
-            z: Latent vector of shape [B, latent_dim]
-
+            modality: Which modality to generate ('ts' or 'desc')
+            conditioning_latent: Optional latent vector to condition generation on
+            
         Returns:
-            recon_ts: Generated time-series data
-            recon_mask: Generated damage mask
+            Generated sample
         """
-        z_tokens = tf.reshape(z, (-1, self.token_count, self.token_dim))
-        attn_output = self.self_attention_layer(query=z_tokens, key=z_tokens, value=z_tokens)
-        z_refined = tf.reshape(attn_output, (-1, tf.shape(z)[-1]))
-
-        recon_ts = self.decoder_ts(z_refined, mask_features=None)
-        recon_mask = self.decoder_mask(z_refined, ts_features=None)
-
-        return recon_ts, recon_mask
-
+        # Sample from prior or use conditioning latent
+        if conditioning_latent is None:
+            # Sample from a standard Gaussian prior
+            z = tf.random.normal(shape=(1, self.latent_dim))
+        else:
+            z = conditioning_latent
+        
+        # Refine with self-attention
+        z_refined = self.apply_self_attention(z)
+        
+        # Generate requested modality
+        if modality == 'ts':
+            return self.raw_decoder(z_refined)
+        elif modality == 'desc':
+            return self.descriptor_decoder(z_refined)
+        else:
+            raise ValueError(f"Unknown modality: {modality}")
+                     
 # ----- Prior estimation -----
-def mixture_of_gaussians_log_prob(z, mus, logvars, pis, eps=1e-8):
-    """
-    Evaluate log p(z) for a mixture of Gaussians:
-      p(z) = sum_k pis[k] * N(z | mus[k], exp(logvars[k]))
-
-    Args:
-      z: shape (batch, latent_dim)
-      mus: shape (K, latent_dim)
-      logvars: shape (K, latent_dim)
-      pis: shape (K,) => mixture weights (should sum to 1)
-      eps: small constant to avoid log(0)
-
-    Returns:
-      log_p(z), shape (batch,)
-    """
-    # 1) Safe clamp mixture weights => never zero
-    pis_safe = pis + eps
-    pis_safe = pis_safe / tf.reduce_sum(pis_safe)  # re-normalize
-
-    # 2) Clip logvars to safe range
-    logvars = tf.clip_by_value(logvars, -10.0, 10.0)
-
-    # Expand dims to broadcast
-    K = tf.shape(mus)[0]  # K
-    z_expanded = tf.expand_dims(z, axis=1)      # (batch, 1, latent_dim)
-    mus = tf.expand_dims(mus, axis=0)           # (1, K, latent_dim)
-    logvars = tf.expand_dims(logvars, axis=0)   # (1, K, latent_dim)
-
-    # log p(z | comp k)
-    # = -0.5 * [(z - mu)^2 / var + log var] - const
-    const_term = 0.5 * tf.cast(z.shape[-1], tf.float32) * np.log(2.0 * np.pi)
-    inv_var = tf.exp(-logvars)
-    log_p_k = -0.5 * tf.reduce_sum(inv_var * tf.square(z_expanded - mus), axis=-1) \
-              - 0.5 * tf.reduce_sum(logvars, axis=-1) \
-              - const_term  # => shape (batch, K)
-
-    # weighting by mixture pi_k => log pi_k
-    weighted_log_p_k = log_p_k + tf.math.log(pis_safe)  # => shape (batch, K)
-
-    # stable log-sum-exp across k
-    log_p = tf.reduce_logsumexp(weighted_log_p_k, axis=-1)  # => (batch,)
-    tf.debugging.assert_all_finite(log_p, "NaN in mixture_of_gaussians_log_prob")
-    return log_p
-
-def mog_log_prob_per_example(z, mu_q, logvar_q, pi_q, eps=1e-8):
-    """
-    Evaluate log q_i(z_i), where q_i is a mixture of Gaussians specific
-    to each batch example i.
-
-    Args:
-      z: shape (batch, latent_dim)
-      mu_q: shape (batch, K, latent_dim)
-      logvar_q: shape (batch, K, latent_dim)
-      pi_q: shape (batch, K)
-      eps: small constant to avoid log(0)
-
-    Returns:
-      shape (batch,) => log of the mixture pdf at each z_i
-    """
-    # 1) clamp mixture weights => no zero
-    pi_q_safe = pi_q + eps
-    pi_q_safe = pi_q_safe / tf.reduce_sum(pi_q_safe, axis=1, keepdims=True)  # per example
-
-    # 2) clamp logvar => [-10, 10]
-    logvar_q = tf.clip_by_value(logvar_q, -10.0, 10.0)
-
-    batch_size = tf.shape(z)[0]
-    K = tf.shape(mu_q)[1]
-
-    # expand z => [batch, 1, latent_dim]
-    z_expanded = tf.expand_dims(z, axis=1)   # => [batch, 1, latent_dim]
-    inv_var = tf.exp(-logvar_q)             # => [batch, K, latent_dim]
-    diff_sq = tf.square(z_expanded - mu_q)  # => [batch, K, latent_dim]
-
-    # log N(z|mu, var)
-    const_term = 0.5 * tf.cast(z.shape[-1], tf.float32) * np.log(2.0 * np.pi)
-    log_probs_per_comp = -0.5 * tf.reduce_sum(inv_var * diff_sq, axis=-1) \
-                         - 0.5 * tf.reduce_sum(logvar_q, axis=-1) \
-                         - const_term
-    # => shape [batch, K]
-
-    # add log pi_q
-    weighted = log_probs_per_comp + tf.math.log(pi_q_safe)  # => [batch, K]
-    log_mix = tf.reduce_logsumexp(weighted, axis=-1)        # => [batch]
-
-    tf.debugging.assert_all_finite(log_mix, "NaN in mog_log_prob_per_example")
-    return log_mix
-
 def compute_vae_loss(recon_loss, kl_loss, current_epoch, total_epochs):
     """
     Computes the VAE loss with KL annealing.
@@ -1042,76 +1038,6 @@ def compute_vae_loss(recon_loss, kl_loss, current_epoch, total_epochs):
     total_loss = recon_loss + kl_weight * kl_loss
     return total_loss, kl_weight  # Return KL weight for monitoring
 
-def kl_q_p_mixture(
-    mu_q, logvar_q, pi_q,       # posterior mixture: shape [batch, K, latent_dim], [batch, K], etc.
-    mu_p, logvar_p, pi_p,       # prior mixture: shape [K, latent_dim], [K], etc.
-    num_samples=1,
-    eps=1e-8
-):
-    """
-    KL( q(z) || p(z) ) where both q, p are mixture-of-Gaussians.
-
-    We do:
-    1) sample z ~ q
-    2) compute log_q(z) - log_p(z)
-    3) average over multiple samples if needed
-    """
-    # Quick checks
-    tf.debugging.assert_all_finite(mu_q,     "mu_q is NaN/Inf in kl_q_p_mixture")
-    tf.debugging.assert_all_finite(logvar_q, "logvar_q is NaN/Inf in kl_q_p_mixture")
-    tf.debugging.assert_all_finite(pi_q,     "pi_q is NaN/Inf in kl_q_p_mixture")
-    tf.debugging.assert_all_finite(mu_p,     "mu_p is NaN/Inf in kl_q_p_mixture")
-    tf.debugging.assert_all_finite(logvar_p, "logvar_p is NaN/Inf in kl_q_p_mixture")
-    tf.debugging.assert_all_finite(pi_p,     "pi_p is NaN/Inf in kl_q_p_mixture")
-
-    # clamp posterior mixture weights
-    pi_q_safe = pi_q + eps  # shape [batch, K]
-    pi_q_safe = pi_q_safe / tf.reduce_sum(pi_q_safe, axis=1, keepdims=True)
-
-    # clamp prior mixture weights
-    pi_p_safe = pi_p + eps  # shape [K,]
-    pi_p_safe = pi_p_safe / tf.reduce_sum(pi_p_safe)
-
-    # clamp logvar
-    logvar_q = tf.clip_by_value(logvar_q, -10.0, 10.0)
-    logvar_p = tf.clip_by_value(logvar_p, -10.0, 10.0)
-
-    batch_size = tf.shape(mu_q)[0]
-    K = tf.shape(mu_q)[1]
-    latent_dim = tf.shape(mu_q)[2]
-
-    kl_accum = 0.0
-    for _ in range(num_samples):
-        # pick a mixture component j ~ pi_q
-        chosen_js = tf.random.categorical(tf.math.log(pi_q_safe), num_samples=1, dtype=tf.int32)
-        chosen_js = tf.squeeze(chosen_js, axis=1)  # => shape (batch,)
-
-        batch_idxs = tf.range(batch_size, dtype=tf.int32)
-        gather_idxs = tf.stack([batch_idxs, chosen_js], axis=1)  # => shape (batch,2)
-
-        # gather mu_q[i,j], logvar_q[i,j]
-        chosen_mu = tf.gather_nd(mu_q, gather_idxs)      # => [batch, latent_dim]
-        chosen_lv = tf.gather_nd(logvar_q, gather_idxs)  # => [batch, latent_dim]
-
-        # sample z
-        eps_ = tf.random.normal(tf.shape(chosen_mu))
-        chosen_lv = tf.clip_by_value(chosen_lv, -10.0, 10.0)  # again clamp
-        z_sample = chosen_mu + tf.exp(0.5 * chosen_lv) * eps_  # => [batch, latent_dim]
-
-        # Evaluate log q(z), log p(z)
-        log_qz = mog_log_prob_per_example(z_sample, mu_q, logvar_q, pi_q_safe, eps=eps)
-        log_pz = mixture_of_gaussians_log_prob(z_sample, mu_p, logvar_p, pi_p_safe, eps=eps)
-
-        diff = (log_qz - log_pz)
-        tf.debugging.assert_all_finite(diff, "NaN in (log_qz - log_pz)")
-
-        kl_accum += diff
-
-    kl_values = kl_accum / tf.cast(num_samples, tf.float32)
-    kl_mean = tf.reduce_mean(kl_values)
-    tf.debugging.assert_all_finite(kl_mean, "NaN in kl_mean (kl_q_p_mixture)")
-    return kl_mean
-
 def gaussian_log_prob(z, mu, logvar):
     """
     log N(z | mu, exp(logvar)) i.i.f. over the last dimension
@@ -1122,77 +1048,23 @@ def gaussian_log_prob(z, mu, logvar):
     log_det = 0.5 * tf.reduce_sum(logvar, axis=-1)
     return tf.cast(const_term, tf.float32) + 0.5 * tmp + log_det
 
-def sample_from_mog(mu, logvar, pi):
-    """
-    Samples from a Mixture of Gaussians:
-      mu, logvar: shape [K, latent_dim]
-      pi: shape [K,] for mixture weights
-    Returns:
-      z: shape [1, latent_dim] if we do 1 sample
-    """
-    K = tf.shape(pi)[0]  # Number of components
-    # Suppose we sample 1 latent vector at a time
-    k = tf.random.categorical(tf.math.log(tf.expand_dims(pi, axis=0)), 1)  # shape [1,1]
-    k = tf.squeeze(k, axis=-1)  # shape [1]
-    # Extract the chosen component's (mu, logvar)
-    chosen_mu = tf.gather(mu, k, axis=0)
-    chosen_logvar = tf.gather(logvar, k, axis=0)
-    eps = tf.random.normal(tf.shape(chosen_mu))
-    z = chosen_mu + tf.exp(0.5 * chosen_logvar) * eps
-    # shape [latent_dim], expand to [1, latent_dim] if needed
-    return tf.expand_dims(z, axis=0)
-
-def train_autoencoder(model, train_dataset, val_dataset, optimizer, num_epochs=50):
-    """Train only the encoder (ignoring KL and MoG)."""
-    mse_loss_fn = tf.keras.losses.MeanSquaredError()
-    all_trainables = model.encoder.trainable_variables + model.decoder_ts.trainable_variables
-
-    for epoch in range(num_epochs):
-        epoch_loss = 0.0
-        steps = 0
-
-        for raw_in, fft_in, rms_in, psd_in, mask_in, test_id_in in train_dataset:
-            with tf.GradientTape() as tape:
-                recon_ts, _, _ = model(raw_in, fft_in, rms_in, psd_in, mask_in, test_id_in, training=True)
-                loss = mse_loss_fn(raw_in, recon_ts)
-
-            grads = tape.gradient(loss, all_trainables)
-            optimizer.apply_gradients(zip(grads, all_trainables))
-
-            epoch_loss += loss.numpy()
-            steps += 1
-
-        print(f"Epoch {epoch+1}/{num_epochs} - Recon Loss: {epoch_loss / steps:.4f}")
-
-def extract_latent_representations(model, dataset, preprocessed_masks):
-    """Pass data through the encoder to get latent embeddings."""
+def extract_latent_representations(model, dataset):
+    """Pass data through the encoder to get latent embeddings.
+    Updated to handle dataset with 5 elements instead of 6."""
     latent_vectors = []
     test_ids = []
 
-    for raw_in, fft_in, rms_in, psd_in, mask_in, test_id_in in dataset:
+    for raw_in, rms_in, psd_in, mask_in, test_id_in in dataset:
         # 🔹 Convert test_id_in to proper format
         if isinstance(test_id_in, tf.Tensor):
             test_id_in = test_id_in.numpy()
         if isinstance(test_id_in, np.ndarray):
             test_id_in = test_id_in.flatten().tolist()
 
-        # 🔹 Retrieve precomputed mask encodings
-        batch_ellipses = []
-        batch_polygons = []
-        for tid in test_id_in:
-            mask_data = preprocessed_masks.get(int(tid), {"ellipses": [], "polygons": []})
-            batch_ellipses.append(mask_data["ellipses"])
-            batch_polygons.append(mask_data["polygons"])
-
-        batch_ellipses = np.array(batch_ellipses, dtype=np.float32)
-        batch_polygons = np.array(batch_polygons, dtype=np.float32)
-        test_id_in = np.array(test_id_in, dtype=np.int32).flatten()
-
-        # ✅ Fix the Unpacking Issue - Use 4 Values
-        mu_q, logvar_q, pi_q, _ = model.encoder(
-            raw_in, fft_in, rms_in, psd_in, batch_ellipses, batch_polygons, test_id_in, training=False
-        )
-
+        # Get latent representations from model, adapting to your specific model
+        # This assumes your model's encoder can be called directly to get mu and logvar
+        mu_q, logvar_q = model.raw_encoder(raw_in, training=False)
+        
         latent_vectors.append(mu_q.numpy())
         test_ids.append(test_id_in)
 
@@ -1254,243 +1126,192 @@ def estimate_mog_components(latent_vectors, max_components=10):
     plt.title("Estimating Best MoG Components for Z")
     plt.show()
 
-# ~~~~~~~~~~~~~~~~ DEFINE MOG PARAMETERS ~~~~~~~~~~~~~~~~~
-K = 3  # Number of mixture components
-latent_dim_raw = 128 # Must match the latend_dim in main
-latent_dim_fft = 128
-latent_dim_rms = 128
-latent_dim_psd = 128
-latent_dim_mask = 128
-
 #-------------------- Training -------------------------
-def train_vae(
+def train_improved_mmvm_vae(
     model, 
     train_dataset, 
     val_dataset, 
-    mask_dict, 
-    preprocessed_masks, 
     optimizer, 
     num_epochs=100, 
-    use_mog=True,
-    patience=10
+    patience=10,
+    beta_schedule='cyclical',
+    descriptor_loss_fn=None
 ):
     """
-    Train loop for VAE using adaptive ellipses/polygons for mask representation.
-    Incorporates KL annealing, LR scheduling, and early stopping.
+    Improved train loop for MMVM VAE with true mixture-of-experts prior.
+    Updated to use descriptor data instead of mask data.
+    
+    Args:
+        model: MMVM VAE model
+        train_dataset: Training dataset
+        val_dataset: Validation dataset
+        optimizer: Optimizer
+        num_epochs: Maximum number of epochs
+        patience: Early stopping patience
+        beta_schedule: Type of beta schedule ('linear', 'exponential', 'cyclical')
+        descriptor_loss_fn: Custom descriptor loss function (if None, use weighted_descriptor_mse_loss)
+    
+    Returns:
+        Training and validation metrics
     """
-
+    # Define loss functions
     mse_loss_fn = tf.keras.losses.MeanSquaredError()
+    if descriptor_loss_fn is None:
+        descriptor_loss_fn = weighted_descriptor_mse_loss
+    
     all_trainables = model.trainable_variables
 
+    # Initialize metrics tracking
     train_total_losses = []
     train_recon_losses = []
-    train_kl_losses = []
+    train_ts_losses = []
+    train_desc_losses = []
+    train_js_losses = []
 
     val_total_losses = []
     val_recon_losses = []
-    val_kl_losses = []
+    val_ts_losses = []
+    val_desc_losses = []
+    val_js_losses = []
 
     # For early stopping
     best_val_loss = float('inf')
     no_improvement_count = 0
 
-    print("🔄 Starting Training...")
+    print("🔄 Starting Training with Improved Mixture-of-Experts Prior...")
 
     for epoch in range(num_epochs):
+        # Get beta value for this epoch
+        beta = get_beta_schedule(epoch, num_epochs, beta_schedule)
+        
+        # Get dynamic loss weights
+        desc_weight = dynamic_mask_loss_weight(epoch, num_epochs)  # Reusing the function but for descriptor weight
+        ts_weight = 1.0 - desc_weight
+        
+        print(f"Epoch {epoch+1}/{num_epochs} | Beta: {beta:.6f} | Descriptor Weight: {desc_weight:.2f}")
+        
+        # Training loop
         epoch_train_total = 0.0
         epoch_train_recon = 0.0
-        epoch_train_kl = 0.0
+        epoch_train_ts = 0.0
+        epoch_train_desc = 0.0
+        epoch_train_js = 0.0
         train_steps = 0
 
-        for step, (raw_in, fft_in, rms_in, psd_in, mask_in, test_id_in) in enumerate(train_dataset):
-            # Convert test_id_in to list of integers
-            if isinstance(test_id_in, tf.Tensor):
-                test_id_in = test_id_in.numpy()
-            if isinstance(test_id_in, np.ndarray):
-                test_id_in = test_id_in.flatten().tolist()
-
-            # Retrieve the correct mask for each test_id in the batch
-            batch_ellipses = []
-            batch_polygons = []
-            for tid in test_id_in:
-                mask_data = preprocessed_masks.get(int(tid), {"ellipses": [], "polygons": []})
-                batch_ellipses.append(mask_data["ellipses"])
-                batch_polygons.append(mask_data["polygons"])
-
-            batch_ellipses = np.array(batch_ellipses, dtype=np.float32)
-            batch_polygons = np.array(batch_polygons, dtype=np.float32)
-            test_id_in = np.array([int(float(tid)) for tid in test_id_in], dtype=np.int32)
-
+        # Modified to handle descriptor data
+        for step, (raw_in, rms_in, psd_in, descriptor_in, test_id_in) in enumerate(train_dataset):
             with tf.GradientTape() as tape:
-                recon_ts, recon_mask, (mu_final, logvar_final, pi_final) = model(
-                    raw_in, fft_in, rms_in, psd_in,
-                    batch_ellipses, batch_polygons, test_id_in,
+                # Forward pass through the model
+                recon_ts, recon_desc, (all_mus, all_logvars, js_div) = model(
+                    raw_in, rms_in, psd_in, descriptor_in, test_id_in,
                     training=True
                 )
-                # 🔹 Fix: Clip mu to prevent large values
-                mu_final = tf.clip_by_value(mu_final, -10.0, 10.0)
-
-                pred_ellipses, pred_polygons = recon_mask
-
-                # Reconstruction loss (time-series)
-                LAMBDA_FFT, LAMBDA_MSE = 0.7, 0.3
+                
+                # Time-series reconstruction loss
                 loss_ts = mse_loss_fn(raw_in, recon_ts)
+                
+                # Descriptor reconstruction loss
+                desc_recon_loss = descriptor_loss_fn(descriptor_in, recon_desc)
+                
+                # Combined reconstruction loss with dynamic weighting
+                recon_loss = ts_weight * loss_ts + desc_weight * desc_recon_loss
+                
+                # Total loss = reconstruction loss + beta * JS divergence
+                total_loss = recon_loss + beta * js_div
 
-                # Reconstruction loss (mask)
-                LAMBDA_ELLIPSE, LAMBDA_POLYGON = 0.7, 0.3
-                mask_recon_loss = 0.0
-                for true_e, true_p, pe, pp in zip(batch_ellipses, batch_polygons, pred_ellipses, pred_polygons):
-                    if len(true_e) == 0 and len(true_p) == 0:
-                        # If the model predicts something when there's no true damage -> penalty
-                        if len(pe) != 0 or len(pp) != 0:
-                            mask_recon_loss += 1.0
-                    else:
-                        mask_recon_loss += (
-                            LAMBDA_ELLIPSE * ellipse_loss(true_e, pe)
-                            + LAMBDA_POLYGON * polygon_loss(true_p, pp)
-                        )
-
-                recon_loss = 0.5 * (loss_ts + mask_recon_loss)
-
-                # KL loss
-                if use_mog:
-                    kl_loss = kl_q_p_mixture(
-                        mu_q=mu_final, logvar_q=logvar_final, pi_q=pi_final,
-                        mu_p=tf.zeros_like(mu_final),
-                        logvar_p=tf.zeros_like(logvar_final),
-                        pi_p=tf.ones_like(pi_final) / tf.cast(tf.shape(pi_final)[-1], tf.float32),
-                        num_samples=1
-                    )
-                else:
-                    # Standard Gaussian prior
-                    # 🔹 Fix: Clip logvar to prevent variance explosion
-                    logvar_final = tf.clip_by_value(logvar_final, -5.0, 5.0)
-
-                    # Compute KL loss
-                    kl_loss = -0.5 * tf.reduce_mean(
-                        1.0 + logvar_final - tf.square(mu_final) - tf.exp(logvar_final)
-                    )
-
-
-                # KL Annealing: linearly ramp beta from BETA_START -> BETA_MAX over KL_ANNEALING_EPOCHS
-                KL_ANNEALING_EPOCHS = 400
-                BETA_START = 1e-10
-                BETA_MAX   = 1e-4
-                BETA = min(
-                    BETA_START + (BETA_MAX - BETA_START) * (epoch / KL_ANNEALING_EPOCHS),
-                    BETA_MAX
-                )
-
-                total_loss = recon_loss + BETA * kl_loss
-
+            # Gradient clipping to prevent extreme updates
             grads = tape.gradient(total_loss, all_trainables)
-            optimizer.apply_gradients(zip(grads, all_trainables))
+            # Clip gradients to prevent exploding gradients
+            clipped_grads, _ = tf.clip_by_global_norm(grads, 5.0)
+            optimizer.apply_gradients(zip(clipped_grads, all_trainables))
 
+            # Track losses
             epoch_train_total += total_loss.numpy()
             epoch_train_recon += recon_loss.numpy()
-            epoch_train_kl += kl_loss.numpy()
+            epoch_train_ts += loss_ts.numpy()
+            epoch_train_desc += desc_recon_loss.numpy()
+            epoch_train_js += js_div.numpy()
             train_steps += 1
+            
+            # Print progress every 20 steps
+            if step % 20 == 0:
+                print(f"  Step {step}/{len(train_dataset)}", end="\r")
 
         # Compute average training losses for the epoch
         if train_steps > 0:
             train_total_losses.append(epoch_train_total / train_steps)
             train_recon_losses.append(epoch_train_recon / train_steps)
-            train_kl_losses.append(epoch_train_kl / train_steps)
+            train_ts_losses.append(epoch_train_ts / train_steps)
+            train_desc_losses.append(epoch_train_desc / train_steps)
+            train_js_losses.append(epoch_train_js / train_steps)
+        
+        # Debug information
+        print(f"Train Loss: {train_total_losses[-1]:.4f} | "
+              f"Recon: {train_recon_losses[-1]:.4f} | "
+              f"TS: {train_ts_losses[-1]:.4f} | "
+              f"Desc: {train_desc_losses[-1]:.4f} | " 
+              f"JS: {train_js_losses[-1]:.4f}")
 
-        # 🔹 Debug: Print latent space mean and variance to check instability
-        print(f"Epoch {epoch+1}/{num_epochs} | Mean(μ): {tf.reduce_mean(mu_final).numpy():.4f}, "
-        f"Var(σ²): {tf.reduce_mean(tf.exp(logvar_final)).numpy():.4f}")
-
-        print(f"  🟢 Train => Total: {train_total_losses[-1]:.4f}, "
-              f"Recon: {train_recon_losses[-1]:.4f}, "
-              f"KL: {train_kl_losses[-1]:.4f}, "
-              f"Beta: {BETA:.7f}")
-
-        # ------------------ Validation Loop ------------------
-        epoch_val_total, epoch_val_recon, epoch_val_kl = 0.0, 0.0, 0.0
+        # Validation loop
+        epoch_val_total, epoch_val_recon = 0.0, 0.0
+        epoch_val_ts, epoch_val_desc = 0.0, 0.0
+        epoch_val_js = 0.0
         val_steps = 0
 
-        for step, (raw_in, fft_in, rms_in, psd_in, mask_in, test_id_in) in enumerate(val_dataset):
-            if isinstance(test_id_in, tf.Tensor):
-                test_id_in = test_id_in.numpy()
-            if isinstance(test_id_in, np.ndarray):
-                test_id_in = test_id_in.flatten().tolist()
-
-            batch_ellipses = []
-            batch_polygons = []
-            for tid in test_id_in:
-                mask_data = preprocessed_masks.get(int(tid), {"ellipses": [], "polygons": []})
-                batch_ellipses.append(mask_data["ellipses"])
-                batch_polygons.append(mask_data["polygons"])
-
-            batch_ellipses = np.array(batch_ellipses, dtype=np.float32)
-            batch_polygons = np.array(batch_polygons, dtype=np.float32)
-            test_id_in = np.array([int(float(tid)) for tid in test_id_in], dtype=np.int32)
-
+        # Modified to handle descriptor data
+        for step, (raw_in, rms_in, psd_in, descriptor_in, test_id_in) in enumerate(val_dataset):
             # Forward pass
-            recon_ts, recon_mask, (mu_final, logvar_final, pi_final) = model(
-                raw_in, fft_in, rms_in, psd_in, batch_ellipses, batch_polygons, test_id_in, training=False
+            recon_ts, recon_desc, (all_mus, all_logvars, js_div) = model(
+                raw_in, rms_in, psd_in, descriptor_in, test_id_in, 
+                training=False
             )
-            # 🔹 Fix: Clip `mu_final` to prevent extreme mean values
-            mu_final = tf.clip_by_value(mu_final, -10.0, 10.0)
 
-            # 🔹 Fix: Clip `logvar_final` to prevent variance explosion
-            logvar_final = tf.clip_by_value(logvar_final, -5.0, 5.0)
+            # Time-series reconstruction loss
+            loss_ts = mse_loss_fn(raw_in, recon_ts)
+            
+            # Descriptor reconstruction loss
+            desc_recon_loss = descriptor_loss_fn(descriptor_in, recon_desc)
+            
+            # Combined reconstruction loss with the same weighting
+            recon_loss = ts_weight * loss_ts + desc_weight * desc_recon_loss
+            
+            # Total loss with the same Beta value
+            total_loss = recon_loss + beta * js_div
 
-            pred_ellipses, pred_polygons = recon_mask
-
-            loss_ts = LAMBDA_MSE * mse_loss_fn(raw_in, recon_ts) + LAMBDA_FFT * fft_loss(raw_in, recon_ts)
-
-            mask_recon_loss = 0.0
-            for true_e, true_p, pe, pp in zip(batch_ellipses, batch_polygons, pred_ellipses, pred_polygons):
-                if len(true_e) == 0 and len(true_p) == 0:
-                    if len(pe) != 0 or len(pp) != 0:
-                        mask_recon_loss += 1.0
-                else:
-                    mask_recon_loss += (
-                        LAMBDA_ELLIPSE * ellipse_loss(true_e, pe)
-                        + LAMBDA_POLYGON * polygon_loss(true_p, pp)
-                    )
-
-            recon_loss = 0.5 * (loss_ts + mask_recon_loss)
-
-            if use_mog:
-                kl_loss = kl_q_p_mixture(
-                    mu_q=mu_final, logvar_q=logvar_final, pi_q=pi_final,
-                    mu_p=tf.zeros_like(mu_final),
-                    logvar_p=tf.zeros_like(logvar_final),
-                    pi_p=tf.ones_like(pi_final) / tf.cast(tf.shape(pi_final)[-1], tf.float32),
-                    num_samples=1
-                )
-            else:
-                kl_loss = -0.5 * tf.reduce_mean(
-                    1.0 + logvar_final - tf.square(mu_final) - tf.exp(logvar_final)
-                )
-
-            # Use the same Beta so validation is consistent with training
-            total_loss = recon_loss + BETA * kl_loss
-
+            # Track validation losses
             epoch_val_total += total_loss.numpy()
             epoch_val_recon += recon_loss.numpy()
-            epoch_val_kl += kl_loss.numpy()
+            epoch_val_ts += loss_ts.numpy()
+            epoch_val_desc += desc_recon_loss.numpy()
+            epoch_val_js += js_div.numpy()
             val_steps += 1
 
+        # Compute average validation losses
         if val_steps > 0:
             val_total_losses.append(epoch_val_total / val_steps)
             val_recon_losses.append(epoch_val_recon / val_steps)
-            val_kl_losses.append(epoch_val_kl / val_steps)
+            val_ts_losses.append(epoch_val_ts / val_steps)
+            val_desc_losses.append(epoch_val_desc / val_steps)
+            val_js_losses.append(epoch_val_js / val_steps)
 
-        print(f"  🔵 Val   => Total: {val_total_losses[-1]:.4f}, "
-              f"Recon: {val_recon_losses[-1]:.4f}, "
-              f"KL: {val_kl_losses[-1]:.4f}")
+        print(f"  🔵 Val => Total: {val_total_losses[-1]:.4f} | "
+              f"Recon: {val_recon_losses[-1]:.4f} | "
+              f"TS: {val_ts_losses[-1]:.4f} | "
+              f"Desc: {val_desc_losses[-1]:.4f} | "
+              f"JS: {val_js_losses[-1]:.4f}")
+              
+        # Improved monitoring and debugging: check if descriptor loss is stuck
+        if epoch > 10 and abs(val_desc_losses[-1] - val_desc_losses[-2]) < 1e-4:
+            print(f"⚠️ Warning: Descriptor loss appears to be plateauing: {val_desc_losses[-1]:.4f}")
 
         # -------------- Early Stopping --------------
         current_val_loss = val_total_losses[-1]
         if current_val_loss < best_val_loss:
             best_val_loss = current_val_loss
             no_improvement_count = 0
-            # (Optional) Save best model weights
-            # model.save_weights("results/best_model_weights.h5")
+            # Save best model weights
+            model.save_weights("results/best_mmvm_model_weights.h5")
+            print("✅ Saved best model weights")
         else:
             no_improvement_count += 1
             print(f"🚨 No improvement for {no_improvement_count}/{patience} epochs.")
@@ -1499,16 +1320,197 @@ def train_vae(
             print(f"🛑 Early stopping triggered at epoch {epoch+1}. No improvement for {patience} epochs.")
             break
 
-    return (
-        train_total_losses,
-        train_recon_losses,
-        train_kl_losses,
-        val_total_losses,
-        val_recon_losses,
-        val_kl_losses
-    )
+    return {
+        'train_total': train_total_losses,
+        'train_recon': train_recon_losses,
+        'train_ts': train_ts_losses,
+        'train_desc': train_desc_losses,
+        'train_js': train_js_losses,
+        'val_total': val_total_losses,
+        'val_recon': val_recon_losses,
+        'val_ts': val_ts_losses,
+        'val_desc': val_desc_losses,
+        'val_js': val_js_losses
+    }
 
 #--------------------- Plots ---------------------------
+def plot_detailed_training_curves(metrics):
+    """
+    Plot detailed training curves with improved visualization.
+    Updated to show descriptor loss instead of mask loss.
+    
+    Args:
+        metrics: Dictionary of training and validation metrics
+    """
+    epochs = list(range(1, len(metrics['train_total']) + 1))
+    
+    # Create a 2x2 grid of plots
+    fig = go.Figure()
+    
+    # 1. Total Loss
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=epochs, y=metrics['train_total'], mode='lines+markers', name="Train Total", line=dict(color='blue')))
+    fig.add_trace(go.Scatter(x=epochs, y=metrics['val_total'], mode='lines+markers', name="Val Total", line=dict(color='red')))
+    fig.update_layout(title="Total Loss vs Epochs", xaxis_title="Epoch", yaxis_title="Loss")
+    pio.write_html(fig, file="train_val_total_loss.html", auto_open=True)
+    
+    # 2. Reconstruction Losses
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=epochs, y=metrics['train_recon'], mode='lines+markers', name="Train Recon", line=dict(color='blue')))
+    fig.add_trace(go.Scatter(x=epochs, y=metrics['val_recon'], mode='lines+markers', name="Val Recon", line=dict(color='red')))
+    fig.update_layout(title="Reconstruction Loss vs Epochs", xaxis_title="Epoch", yaxis_title="Loss")
+    pio.write_html(fig, file="train_val_recon_loss.html", auto_open=True)
+    
+    # 3. Time-Series & Descriptor Losses
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=epochs, y=metrics['train_ts'], mode='lines+markers', name="Train TS", line=dict(color='blue')))
+    fig.add_trace(go.Scatter(x=epochs, y=metrics['val_ts'], mode='lines+markers', name="Val TS", line=dict(color='red')))
+    fig.add_trace(go.Scatter(x=epochs, y=metrics['train_desc'], mode='lines+markers', name="Train Desc", line=dict(color='green')))
+    fig.add_trace(go.Scatter(x=epochs, y=metrics['val_desc'], mode='lines+markers', name="Val Desc", line=dict(color='orange')))
+    fig.update_layout(title="TS & Descriptor Losses vs Epochs", xaxis_title="Epoch", yaxis_title="Loss")
+    pio.write_html(fig, file="train_val_ts_desc_loss.html", auto_open=True)
+    
+    # 4. JS Divergence
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=epochs, y=metrics['train_js'], mode='lines+markers', name="Train JS", line=dict(color='blue')))
+    fig.add_trace(go.Scatter(x=epochs, y=metrics['val_js'], mode='lines+markers', name="Val JS", line=dict(color='red')))
+    fig.update_layout(title="JS Divergence vs Epochs", xaxis_title="Epoch", yaxis_title="JS Divergence")
+    pio.write_html(fig, file="train_val_js_div.html", auto_open=True)
+
+def batch_reconstruct_masks(descriptors, image_shape=(256, 768), line_thickness=1):
+    """
+    Convert batched descriptor data back to mask image format for visualization
+    using the data_loader.reconstruct_mask_from_descriptors function.
+    Filters out zero-padded rows before passing to the reconstruction function.
+    
+    Args:
+        descriptors: Tensor or array of shape [batch, max_num_cracks, desc_length]
+        image_shape: Shape of the output mask (height, width)
+        line_thickness: Thickness of the lines in the reconstructed mask
+        
+    Returns:
+        Reconstructed binary mask of shape [batch, height, width, 1]
+    """
+    # Process one batch at a time
+    batch_size = descriptors.shape[0]
+    masks = []
+    
+    for b in range(batch_size):
+        # Process each crack descriptor batch
+        desc_batch = descriptors[b]
+        
+        # Find valid descriptors (non-zero rows)
+        # A row is considered valid if it has any non-zero elements
+        valid_mask = np.any(desc_batch != 0, axis=1)
+        valid_descriptors = desc_batch[valid_mask]
+        
+        # Check if we have any valid descriptors before reconstruction
+        if len(valid_descriptors) == 0:
+            # No valid descriptors, return an empty mask
+            mask = np.zeros(image_shape, dtype=np.uint8)
+        else:
+            try:
+                # Use the data_loader function to reconstruct the mask
+                mask = data_loader.reconstruct_mask_from_descriptors(
+                    valid_descriptors, 
+                    image_shape, 
+                    line_thickness=line_thickness
+                )
+            except Exception as e:
+                print(f"Error in reconstruct_mask_from_descriptors: {e}")
+                # Fallback to empty mask in case of error
+                mask = np.zeros(image_shape, dtype=np.uint8)
+        
+        # Convert to float32 and add channel dimension if needed
+        mask = mask.astype(np.float32)
+        if len(mask.shape) == 2:
+            mask = np.expand_dims(mask, axis=-1)
+            
+        masks.append(mask)
+    
+    # Stack all masks into a batch
+    return np.stack(masks, axis=0)
+
+def visualize_reconstructions(model, val_dataset, num_samples=5, line_thickness=1):
+    """
+    Visualize original vs. reconstructed time series and masks (from descriptors).
+    Uses data_loader's reconstruct_mask_from_descriptors function.
+    
+    Args:
+        model: Trained MMVM_VAE model
+        val_dataset: Validation dataset
+        num_samples: Number of samples to visualize
+        line_thickness: Thickness of the lines in reconstructed masks
+    """
+    # Select samples from validation dataset
+    for i, (raw_batch, rms_batch, psd_batch, desc_batch, _) in enumerate(val_dataset.take(1)):
+        for j in range(min(num_samples, raw_batch.shape[0])):
+            # Get sample
+            raw_sample = tf.expand_dims(raw_batch[j], 0)
+            rms_sample = tf.expand_dims(rms_batch[j], 0)
+            psd_sample = tf.expand_dims(psd_batch[j], 0)
+            desc_sample = tf.expand_dims(desc_batch[j], 0)
+            
+            # Get reconstructions
+            recon_ts, recon_desc, _ = model(
+                raw_sample, rms_sample, psd_sample, desc_sample, 
+                tf.constant([[0]]), training=False
+            )
+            
+            # Visualize time series
+            raw_mean = tf.reduce_mean(raw_sample[0], axis=1).numpy()
+            recon_mean = tf.reduce_mean(recon_ts[0], axis=1).numpy()
+            
+            fig = go.Figure()
+            fig.add_trace(go.Scatter(
+                y=raw_mean, mode='lines', name='Original', 
+                line=dict(color='blue')
+            ))
+            fig.add_trace(go.Scatter(
+                y=recon_mean, mode='lines', name='Reconstructed', 
+                line=dict(color='red')
+            ))
+            
+            fig.update_layout(
+                title=f"Time Series Reconstruction Sample {j+1}",
+                xaxis_title="Time",
+                yaxis_title="Amplitude"
+            )
+            
+            fig.write_html(f"results/visualizations/ts_recon_sample_{j+1}.html")
+            
+            # Convert descriptors to masks for visualization using data_loader function
+            original_mask = batch_reconstruct_masks(
+                desc_sample.numpy(), 
+                image_shape=(256, 768), 
+                line_thickness=line_thickness
+            )
+            
+            recon_mask = batch_reconstruct_masks(
+                recon_desc.numpy(), 
+                image_shape=(256, 768), 
+                line_thickness=line_thickness
+            )
+            
+            # Visualize masks
+            fig = go.Figure()
+            fig.add_trace(go.Heatmap(
+                z=original_mask[0, :, :, 0], 
+                colorscale='Blues',
+                showscale=False
+            ))
+            fig.update_layout(title=f"Original Mask from Descriptors - Sample {j+1}")
+            fig.write_html(f"results/visualizations/orig_mask_sample_{j+1}.html")
+            
+            fig = go.Figure()
+            fig.add_trace(go.Heatmap(
+                z=recon_mask[0, :, :, 0], 
+                colorscale='Reds',
+                showscale=False
+            ))
+            fig.update_layout(title=f"Reconstructed Mask from Descriptors - Sample {j+1}")
+            fig.write_html(f"results/visualizations/recon_mask_sample_{j+1}.html")
+
 def plot_training_curves(train_total, train_recon, train_kl, val_total, val_recon, val_kl):
     epochs = list(range(1, len(train_total) + 1))
 
@@ -1586,42 +1588,64 @@ def visualize_reconstruction(true_mask, pred_ellipses, pred_polygons):
 # Global variable to store the trained VAE model for external access.
 vae_model = None
 
-def encoder(ts_sample, mask_sample=None):
+def encoder(ts_sample, rms_sample=None, psd_sample=None, mask_sample=None):
     """
-    Encodes a time-series sample into its latent representation.
+    Encodes samples from various modalities into their latent representations.
     
     Args:
-        ts_sample: Numpy array of shape [batch, 12000, 12]
-        mask_sample: (Optional) Numpy array of shape [batch, 256, 768]. 
-                     If not provided, a dummy mask of zeros is used.
+        ts_sample: Time-series sample of shape [batch, 1000, 12]
+        rms_sample: RMS features of shape [batch, 12] (optional)
+        psd_sample: PSD features of shape [batch, freq_bins, 12] (optional)
+        mask_sample: Either ellipses and polygons or image-like input (optional)
     
     Returns:
-        Latent vector (mu) from the encoder.
+        Dictionary of modality-specific latent distributions (mu, logvar)
     """
     global vae_model
     if vae_model is None:
-        raise ValueError("VAE model has not been trained or loaded.")
-    if mask_sample is None:
-        mask_sample = np.zeros((ts_sample.shape[0], 256, 768), dtype=np.float32)
-    mu, logvar, _, _ = vae_model.encoder(ts_sample, mask_sample)
-    return mu
+        raise ValueError("MMVM VAE model has not been trained or loaded.")
+    
+    latent_dists = {}
+    
+    # Encode each available modality
+    if ts_sample is not None:
+        latent_dists['ts'] = vae_model.raw_encoder(ts_sample)
+    
+    if rms_sample is not None:
+        latent_dists['rms'] = vae_model.rms_encoder(rms_sample)
+        
+    if psd_sample is not None:
+        latent_dists['psd'] = vae_model.psd_encoder(psd_sample)
+    
+    if mask_sample is not None:
+        latent_dists['mask'] = vae_model.mask_encoder(mask_sample)
+    
+    return latent_dists
 
-def decoder(z):
+def decode(z_dict):
     """
-    Wrapper function to decode a latent vector z into a pair of outputs:
-    the reconstructed time-series and its corresponding binary mask.
+    Decodes latent vectors from multiple modalities.
     
     Args:
-        z: Latent vector of shape [batch, latent_dim]
-    
+        z_dict: Dictionary of modality-specific latent vectors
+        
     Returns:
-        Tuple (recon_ts, recon_mask)
+        Dictionary of reconstructed modalities
     """
     global vae_model
     if vae_model is None:
-        raise ValueError("VAE model has not been trained or loaded.")
-    recon_ts, recon_mask = vae_model.generate(z)
-    return recon_ts, recon_mask
+        raise ValueError("MMVM VAE model has not been trained or loaded.")
+    
+    reconstructions = {}
+    
+    # Decode each modality if its latent vector is provided
+    if 'ts' in z_dict:
+        reconstructions['ts'] = vae_model.raw_decoder(z_dict['ts'])
+    
+    if 'mask' in z_dict:
+        reconstructions['mask'] = vae_model.mask_decoder(z_dict['mask'])
+    
+    return reconstructions
 
 def load_trained_model(weights_path):
     """
@@ -1633,7 +1657,7 @@ def load_trained_model(weights_path):
     """
     global vae_model
     latent_dim = 128  # Ensure this matches the latent_dim used in training.
-    model = VAE(latent_dim, feature_dim=128)
+    model = MMVM_VAE(latent_dim, feature_dim=128)
     
     # Build the model's variables by calling it with dummy inputs.
     dummy_ts = tf.zeros((1, 12000, 12), dtype=tf.float32)
@@ -1668,165 +1692,207 @@ def main():
     print("\nNum GPUs Available: ", len(tf.config.list_physical_devices('GPU')))
 
     # ------------------------ 1) Load Data ------------------------
-    accel_dict, mask_dict = data_loader.load_data()
-    gen = segment_and_transform(accel_dict, mask_dict)
+    # Define params for data_loader.load_data
+    params = {
+        'keypoint_count': 15,
+        'max_gap': 3,
+        'curved_threshold': 10,
+        'curved_angle_threshold': 75,
+        'straight_angle_threshold': 15,
+        'min_segment_length': 2,
+        'line_thickness': 1,
+    }
+    
+    # Call load_data with the required params argument
+    print("Loading data with parameters:")
+    for key, value in params.items():
+        print(f"  - {key}: {value}")
+    accel_dict, crack_dict, binary_masks, skeletons, padded_dict = data_loader.load_data(params)
+    
+    # Get dimensions from the padded descriptors
+    sample_desc = next(iter(padded_dict.values()))
+    max_num_cracks = sample_desc.shape[0]
+    desc_length = sample_desc.shape[1]
+    print(f"Loaded data for {len(accel_dict)} tests")
+    print(f"Descriptor dimensions: {max_num_cracks} cracks x {desc_length} features")
+    
+    # Check padded_dict values for descriptor data
+    sample_desc = next(iter(padded_dict.values()))
+    print(f"Loaded data for {len(accel_dict)} tests")
+    print(f"Descriptor shape sample: {sample_desc.shape}")  # Should be (max_num_cracks, desc_length)
+    
+    # Store dimensions for model initialization
+    max_num_cracks = sample_desc.shape[0]
+    desc_length = sample_desc.shape[1]
+    print(f"Max number of cracks: {max_num_cracks}, Descriptor length: {desc_length}")
+    
+    # Use the updated segment_and_transform function with descriptor data
+    print("Segmenting data...")
+    gen = segment_and_transform(accel_dict, padded_dict)
     try:
-        raw_segments, fft_segments, rms_segments, psd_segments, mask_segments, test_ids = next(gen)
+        raw_segments, rms_segments, psd_segments, descriptor_segments, test_ids = next(gen)
     except StopIteration:
         raise ValueError("segment_and_transform() did not yield any data.")
 
     print("Finished segmenting data.")
     print(f"Data shapes after segmentation:")
     print(f"  Raw: {raw_segments.shape}")     
-    print(f"  FFT: {fft_segments.shape}")     
     print(f"  RMS: {rms_segments.shape}")      
     print(f"  PSD: {psd_segments.shape}")      
-    print(f"  Mask: {mask_segments.shape}")    
+    print(f"  Descriptor: {descriptor_segments.shape}")    
     print(f"  IDs: {test_ids.shape}")
 
-    # ---- Debugging: Print Structure of mask_dict ----
-    print("\nDEBUGGING MASK DICT STRUCTURE")
-    print(f"Number of unique test IDs: {len(mask_dict)}")
-    sample_test_id = next(iter(mask_dict.keys()))  # Get any test ID
-    print(f"Sample test ID: {sample_test_id}")
-
-    sample_mask_data = mask_dict[sample_test_id]
-    print(f"Type of mask_dict[{sample_test_id}]: {type(sample_mask_data)}")
-
-    # Ensure all mask data are NumPy arrays
-    for key, mask in mask_dict.items():
-        if not isinstance(mask, np.ndarray):
-            print(f"[ERROR] Mask for Test ID {key} is not a NumPy array! Found: {type(mask)}")
-    
-    print("--------------------------------------------------")
-
     # ------------------------ 2) Convert to Float32 ------------------------
-    raw_segments  = raw_segments.astype(np.float32)
-    fft_segments  = fft_segments.astype(np.float32)
-    rms_segments  = rms_segments.astype(np.float32)
-    psd_segments  = psd_segments.astype(np.float32)
-    mask_segments = mask_segments.astype(np.float32)
-    test_ids      = test_ids.astype(np.float32)
+    raw_segments = raw_segments.astype(np.float32)
+    rms_segments = rms_segments.astype(np.float32)
+    psd_segments = psd_segments.astype(np.float32)
+    descriptor_segments = descriptor_segments.astype(np.float32)
+    test_ids = test_ids.astype(np.float32)
 
     # ------------------------ 3) Shuffle and Split into Train/Val ------------------------
     N = raw_segments.shape[0]
     indices = np.random.permutation(N)
     train_size = int(0.8 * N)
     train_idx = indices[:train_size]
-    val_idx   = indices[train_size:]
+    val_idx = indices[train_size:]
 
-    train_raw   = raw_segments[train_idx]
-    train_fft   = fft_segments[train_idx]
-    train_rms   = rms_segments[train_idx]
-    train_psd   = psd_segments[train_idx]
-    train_mask  = mask_segments[train_idx]
-    train_ids   = test_ids[train_idx]
+    train_raw = raw_segments[train_idx]
+    train_rms = rms_segments[train_idx]
+    train_psd = psd_segments[train_idx]
+    train_desc = descriptor_segments[train_idx]
+    train_ids = test_ids[train_idx]
 
-    val_raw   = raw_segments[val_idx]
-    val_fft   = fft_segments[val_idx]
-    val_rms   = rms_segments[val_idx]
-    val_psd   = psd_segments[val_idx]
-    val_mask  = mask_segments[val_idx]
-    val_ids   = test_ids[val_idx]
+    val_raw = raw_segments[val_idx]
+    val_rms = rms_segments[val_idx]
+    val_psd = psd_segments[val_idx]
+    val_desc = descriptor_segments[val_idx]
+    val_ids = test_ids[val_idx]
 
-    # ------------------------ 4) Precompute Ellipse/Polygon Representations ------------------------
-    print("\nPrecomputing ellipse/polygon encodings for unique test IDs...")
-    preprocessed_masks = preprocess_all_masks(mask_dict)  # {test_id: {"ellipses": [...], "polygons": [...]} }
-    print("Preprocessing complete.")
-
-    print("\n🔎 Debug: Checking Preprocessed Masks")
-    for key in list(preprocessed_masks.keys())[:5]:  # Print first 5 entries
-        print(f"Test ID {key}: {preprocessed_masks[key]}")
-
-    # ------------------------ 5) Build tf.data Datasets ------------------------
-    BATCH_SIZE = 128
+    # ------------------------ 4) Build tf.data Datasets ------------------------
+    BATCH_SIZE = 32
+    
+    # Use updated create_tf_dataset function
     train_dataset = create_tf_dataset(
-        train_raw, train_fft, train_rms, train_psd, train_mask, train_ids, batch_size=BATCH_SIZE
+        train_raw, train_rms, train_psd, train_desc, train_ids, batch_size=BATCH_SIZE
     )
     val_dataset = create_tf_dataset(
-        val_raw, val_fft, val_rms, val_psd, val_mask, val_ids, batch_size=BATCH_SIZE
+        val_raw, val_rms, val_psd, val_desc, val_ids, batch_size=BATCH_SIZE
     )
 
     print(f"Train batches: {len(train_dataset)}")
     print(f"Val batches:   {len(val_dataset)}")
 
-    # ------------------------ 6) Build & Train Model ------------------------
-    latent_dim  = 128
-    feature_dim = 128
-    model = VAE(latent_dim, feature_dim)  # Your custom VAE model
+    # ------------------------ 5) Build Improved Model ------------------------
+    latent_dim = 256
+    
+    # Use our new MMVM VAE with descriptor support
+    print(f"Building model with descriptor dimensions: {max_num_cracks} cracks x {desc_length} features")
+    model = MMVM_VAE(latent_dim, max_num_cracks=max_num_cracks, desc_length=desc_length)
 
-    # (a) Learning Rate Scheduler
-    decay_steps = 20000
-    decay_rate  = 0.95
-    lr_schedule = tf.keras.optimizers.schedules.ExponentialDecay(
-        initial_learning_rate=1e-6,  # start a bit higher
-        decay_steps=decay_steps,
-        decay_rate=decay_rate,
-        staircase=False  # smooth decay
+    # Learning Rate Scheduler with Cosine Decay
+    initial_learning_rate = 2e-4
+    decay_steps = 10000
+    
+    # Cosine decay schedule with warm restart
+    lr_schedule = tf.keras.optimizers.schedules.CosineDecayRestarts(
+        initial_learning_rate,
+        decay_steps,
+        t_mul=2.0,    # Double period after each restart
+        m_mul=0.9,    # Reduce max LR by 10% after each restart
+        alpha=1e-5    # Minimum LR factor
     )
 
-    # (b) Build Optimizer with LR Schedule
+    # Adam optimizer with improved parameters
     optimizer = keras.optimizers.AdamW(
         learning_rate=lr_schedule,
-        weight_decay=1e-4
+        weight_decay=1e-5,
+        beta_1=0.9,
+        beta_2=0.999,
+        epsilon=1e-6   # Increased epsilon for better numerical stability
     )
 
     print_detailed_memory()
 
-    # (c) Train using your custom train_vae function
-    (
-        train_total,
-        train_recon,
-        train_kl,
-        val_total,
-        val_recon,
-        val_kl
-    ) = train_vae(
+    # Create output directories
+    os.makedirs("results", exist_ok=True)
+    os.makedirs("results/model_checkpoints", exist_ok=True)
+    os.makedirs("results/visualizations", exist_ok=True)
+
+    # Use combined descriptor loss
+    custom_descriptor_loss = lambda y_true, y_pred: combined_descriptor_loss(
+        y_true, y_pred, 
+        mse_weight=0.7, 
+        feature_weight=0.3
+    )
+
+    # Train using our improved training function
+    print("Starting training...")
+    training_metrics = train_improved_mmvm_vae(
         model=model,
         train_dataset=train_dataset,
         val_dataset=val_dataset,
-        mask_dict=mask_dict,
-        preprocessed_masks=preprocessed_masks,
         optimizer=optimizer,
-        num_epochs=800,   # or whichever number of epochs you want
-        use_mog=False,     # mixture-of-gaussians prior
-        patience=800       # early stopping patience
+        num_epochs=200,
+        patience=100,
+        beta_schedule='cyclical',
+        descriptor_loss_fn=custom_descriptor_loss
     )
 
-    # ------------------------ 7) Save Weights ------------------------
-    model.save_weights("results/vae_mmodal_weights.h5")
-    print("Saved model weights to results/vae_mmodal_weights.h5")
+    # ------------------------ 6) Visualize Training Results ------------------------
+    # Save detailed training metrics to a file
+    np.save("results/training_metrics.npy", training_metrics)
+    
+    # Plot detailed training curves
+    plot_detailed_training_curves(training_metrics)
 
-    # ------------------------ 8) Visualize Latent Space with UMAP ------------------------
-    latent_vectors, test_ids_arr = extract_latent_representations(model, train_dataset, preprocessed_masks)
+    # ------------------------ 7) Extract and Visualize Latent Space ------------------------
+    # Extract latent vectors from trained model
+    latent_vectors, test_ids_arr = extract_latent_representations(model, train_dataset)
+    
+    # Dimensionality reduction with UMAP
     latent_3d = reduce_latent_dim_umap(latent_vectors)
-    plot_latent_space_3d(latent_3d, test_ids_arr)
+    
+    # Plot 3D visualization
+    plot_latent_space_3d(latent_3d, test_ids_arr, output_file="results/visualizations/latent_space_3d.html")
+    
+    # Line thickness parameter for mask reconstruction
+    line_thickness = params.get('line_thickness', 1)
+    
+    # ------------------------ 8) Evaluate Reconstructions ------------------------
+    visualize_reconstructions(model, val_dataset, num_samples=5, line_thickness=line_thickness)
+    
+    # ------------------------ 9) Generate New Samples ------------------------
+    # Generate random samples from the latent space
+    num_gen_samples = 5
+    for i in range(num_gen_samples):
+        # Random latent vector
+        z = tf.random.normal(shape=(1, latent_dim))
+        
+        # Generate both time series and descriptors
+        gen_ts = model.generate(modality='ts', conditioning_latent=z)
+        gen_desc = model.generate(modality='desc', conditioning_latent=z)
+        
+        # Visualize time series
+        fig = go.Figure()
+        gen_ts_mean = tf.reduce_mean(gen_ts[0], axis=1).numpy()
+        fig.add_trace(go.Scatter(y=gen_ts_mean, mode='lines'))
+        fig.update_layout(title=f"Generated Time Series - Sample {i+1}")
+        fig.write_html(f"results/visualizations/gen_ts_sample_{i+1}.html")
+        
+        # Convert generated descriptors to mask for visualization using data_loader function
+        gen_mask = batch_reconstruct_masks(
+            gen_desc.numpy(), 
+            image_shape=(256, 768), 
+            line_thickness=line_thickness
+        )
+        
+        # Visualize generated mask
+        fig = go.Figure(data=go.Heatmap(z=gen_mask[0, :, :, 0], colorscale='Viridis'))
+        fig.update_layout(title=f"Generated Mask from Descriptors - Sample {i+1}")
+        fig.write_html(f"results/visualizations/gen_mask_sample_{i+1}.html")
 
-    # Extract latent representations from the trained model
-    latent_vectors, _ = extract_latent_representations(model, train_dataset, preprocessed_masks)
-
-    # Plot histograms for 3 latent dimensions
-    plot_latent_histograms(latent_vectors)
-
-    # ------------------------ 9) Plot Training Curves ------------------------
-    plot_training_curves(train_total, train_recon, train_kl, val_total, val_recon, val_kl)
-
-    # # 10) Generate and plot 5 random samples.
-    # plot_generated_samples(model, latent_dim, num_samples=5)
-
-    # # 11) Generate synthetic data
-    # results_dir = "results/vae_results"
-    # os.makedirs(results_dir, exist_ok=True)
-
-    # num_synthetic = 50
-    # for i in range(num_synthetic):
-    #     z_rand = tf.random.normal(shape=(1, latent_dim))
-    #     gen_ts, gen_mask = model.generate(z_rand)
-
-    #     np.save(os.path.join(results_dir, f"gen_ts_{i}.npy"), gen_ts.numpy())
-    #     np.save(os.path.join(results_dir, f"gen_mask_{i}.npy"), gen_mask.numpy())
-    #     logging.info(f"Saved synthetic sample {i}")
-
+    print("✅ Finished training and evaluation. Results saved in 'results/' directory.")
+    print(f"   Mask visualizations created using data_loader.reconstruct_mask_from_descriptors with line_thickness={line_thickness}")
 
 if __name__ == "__main__":
     main()
