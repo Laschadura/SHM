@@ -118,17 +118,16 @@ def skeleton_to_components(skeleton):
     num_labels, labels = cv2.connectedComponents(skeleton)
     return [np.column_stack(np.where(labels == label)) for label in range(1, num_labels)]
 
-def enhance_skeleton(skeleton, max_gap=8, curving_preference=True):
+def enhance_skeleton(skeleton, max_gap=6, curving_preference=True, angle_limit=45):
     """
     Enhanced skeleton processing with better handling of curved segments.
-    It identifies endpoints (pixels with only one neighbor)
-    For nearby endpoints, it creates connections (straight lines or Bezier curves)
-    This helps recover connections that might have been broken during processing
+    Added angle limit to prevent wild connections.
     
     Args:
         skeleton: Binary skeleton image
-        max_gap: Maximum gap to connect (larger for curved cracks)
+        max_gap: Maximum gap to connect (reduced to prevent wild connections)
         curving_preference: Whether to prefer connections that maintain curve orientation
+        angle_limit: Maximum angle (degrees) between directions to allow connection
     """
     # Find endpoints in the skeleton
     kernel = np.array([[1, 1, 1],
@@ -206,6 +205,14 @@ def enhance_skeleton(skeleton, max_gap=8, curving_preference=True):
                     # and dir2 with reverse connection
                     align1 = np.dot(dir1, connection_vec)
                     align2 = np.dot(dir2, -connection_vec)
+                    
+                    # Calculate angles in degrees
+                    angle1 = np.degrees(np.arccos(np.clip(align1, -1.0, 1.0)))
+                    angle2 = np.degrees(np.arccos(np.clip(align2, -1.0, 1.0)))
+                    
+                    # Check if angles are within limit
+                    if angle1 > angle_limit or angle2 > angle_limit:
+                        continue  # Skip connections with bad angles
                     
                     # Higher score for better alignment
                     direction_score = (align1 + align2) / 2
@@ -444,11 +451,14 @@ def split_crack_segments(ordered_pts, min_segment_length=2,
     
     return segments
 
-def compute_keypoints(ordered_pts, num_keypoints=18):
+def compute_keypoints(ordered_pts, num_keypoints=25):
     """
-    Improved keypoint sampling with better handling of curves and corners.
-    Increased keypoint density for better representation.
+    Improved keypoint sampling with special handling for corners and junctions.
+    Increased keypoint count to capture more detail.
     """
+    # Ensure num_keypoints is an integer
+    num_keypoints = int(num_keypoints)
+    
     if len(ordered_pts) < 2:
         return ordered_pts
     
@@ -480,18 +490,30 @@ def compute_keypoints(ordered_pts, num_keypoints=18):
     curvatures = np.array(curvatures)
     
     # Find corners (points with high curvature)
-    corner_threshold = 0.5  # radians (~30 degrees)
+    corner_threshold = 0.4  # Reduced from 0.5 to capture more corners
     corners = curvatures > corner_threshold
     
     # Ensure we always include endpoints
     corners[0] = True
     corners[-1] = True
     
+    # Look for junction-like features - areas with multiple high-curvature points close together
+    for i in range(1, len(ordered_pts)-1):
+        if curvatures[i] > corner_threshold * 0.7:  # Lower threshold to detect potential junctions
+            # Check if there are other high curvature points nearby
+            window = 5
+            start = max(0, i-window)
+            end = min(len(ordered_pts), i+window+1)
+            high_curvature_neighbors = np.sum(curvatures[start:end] > corner_threshold * 0.7)
+            
+            if high_curvature_neighbors >= 2:  # If there are multiple high curvature points nearby
+                corners[i] = True  # Mark as a corner/junction
+    
     # Always include corner points in keypoints
     corner_indices = np.where(corners)[0]
     
-    # Adjust curvature weighting - higher emphasis on curved regions
-    curvature_weight = 1 + 5 * (curvatures / (np.max(curvatures) + 1e-8))
+    # Adjust curvature weighting - even higher emphasis on curved regions
+    curvature_weight = 1 + 6 * (curvatures / (np.max(curvatures) + 1e-8))  # Increased from 5 to 6
     
     # Calculate cumulative distance along path with curvature weighting
     cum_dist = [0]
@@ -507,6 +529,9 @@ def compute_keypoints(ordered_pts, num_keypoints=18):
     
     # Determine how many additional keypoints to place between corners
     remaining_keypoints = num_keypoints - len(corner_indices)
+    
+    # Ensure remaining_keypoints is an integer
+    remaining_keypoints = int(remaining_keypoints)
     
     if remaining_keypoints <= 0:
         # If we have more corners than allowed keypoints, use the most significant ones
@@ -572,12 +597,6 @@ def compute_keypoints(ordered_pts, num_keypoints=18):
         if min_dist_to_corner > 1.0:
             keypoints.append(pt)
     
-    # Make sure we have endpoints
-    if np.linalg.norm(keypoints[0] - ordered_pts[0]) > 1e-8:
-        keypoints.insert(0, ordered_pts[0])
-    if np.linalg.norm(keypoints[-1] - ordered_pts[-1]) > 1e-8:
-        keypoints.append(ordered_pts[-1])
-    
     # Sort keypoints by position along the path
     # Project each keypoint onto the path and get its parameter value
     path_params = []
@@ -598,21 +617,6 @@ def compute_keypoints(ordered_pts, num_keypoints=18):
     # Sort keypoints by path parameter
     sorted_indices = np.argsort(path_params)
     sorted_keypoints = [keypoints[i] for i in sorted_indices]
-    
-    # Limit to requested number of keypoints
-    if len(sorted_keypoints) > num_keypoints:
-        # Keep endpoints and select interior points evenly
-        interior_points = sorted_keypoints[1:-1]
-        step = len(interior_points) / (num_keypoints - 2)
-        
-        selected_indices = [0]  # First point
-        for i in range(num_keypoints - 2):
-            idx = int(i * step)
-            idx = min(idx, len(interior_points) - 1)  # Safety check
-            selected_indices.append(idx + 1)  # +1 because we skipped first point
-        selected_indices.append(len(sorted_keypoints) - 1)  # Last point
-        
-        sorted_keypoints = [sorted_keypoints[i] for i in selected_indices]
     
     return np.array(sorted_keypoints)
 
@@ -737,7 +741,7 @@ def is_similar_crack(desc1, desc2, position_threshold=12, angle_threshold=0.5):
     base_desc_length = 12  # Updated to include the new orientation elements
     if len(desc1) < base_desc_length or len(desc2) < base_desc_length:
         # Fallback to original format if the new fields aren't available
-        return is_similar_crack_original(desc1, desc2, position_threshold, angle_threshold)
+        return is_similar_crack(desc1, desc2, position_threshold, angle_threshold)
     
     # Extract base descriptors
     base1 = desc1[:base_desc_length]
@@ -771,72 +775,6 @@ def is_similar_crack(desc1, desc2, position_threshold=12, angle_threshold=0.5):
     # Match criteria: endpoints are close OR keypoints overlap, AND curve patterns match
     return ((min_dist < position_threshold or curve_overlap) and curve_pattern_match)
 
-def is_similar_crack_original(desc1, desc2, position_threshold=12, angle_threshold=0.5):
-    """
-    Improved crack comparison with better handling of curved segments.
-    Considers both endpoints and midpoints for matching.
-    
-    Fixed to handle different descriptor lengths safely.
-    """
-    # Safety check for descriptor format - ensure we have at least the base descriptor
-    if len(desc1) < 9 or len(desc2) < 9:
-        return False
-    
-    # Extract base descriptors (first 9 elements)
-    base1 = desc1[:9]
-    base2 = desc2[:9]
-    
-    # Extract endpoints
-    start1 = np.array([base1[0], base1[1]])
-    end1 = np.array([base1[2], base1[3]])
-    start2 = np.array([base2[0], base2[1]])
-    end2 = np.array([base2[2], base2[3]])
-    
-    # Check distances between endpoints
-    dist_start_start = np.linalg.norm(start1 - start2)
-    dist_start_end = np.linalg.norm(start1 - end2)
-    dist_end_start = np.linalg.norm(end1 - start2)
-    dist_end_end = np.linalg.norm(end1 - end2)
-    
-    min_dist = min(dist_start_start, dist_start_end, dist_end_start, dist_end_end)
-    
-    # For curved segments, also check if keypoints overlap
-    curve_overlap = False
-    
-    # Make sure we have keypoints and they are of even length (pairs of coordinates)
-    if (len(desc1) > 9 and len(desc2) > 9 and 
-        (len(desc1) - 9) % 2 == 0 and (len(desc2) - 9) % 2 == 0):
-        
-        # Reshape safely with the correct number of points
-        keypoints1 = desc1[9:].reshape(-1, 2)
-        keypoints2 = desc2[9:].reshape(-1, 2)
-        
-        # Check middle keypoint distance (helps with curved segments)
-        if len(keypoints1) > 0 and len(keypoints2) > 0:
-            mid1 = keypoints1[len(keypoints1)//2]
-            
-            # Find closest point in the other crack
-            min_mid_dist = float('inf')
-            for kp2 in keypoints2:
-                dist = np.linalg.norm(mid1 - kp2)
-                min_mid_dist = min(min_mid_dist, dist)
-            
-            # If middle points are close, consider it a match
-            if min_mid_dist < position_threshold:
-                curve_overlap = True
-    
-    # Check if orientations are similar
-    angle_match = True
-    if min_dist >= position_threshold and not curve_overlap:
-        orientation1, orientation2 = base1[5], base2[5]
-        angle_diff = abs(orientation1 - orientation2)
-        angle_diff = min(angle_diff, np.pi - angle_diff)  # Handle circular wrapping
-        
-        angle_match = angle_diff < angle_threshold
-    
-    # Consider it a match if endpoints are close OR we have curve overlap
-    return (min_dist < position_threshold or curve_overlap) and angle_match
-
 def check_keypoint_overlap(desc1, desc2, position_threshold):
     """Helper function to check if keypoints of two cracks overlap"""
     # Make sure we have keypoints and they are of even length (pairs of coordinates)
@@ -863,7 +801,9 @@ def check_keypoint_overlap(desc1, desc2, position_threshold):
     
     return False
 
-def process_test_cracks(mask, prev_test_skeleton=None, keypoint_count=20, max_gap=10):
+def process_test_cracks(mask, prev_test_skeleton=None, keypoint_count=20, max_gap=5,
+                      curved_threshold=10, curved_angle_threshold=85, 
+                      straight_angle_threshold=20, min_segment_length=2):
     """
     Process cracks with improved new crack identification using skeleton subtraction.
     
@@ -872,6 +812,10 @@ def process_test_cracks(mask, prev_test_skeleton=None, keypoint_count=20, max_ga
         prev_test_skeleton: Skeleton from previous test (None for first test)
         keypoint_count: Number of keypoints for each crack
         max_gap: Maximum gap to connect in skeleton enhancement
+        curved_threshold: Threshold to identify curved regions (degrees)
+        curved_angle_threshold: Angle threshold for curved regions (degrees)
+        straight_angle_threshold: Angle threshold for straight regions (degrees)
+        min_segment_length: Minimum segment length to keep
         
     Returns:
         descriptors: List of crack descriptors
@@ -880,99 +824,26 @@ def process_test_cracks(mask, prev_test_skeleton=None, keypoint_count=20, max_ga
     skeleton = skeletonize_mask(mask)
     
     # Enhanced skeleton - try to connect broken segments
-    enhanced_skeleton = enhance_skeleton(skeleton, max_gap=max_gap, curving_preference=True)
+    enhanced_skeleton = enhance_skeleton(skeleton, max_gap=max_gap, curving_preference=True, angle_limit=45)
     
-    # Identify new vs. continued cracks using skeleton subtraction
+    # Identify new vs. continued cracks using skeleton subtraction - UPDATED
     new_descriptors, continued_descriptors = identify_new_cracks(
-        enhanced_skeleton, prev_test_skeleton, keypoint_count)
+        enhanced_skeleton, prev_test_skeleton, 
+        keypoint_count=keypoint_count,
+        curved_threshold=curved_threshold,
+        curved_angle_threshold=curved_angle_threshold,
+        straight_angle_threshold=straight_angle_threshold,
+        min_segment_length=min_segment_length
+    )
     
     # Combine all descriptors
     all_descriptors = new_descriptors + continued_descriptors
     
-    return all_descriptors, enhanced_skeleton  # Return skeleton for next test
+    return all_descriptors, enhanced_skeleton
 
-def process_test_cracks_original(mask, prev_test_descriptors=None, keypoint_count=20, max_gap=10, 
-                       curved_threshold=10, curved_angle_threshold=85, 
-                       straight_angle_threshold=20, min_segment_length=2):
-    """
-    Process cracks without extension tracking.
-    
-    Args:
-        mask: Binary mask of cracks
-        prev_test_descriptors: Descriptors from previous test 
-        keypoint_count: Number of keypoints for each crack
-        max_gap: Maximum gap to connect in skeleton enhancement
-        curved_threshold: Threshold to identify curved regions
-        curved_angle_threshold: Angle threshold for curved regions
-        straight_angle_threshold: Angle threshold for straight regions
-        min_segment_length: Minimum length of crack segments to keep
-        
-    Returns:
-        descriptors: List of crack descriptors
-    """
-    # Create skeleton from mask
-    skeleton = skeletonize_mask(mask)
-    
-    # Enhanced skeleton - try to connect broken segments
-    enhanced_skeleton = enhance_skeleton(
-        skeleton, 
-        max_gap=max_gap, 
-        curving_preference=True
-    )
-    
-    # Extract connected components
-    components = skeleton_to_components(enhanced_skeleton)
-    
-    # Store results
-    crack_descriptors = []
-    
-    # Process each component
-    for component in components:
-        if len(component) < 3:
-            continue
-            
-        # Order points along the curve
-        ordered_pts = order_points_along_path(component)
-        
-        # Split into segments with improved handling
-        segments = split_crack_segments(
-            ordered_pts, 
-            min_segment_length=min_segment_length,
-            curved_threshold=curved_threshold,
-            curved_angle_threshold=curved_angle_threshold,
-            straight_angle_threshold=straight_angle_threshold
-        )
-        
-        for segment in segments:
-            if len(segment) < 3:
-                continue
-                
-            # Default to new crack
-            is_new = 1
-            
-            # If not a previous extension, check against regular existing cracks
-            if prev_test_descriptors is not None and len(prev_test_descriptors) > 0:
-                # Check for similarity with existing cracks
-                temp_desc = compute_crack_descriptors(segment, keypoint_count, is_new=0)
-                
-                if temp_desc is None:
-                    continue
-                    
-                # Check if it's an existing crack
-                for prev_desc in prev_test_descriptors:
-                    if is_similar_crack(temp_desc, prev_desc, position_threshold=12):
-                        is_new = 0
-                        break
-            
-            # Compute final descriptor
-            descriptor = compute_crack_descriptors(segment, keypoint_count, is_new)
-            
-            if descriptor is not None:
-                crack_descriptors.append(descriptor)
-    
-    return crack_descriptors
-
-def identify_new_cracks(current_skeleton, previous_skeleton, keypoint_count=20):
+def identify_new_cracks(current_skeleton, previous_skeleton, keypoint_count=20,
+                      curved_threshold=10, curved_angle_threshold=85,
+                      straight_angle_threshold=20, min_segment_length=2):
     """
     Identify new cracks by subtracting previous skeleton from current.
     Handles both entirely new cracks and extensions of existing cracks.
@@ -981,6 +852,10 @@ def identify_new_cracks(current_skeleton, previous_skeleton, keypoint_count=20):
         current_skeleton: Binary skeleton image from current test
         previous_skeleton: Binary skeleton image from previous test
         keypoint_count: Number of keypoints for descriptor generation
+        curved_threshold: Threshold to identify curved regions (degrees)
+        curved_angle_threshold: Angle threshold for curved regions (degrees)
+        straight_angle_threshold: Angle threshold for straight regions (degrees)
+        min_segment_length: Minimum segment length to keep
         
     Returns:
         List of descriptors for new cracks, List of descriptors for continued cracks
@@ -995,7 +870,14 @@ def identify_new_cracks(current_skeleton, previous_skeleton, keypoint_count=20):
                 continue
                 
             ordered_pts = order_points_along_path(component)
-            segments = split_crack_segments(ordered_pts)
+            # UPDATED: Pass parameters to split_crack_segments
+            segments = split_crack_segments(
+                ordered_pts,
+                min_segment_length=min_segment_length,
+                curved_threshold=curved_threshold,
+                curved_angle_threshold=curved_angle_threshold,
+                straight_angle_threshold=straight_angle_threshold
+            )
             
             for segment in segments:
                 if len(segment) < 3:
@@ -1025,7 +907,14 @@ def identify_new_cracks(current_skeleton, previous_skeleton, keypoint_count=20):
             continue
             
         ordered_pts = order_points_along_path(component)
-        segments = split_crack_segments(ordered_pts)
+        # UPDATED: Pass parameters to split_crack_segments
+        segments = split_crack_segments(
+            ordered_pts,
+            min_segment_length=min_segment_length,
+            curved_threshold=curved_threshold,
+            curved_angle_threshold=curved_angle_threshold,
+            straight_angle_threshold=straight_angle_threshold
+        )
         
         for segment in segments:
             if len(segment) < 3:
@@ -1044,7 +933,14 @@ def identify_new_cracks(current_skeleton, previous_skeleton, keypoint_count=20):
             continue
             
         ordered_pts = order_points_along_path(component)
-        segments = split_crack_segments(ordered_pts)
+        # UPDATED: Pass parameters to split_crack_segments
+        segments = split_crack_segments(
+            ordered_pts,
+            min_segment_length=min_segment_length,
+            curved_threshold=curved_threshold,
+            curved_angle_threshold=curved_angle_threshold,
+            straight_angle_threshold=straight_angle_threshold
+        )
         
         for segment in segments:
             if len(segment) < 3:
@@ -1094,18 +990,108 @@ def identify_new_cracks(current_skeleton, previous_skeleton, keypoint_count=20):
                 
     return new_crack_descriptors, continued_crack_descriptors
 
+def prepare_padded_descriptors(crack_dict):
+    """
+    Given crack_dict: {test_id: [descriptor_1, descriptor_2, ...]},
+    1) Sort cracks in each test by:
+       - is_new (descending)
+       - path_length (descending)
+    2) Find the maximum number of cracks across all tests (max_num_cracks).
+    3) Find the maximum descriptor length (max_desc_len).
+    4) Pad descriptors with zeros to max_desc_len.
+    5) Pad each test's descriptor list to max_num_cracks.
+
+    Returns:
+      padded_dict: {test_id: np.array of shape [max_num_cracks, max_desc_len]}
+      or a single big array if you prefer.
+    """
+
+    # ------------------
+    # 1) Sort each test's descriptors
+    # ------------------
+    for test_id, desc_list in crack_dict.items():
+        # Sort by is_new descending -> (desc[8] higher first),
+        # then by path_length descending -> (desc[4] higher first)
+        # is_new = desc[8], path_length=desc[4]
+        # Python sort uses ascending by default, so for descending we do reverse=True
+        crack_dict[test_id] = sorted(
+            desc_list,
+            key=lambda d: (d[8], d[4]),
+            reverse=True
+        )
+
+    # ------------------
+    # 2) Find max_num_cracks across all tests
+    # ------------------
+    max_num_cracks = 0
+    for test_id, desc_list in crack_dict.items():
+        if len(desc_list) > max_num_cracks:
+            max_num_cracks = len(desc_list)
+
+    # ------------------
+    # 3) Find maximum descriptor length across all cracks
+    #    (some might have more keypoints => bigger arrays)
+    # ------------------
+    max_desc_len = 0
+    for test_id, desc_list in crack_dict.items():
+        for desc in desc_list:
+            if len(desc) > max_desc_len:
+                max_desc_len = len(desc)
+
+    # ------------------
+    # 4) Pad each descriptor to max_desc_len
+    #    We'll do this on a per-test basis
+    # ------------------
+    padded_dict = {}
+    for test_id, desc_list in crack_dict.items():
+
+        # We'll create a [num_cracks, max_desc_len] array for this test
+        # then we'll fill it with zeros
+        num_cracks = len(desc_list)
+        arr = np.zeros((num_cracks, max_desc_len), dtype=np.float32)
+
+        for i, desc in enumerate(desc_list):
+            desc_array = np.array(desc, dtype=np.float32)
+            # put it in arr[i, :len(desc)] = desc_array
+            arr[i, :len(desc_array)] = desc_array
+
+        padded_dict[test_id] = arr
+
+    # ------------------
+    # 5) Now we have arrays for each test of shape [num_cracks, max_desc_len].
+    #    We want them all to have [max_num_cracks, max_desc_len] by padding with zeros.
+    # ------------------
+    final_padded_dict = {}
+    for test_id, desc_array in padded_dict.items():
+        num_cracks = desc_array.shape[0]
+
+        # If this test doesn't have the max_num_cracks, we stack extra zero rows
+        if num_cracks < max_num_cracks:
+            # shape (max_num_cracks - num_cracks, max_desc_len)
+            extra = np.zeros((max_num_cracks - num_cracks, max_desc_len), dtype=np.float32)
+            final_arr = np.concatenate([desc_array, extra], axis=0)
+        else:
+            # It's exactly or bigger, no extra needed
+            final_arr = desc_array
+
+        final_padded_dict[test_id] = final_arr
+
+    # final_padded_dict[test_id] has shape [max_num_cracks, max_desc_len] for each test
+    return final_padded_dict, max_num_cracks, max_desc_len
+
 ######################################
 # Reconstruction
 ######################################
-def reconstruct_mask_from_descriptors(descriptors, image_shape, line_thickness=1):
+def reconstruct_mask_from_descriptors(descriptors, image_shape=(256, 768), line_thickness=1):
     """
     Reconstructs a binary mask with thickness that matches the original mask.
-    Updated to handle the extended descriptor format.
+    Updated to handle the extended descriptor format and properly check array emptiness.
     """
     # Create empty mask
     mask = np.zeros(image_shape, dtype=np.uint8)
     
-    if not descriptors:
+    # Properly check if descriptors is empty using NumPy methods
+    if descriptors is None or len(descriptors) == 0 or descriptors.size == 0:
         return mask
     
     for desc in descriptors:
@@ -1309,6 +1295,8 @@ def print_descriptor_guide():
        - [6] avg_curvature: Average curvature along the path
        - [7] point_count  : Number of points in the original path
        - [8] is_new       : Flag indicating if this is a new crack (1) or continuation (0)
+
+       -> Use first derivative instead of curvature
     
     2. KEYPOINTS (variable length, default 18 points = 36 elements):
        - Elements [9:] contain flattened keypoint coordinates 
@@ -1372,6 +1360,7 @@ def print_descriptor_guide():
 def load_data(params):
     """
     Loads accelerometer data and processes cracks with improved new crack identification.
+    Also prepares padded descriptor dictionary for VAE.
     
     Args:
         params: Dictionary of parameters for crack detection and processing
@@ -1381,6 +1370,7 @@ def load_data(params):
         crack_dict: Dictionary of crack descriptors by test_id
         binary_masks: Dictionary of binary masks by test_id
         skeletons: Dictionary of enhanced skeletons by test_id
+        padded_dict: Dictionary of padded descriptor arrays for VAE
     """
     accel_dict = load_accelerometer_data(DATA_DIR, SKIP_TESTS)
     crack_dict = {}
@@ -1404,12 +1394,16 @@ def load_data(params):
         # Store the binary mask for validation
         binary_masks[test_id] = binary_mask
         
-        # Process cracks with improved identification
+        # Process cracks with improved identification - UPDATED TO PASS ALL PARAMS
         descriptors, current_skeleton = process_test_cracks(
             binary_mask, 
             previous_skeleton,
-            keypoint_count=params['keypoint_count'],
-            max_gap=params['max_gap']
+            keypoint_count=params.get('keypoint_count', 20),
+            max_gap=params.get('max_gap', 5),
+            curved_threshold=params.get('curved_threshold', 10),
+            curved_angle_threshold=params.get('curved_angle_threshold', 85),
+            straight_angle_threshold=params.get('straight_angle_threshold', 20),
+            min_segment_length=params.get('min_segment_length', 2)
         )
         
         # Store descriptors and skeleton
@@ -1419,7 +1413,12 @@ def load_data(params):
         # Update for next test
         previous_skeleton = current_skeleton
     
-    return accel_dict, crack_dict, binary_masks, skeletons
+    # Prepare padded descriptors for VAE
+    padded_dict, max_num_cracks, max_desc_len = prepare_padded_descriptors(crack_dict)
+    print(f"Prepared padded descriptors: {max_num_cracks} max cracks, {max_desc_len} descriptor length")
+    
+    return accel_dict, crack_dict, binary_masks, skeletons, padded_dict
+
 ######################################
 # For testing and validation
 ######################################
@@ -1432,11 +1431,11 @@ def main():
     
     # TUNABLE PARAMETERS
     params = {
-        'keypoint_count': 20,
+        'keypoint_count': 15,
         'max_gap': 3,
         'curved_threshold': 10,
-        'curved_angle_threshold': 85,
-        'straight_angle_threshold': 20,
+        'curved_angle_threshold': 75,
+        'straight_angle_threshold': 15,
         'min_segment_length': 2,
         'line_thickness': 1,
     }
@@ -1447,6 +1446,10 @@ def main():
     
     # Load data with improved methods that use skeleton subtraction
     accel_data, crack_dict, binary_masks, skeletons = load_data(params)
+
+    padded_dict, max_num_cracks, max_desc_len = prepare_padded_descriptors(crack_dict)
+
+    print(f"Max # cracks = {max_num_cracks}, Max descriptor length = {max_desc_len}")
     
     # Validation: Check if we can reconstruct masks from descriptors
     print(f"\nINFO: Validating crack representation for {len(crack_dict)} tests...")
@@ -1481,9 +1484,10 @@ def main():
         if test_id in skeletons:
             cv2.imwrite(os.path.join(debug_dir, f"test_{test_id}_skeleton.png"), skeletons[test_id])
         
-        # Reconstruct mask from descriptors
+        # Reconstruct mask from descriptors - UPDATED to use params
         reconstructed = reconstruct_mask_from_descriptors(
-            descriptors, binary_masks[test_id].shape, line_thickness=params['line_thickness'])
+            descriptors, binary_masks[test_id].shape, 
+            line_thickness=params['line_thickness'])
         
         # Compare with original mask
         original = binary_masks[test_id]
