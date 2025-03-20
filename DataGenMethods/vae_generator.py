@@ -1,45 +1,7 @@
 import os
 import warnings
 import sys
-
-sys.stderr = open(os.devnull, "w")
-
-# Suppress warning messages
-warnings.filterwarnings('ignore', category=UserWarning)
-warnings.filterwarnings('ignore', category=FutureWarning)
-
-#glog warnings which are not a problem
-# 0 = INFO, 1 = WARNING, 2 = ERROR, 3 = FATAL
-os.environ["GLOG_minloglevel"] = "2"       # or "3" to hide all warnings
-os.environ["FLAGS_minloglevel"] = "2"      # some builds also look for FLAGS_minloglevel
-
-# Configure GPU settings before TensorFlow is loaded
-os.environ["TF_FORCE_GPU_ALLOW_GROWTH"] = "true"
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # Limit TensorFlow to only GPU 0
-
-# Suppress TensorFlow logs (0 = all messages, 1 = INFO, 2 = WARN, 3 = ERROR)
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-
-# Suppress NUMA node warnings
-os.environ["TF_NUMA_NODES_WARNING"] = "0"
-os.environ["TF_CUDA_WARNINGS"] = "0"
-
-# Disable CUDA logging
-os.environ["CUDA_LAUNCH_BLOCKING"] = "0"
-
-# Suppress `absl` logs (abseil-py)
-import absl.logging
-import logging
-absl.logging.set_verbosity(absl.logging.ERROR)
-logging.root.removeHandler(absl.logging._absl_handler)
-absl.logging._warn_preinit_stderr = False
-
 import tensorflow as tf
-
-# Disable TensorFlow logging
-tf.get_logger().setLevel('ERROR')
-tf.autograph.set_verbosity(3)
-tf.compat.v1.logging.set_verbosity(tf.compat.v1.logging.ERROR)
 
 def configure_gpu():
     """Enables memory growth for GPUs and prints the available devices."""
@@ -81,9 +43,6 @@ from sklearn.mixture import GaussianMixture
 
 # Import our custom module instead of tensorflow_probability
 from custom_distributions import compute_js_divergence, reparameterize
-
-# ✅ Sanity check: List available GPUs
-print(f"🖥️ Available GPUs: {tf.config.list_physical_devices('GPU')}")
 
 # Append parent directory to find data_loader.py
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -1077,69 +1036,37 @@ class SpectralMMVAE(tf.keras.Model):
     
 # ----- Data Processing and Dataset Creation -----
 def create_tf_dataset(
-    spectrograms_path,    # path to "cached_spectrograms.npy"
-    descriptor_array,     # shape (N, max_num_cracks, desc_length)
-    test_id_array,        # shape (N,)
-    batch_size=32
+    spectrograms, descriptor_array, test_id_array,
+    batch_size=32, shuffle=True, debug_mode=False, debug_samples=500
 ):
     """
-    Create a TensorFlow Dataset that lazily loads spectrograms from disk
-    using a memory-mapped .npy file.
-
-    Args:
-        spectrograms_path: Path to cached spectrograms (with mmap_mode='r').
-        descriptor_array: In-memory array of descriptors (or also memmapped).
-        test_id_array: In-memory array of test IDs.
-        batch_size: Number of samples per batch.
-
-    Returns:
-        A tf.data.Dataset object that yields batches of (spec_batch, desc_batch, test_id_batch).
+    Create a TensorFlow Dataset that loads data from memory.
     """
+    # Convert file path to memory-mapped array if string is provided
+    if isinstance(spectrograms, str):
+        spectrograms = np.load(spectrograms, mmap_mode='r')
+    
+    # Apply debug mode limit
+    if debug_mode:
+        print(f"⚠️ Debug Mode ON: Using only {debug_samples} samples for quick testing!")
+        spectrograms = spectrograms[:debug_samples]
+        descriptor_array = descriptor_array[:debug_samples]
+        test_id_array = test_id_array[:debug_samples]
+    else:
+        print(f"✅ Full dataset loaded: {len(descriptor_array)} samples.")
 
-    # 1) Define a generator that loads small batches from the .npy file
-    def lazy_data_generator():
-        # Open the spectrograms file in read-only, memory-mapped mode
-        specs_mmap = np.load(spectrograms_path, mmap_mode='r')
-        data_size = len(descriptor_array)
+    # Ensure all inputs have appropriate ranks (at least 1)
+    test_id_array = np.atleast_1d(test_id_array)
+    descriptor_array = np.atleast_1d(descriptor_array)
+    
+    # Create a dataset from the arrays
+    dataset = tf.data.Dataset.from_tensor_slices((spectrograms, descriptor_array, test_id_array))
 
-        # Optionally shuffle if you want random ordering every epoch
-        indices = np.arange(data_size)
-        np.random.shuffle(indices)
+    if shuffle:
+        dataset = dataset.shuffle(buffer_size=len(descriptor_array))
 
-        # Yield one batch at a time
-        for start_idx in range(0, data_size, batch_size):
-            end_idx = start_idx + batch_size
-            batch_idx = indices[start_idx:end_idx]
-
-            # Lazy-load only this slice of spectrograms
-            specs_batch = specs_mmap[batch_idx]
-            desc_batch  = descriptor_array[batch_idx]
-            test_batch  = test_id_array[batch_idx]
-
-            yield specs_batch, desc_batch, test_batch
-
-    # 2) Use from_generator to build a tf.data.Dataset
-    output_signature = (
-        tf.TensorSpec(shape=(None, None, None, None), dtype=tf.float32),  # spectrogram batch
-        tf.TensorSpec(shape=(None, None, None), dtype=tf.float32),        # descriptor batch
-        tf.TensorSpec(shape=(None,), dtype=tf.int32)                      # test_id batch
-    )
-
-    dataset = tf.data.Dataset.from_generator(
-        lazy_data_generator,
-        output_signature=output_signature
-    )
-
-    # 3) Prefetch for better performance (optional)
-    dataset = dataset.prefetch(tf.data.AUTOTUNE)
-
-    # # 4) (Optional) Peek at the first batch to see shapes
-    # for batch in dataset.take(1):
-    #     spec_batch, desc_batch, ids_batch = batch
-    #     print("Lazy dataset first batch shapes:")
-    #     print("  Specs:", spec_batch.shape)
-    #     print("  Descriptors:", desc_batch.shape)
-    #     print("  Test IDs:", ids_batch.shape)
+    # Batch the dataset
+    dataset = dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
 
     return dataset
 
@@ -1184,11 +1111,6 @@ def train_spectral_mmvae(
     no_improvement_count = 0
 
     print("🔄 Starting Training for Spectral MMVAE...")
-
-    # Monitor resources before training starts
-    print("📊 System Resource Usage Before Training:")
-    monitor_resources()
-    print("-" * 60)
 
     train_batches_count = sum(1 for _ in train_dataset)
     val_batches_count = sum(1 for _ in val_dataset)
@@ -1302,22 +1224,13 @@ def train_spectral_mmvae(
                 f"Desc: {val_desc_losses[-1]:.4f} | "
                 f"JS: {val_js_losses[-1]:.4f}")
 
-            # Monitor resources at the end of each epoch
-            print(f"📊 System Resource Usage After Epoch {epoch+1}:")
-            monitor_resources()
-            print("-" * 60)
-
-            # Check epoch duration
-            epoch_time = time.time() - start_time
-            print(f"⏳ Epoch {epoch+1} completed in {epoch_time:.2f} seconds")
-
             # Early Stopping
             current_val_loss = val_total_losses[-1]
             if current_val_loss < best_val_loss:
                 best_val_loss = current_val_loss
                 no_improvement_count = 0
                 # Save best model weights
-                model.save_weights("results/best_spectral_mmvae_weights.h5")
+                model.save_weights("results/best_spectral_mmvae.weights.h5")
                 print("✅ Saved best model weights")
             else:
                 no_improvement_count += 1
@@ -1675,7 +1588,8 @@ def generate_samples(model, data_loader, num_samples=5, fs=200, nperseg=256, nov
 
 # ----- Main Function -----
 def main():
-    tf.config.optimizer.set_experimental_options({"auto_mixed_precision": True})
+    # Set debug mode
+    debug_mode = True
     # ------------------------ 1) Configure Environment ------------------------
     os.makedirs("results", exist_ok=True)
     os.makedirs("results/model_checkpoints", exist_ok=True)
@@ -1687,10 +1601,10 @@ def main():
     nperseg = 256  # STFT segment length
     noverlap = 224  # STFT overlap
     
-    latent_dim = 128  
-    batch_size = 16  
+    latent_dim = 64 
+    batch_size = 32  
     num_epochs = 200  
-    patience = 20  
+    patience = 5  
 
     # Cached file paths
     stft_path = "cached_stft.npy"
@@ -1779,8 +1693,8 @@ def main():
     val_desc, val_ids = descriptor_segments[val_idx], test_ids[val_idx]
 
     # ------------------------ 8) Create TensorFlow Datasets ------------------------
-    train_dataset = create_tf_dataset(final_path, train_desc, train_ids, batch_size)
-    val_dataset = create_tf_dataset(final_path, val_desc, val_ids, batch_size)
+    train_dataset = create_tf_dataset(final_path, train_desc, train_ids, batch_size, debug_mode=debug_mode)
+    val_dataset = create_tf_dataset(final_path, val_desc, val_ids, batch_size, debug_mode=debug_mode)
 
     print(f"✅ Train batches: {sum(1 for _ in train_dataset)}")
     print(f"✅ Val batches: {sum(1 for _ in val_dataset)}")
@@ -1820,7 +1734,7 @@ def main():
     plot_training_curves(training_metrics)
 
     # ------------------------ 13) Load Best Model ------------------------
-    model.load_weights("results/best_spectral_mmvae_weights.h5")
+    model.load_weights("results/best_spectral_mmvae.weights.h5")
 
     # ------------------------ 14) Extract & Visualize Latent Space ------------------------
     latent_vectors, test_ids_arr = extract_latent_representations(model, train_dataset)
