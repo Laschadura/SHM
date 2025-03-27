@@ -35,6 +35,7 @@ import logging
 from scipy import signal
 import matplotlib.pyplot as plt
 import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 import plotly.io as pio
 import umap
 import plotly.express as px
@@ -42,7 +43,7 @@ import pandas as pd
 from sklearn.mixture import GaussianMixture
 
 # Import our custom module instead of tensorflow_probability
-from custom_distributions import compute_js_divergence, reparameterize
+from custom_distributions import compute_js_divergence, reparameterize, compute_mixture_prior, compute_kl_divergence
 
 # Append parent directory to find data_loader.py
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -343,8 +344,8 @@ def inverse_spectrogram(complex_spectrograms, time_length, fs=200, nperseg=256, 
                     fft_length=nperseg
                 )
                 
-                # Trim to original length
-                time_series[b_abs, :time_length, c] = inverse_stft[:time_length].numpy()
+                actual_length = min(inverse_stft.shape[0], time_length)
+                time_series[b_abs, :actual_length, c] = inverse_stft[:actual_length].numpy()
         
         # Clear memory between batches
         if batch_idx < total_batches - 1:
@@ -870,7 +871,7 @@ def get_beta_schedule(epoch, max_epochs, schedule_type='cyclical'):
     """
     # Define beta limits
     BETA_MIN = 1e-8   # Start with very small value
-    BETA_MAX = 0.02   # Maximum value
+    BETA_MAX = 0.01   # Maximum value
     
     # Define warmup phase length (in epochs)
     WARMUP_EPOCHS = 50
@@ -912,7 +913,10 @@ def get_beta_schedule(epoch, max_epochs, schedule_type='cyclical'):
 # ----- Spectral MMVAE Model -----
 class SpectralMMVAE(tf.keras.Model):
     """
-    Spectral Multimodal VAE with two modalities:
+    Spectral Multimodal VAE with Mixture-of-Experts prior.
+    Implementation follows the "Unity by Diversity" paper approach.
+    
+    Modalities:
     1. Complex spectrograms (from time series)
     2. Crack descriptors
     """
@@ -942,60 +946,163 @@ class SpectralMMVAE(tf.keras.Model):
             desc_length=desc_length
         )
 
-    def call(self, spec_in, desc_in, test_id=None, training=False):
+    def call(self, spec_in, desc_in, test_id=None, training=False, missing_modality=None):
         """
-        Forward pass for the MMVM approach:
+        Forward pass for the Mixture-of-Experts MMVAE approach:
          1) Encode each modality -> mu, logvar
-         2) Compute JS divergence among all unimodal encoders
-         3) Sample from each unimodal posterior
-         4) Decode each modality from its own sample
-         5) Return reconstructions + JS divergence
-        """
-        # 1) Encode
-        mu_spec, logvar_spec = self.spec_encoder(spec_in, training=training)
-        mu_desc, logvar_desc = self.desc_encoder(desc_in, training=training)
-
-        # 2) Compute JS among these two unimodal distributions
-        mus = [mu_spec, mu_desc]
-        logvars = [logvar_spec, logvar_desc]
-        js_div = compute_js_divergence(mus, logvars)  # Use imported function
+         2) Compute MoE prior as mixture of unimodal posteriors
+         3) Compute JS divergence between unimodal posteriors and mixture prior
+         4) Sample from each unimodal posterior
+         5) Decode each modality from its own sample
+         6) Return reconstructions + JS divergence and mixture prior
         
-        # 3) Sample from each unimodal
-        z_spec = reparameterize(mu_spec, logvar_spec)  # Use imported function
-        z_desc = reparameterize(mu_desc, logvar_desc)  # Use imported function
+        Args:
+            spec_in: Input spectrogram
+            desc_in: Input descriptor
+            test_id: Test ID (optional)
+            training: Whether in training mode
+            missing_modality: Optional string indicating which modality is missing ('spec' or 'desc')
+            
+        Returns:
+            Tuple of (recon_spec, recon_desc, (mus, logvars, mixture_prior, js_div))
+        """
+        # Track available modalities
+        available_modalities = []
+        if missing_modality != 'spec':
+            available_modalities.append('spec')
+        if missing_modality != 'desc':
+            available_modalities.append('desc')
+        
+        # 1) Encode available modalities
+        mus = []
+        logvars = []
+        
+        if 'spec' in available_modalities:
+            mu_spec, logvar_spec = self.spec_encoder(spec_in, training=training)
+            mus.append(mu_spec)
+            logvars.append(logvar_spec)
+        
+        if 'desc' in available_modalities:
+            mu_desc, logvar_desc = self.desc_encoder(desc_in, training=training)
+            mus.append(mu_desc)
+            logvars.append(logvar_desc)
+        
+        # 2) Compute MoE prior parameters
+        mixture_mu, mixture_logvar = compute_mixture_prior(mus, logvars)
+        
+        # 3) Compute JS divergence
+        js_div = compute_js_divergence(mus, logvars)
+        
+        # Store all distribution parameters
+        all_mus = mus.copy()
+        all_logvars = logvars.copy()
+        
+        # Handle missing modalities by imputing from the mixture
+        if missing_modality == 'spec':
+            # Impute spectrogram modality from the descriptor modality
+            z_spec = reparameterize(mixture_mu, mixture_logvar)
+            # Add placeholders to keep indices consistent
+            all_mus.insert(0, mixture_mu)
+            all_logvars.insert(0, mixture_logvar)
+        else:
+            # Sample spectrogram latent from its posterior
+            z_spec = reparameterize(mu_spec, logvar_spec)
+        
+        if missing_modality == 'desc':
+            # Impute descriptor modality from the spectrogram modality
+            z_desc = reparameterize(mixture_mu, mixture_logvar)
+            # Add placeholders to keep indices consistent
+            all_mus.append(mixture_mu)
+            all_logvars.append(mixture_logvar)
+        else:
+            # Sample descriptor latent from its posterior
+            z_desc = reparameterize(mu_desc, logvar_desc)
         
         # 4) Decode
         recon_spec = self.spec_decoder(z_spec, training=training)
         recon_desc = self.desc_decoder(z_desc, training=training)
         
         # 5) Return outputs
-        return recon_spec, recon_desc, (mus, logvars, js_div)
+        mixture_prior = (mixture_mu, mixture_logvar)
+        return recon_spec, recon_desc, (all_mus, all_logvars, mixture_prior, js_div)
 
-    def generate(self, modality='spec', conditioning_latent=None):
+    def generate(
+        self, 
+        modality='both', 
+        conditioning_modality=None, 
+        conditioning_input=None,
+        conditioning_latent=None
+    ):
         """
-        Generate samples from the prior or conditioned on another modality.
+        Generate samples using the Mixture-of-Experts approach.
         
         Args:
-            modality: Which modality to generate ('spec' or 'desc')
-            conditioning_latent: Optional latent vector to condition generation on
+            modality: Which modality to generate ('spec', 'desc', or 'both')
+            conditioning_modality: Optional modality to condition on ('spec' or 'desc')
+            conditioning_input: Input for the conditioning modality
+            conditioning_latent: Optional latent vector to use directly
+        """
+        # 1. If `conditioning_latent` is passed, use it. 
+        #    Otherwise, sample or encode from `conditioning_modality`.
+        if conditioning_latent is not None:
+            z = conditioning_latent
+        else:
+            # Sample or encode from the given modality
+            if conditioning_modality is None:
+                # Sample from a standard Gaussian prior
+                z = tf.random.normal(shape=(1, self.latent_dim))
+            else:
+                # Encode conditioning modality
+                if conditioning_modality == 'spec':
+                    mu, logvar = self.spec_encoder(conditioning_input)
+                elif conditioning_modality == 'desc':
+                    mu, logvar = self.desc_encoder(conditioning_input)
+                else:
+                    raise ValueError(f"Unknown conditioning modality: {conditioning_modality}")
+                # Sample from the posterior
+                z = reparameterize(mu, logvar)
+
+        # 2. Generate requested modality
+        if modality == 'spec' or modality == 'both':
+            recon_spec = self.spec_decoder(z)
+        else:
+            recon_spec = None
+
+        if modality == 'desc' or modality == 'both':
+            recon_desc = self.desc_decoder(z)
+        else:
+            recon_desc = None
+
+        # 3. Return appropriately
+        if modality == 'both':
+            return recon_spec, recon_desc
+        elif modality == 'spec':
+            return recon_spec
+        elif modality == 'desc':
+            return recon_desc
+ 
+    def encode_all_modalities(self, spec_in, desc_in, training=False):
+        """
+        Encode all modalities and compute the mixture prior.
+        
+        Args:
+            spec_in: Input spectrogram
+            desc_in: Input descriptor
+            training: Whether in training mode
             
         Returns:
-            Generated sample
+            Tuple of (mus, logvars, mixture_mu, mixture_logvar)
         """
-        # Sample from prior or use conditioning latent
-        if conditioning_latent is None:
-            # Sample from a standard Gaussian prior
-            z = tf.random.normal(shape=(1, self.latent_dim))
-        else:
-            z = conditioning_latent
+        # Encode each modality
+        mu_spec, logvar_spec = self.spec_encoder(spec_in, training=training)
+        mu_desc, logvar_desc = self.desc_encoder(desc_in, training=training)
         
-        # Generate requested modality
-        if modality == 'spec':
-            return self.spec_decoder(z)
-        elif modality == 'desc':
-            return self.desc_decoder(z)
-        else:
-            raise ValueError(f"Unknown modality: {modality}")
+        # Compute mixture prior
+        mus = [mu_spec, mu_desc]
+        logvars = [logvar_spec, logvar_desc]
+        mixture_mu, mixture_logvar = compute_mixture_prior(mus, logvars)
+        
+        return mus, logvars, mixture_mu, mixture_logvar
     
     def reconstruct_time_series(self, spec_features, fs=200, nperseg=256, noverlap=128, time_length=1000):
         """
@@ -1078,10 +1185,12 @@ def train_spectral_mmvae(
     optimizer, 
     num_epochs=100, 
     patience=10,
-    beta_schedule='cyclical'
+    beta_schedule='cyclical',
+    modality_dropout_prob=0.1  # Probability of dropping a modality during training
 ):
     """
-    Training function for Spectral MMVAE with system resource monitoring.
+    Training function for Spectral MMVAE with Mixture-of-Experts approach.
+    Implementation follows the "Unity by Diversity" paper.
 
     Args:
         model: Spectral MMVAE model
@@ -1091,6 +1200,7 @@ def train_spectral_mmvae(
         num_epochs: Maximum number of epochs
         patience: Early stopping patience
         beta_schedule: Type of beta schedule ('linear', 'exponential', 'cyclical')
+        modality_dropout_prob: Probability of dropping a modality during training
 
     Returns:
         Training and validation metrics
@@ -1100,6 +1210,7 @@ def train_spectral_mmvae(
     train_spec_losses = []
     train_desc_losses = []
     train_js_losses = []
+    train_mode_losses = []  # Track different modality combinations (full, spec-only, desc-only)
 
     val_total_losses = []
     val_spec_losses = []
@@ -1110,7 +1221,7 @@ def train_spectral_mmvae(
     best_val_loss = float('inf')
     no_improvement_count = 0
 
-    print("🔄 Starting Training for Spectral MMVAE...")
+    print("🔄 Starting Training for Spectral MMVAE with Mixture-of-Experts...")
 
     train_batches_count = sum(1 for _ in train_dataset)
     val_batches_count = sum(1 for _ in val_dataset)
@@ -1121,10 +1232,10 @@ def train_spectral_mmvae(
         for epoch in range(num_epochs):
             start_time = time.time()  # Track epoch duration
 
-            # Get beta value for this epoch
+            # Get beta value for this epoch using the specified schedule
             beta = get_beta_schedule(epoch, num_epochs, beta_schedule)
             
-            # Get dynamic loss weights
+            # Get dynamic loss weights for reconstructions
             desc_weight = dynamic_weighting(epoch, num_epochs)
             spec_weight = 1.0 - desc_weight
             
@@ -1135,53 +1246,115 @@ def train_spectral_mmvae(
             epoch_train_spec = 0.0
             epoch_train_desc = 0.0
             epoch_train_js = 0.0
+            
+            # Track losses by modality combination
+            epoch_train_full = 0.0
+            epoch_train_spec_only = 0.0
+            epoch_train_desc_only = 0.0
+            
+            # Count examples of each modality combination
+            n_full = 0
+            n_spec_only = 0
+            n_desc_only = 0
+            
             train_steps = 0
 
             for step, (spec_in, desc_in, test_id_in) in enumerate(train_dataset):
+                # Randomly decide if a modality should be dropped for this batch
+                missing_modality = None
+                random_value = tf.random.uniform(shape=[], minval=0, maxval=1)
+                
+                if random_value < modality_dropout_prob * 2:  # Split probability between two modalities
+                    if random_value < modality_dropout_prob:
+                        missing_modality = 'spec'
+                    else:
+                        missing_modality = 'desc'
+                
                 with tf.GradientTape() as tape:
-                    # Forward pass through the model
-                    recon_spec, recon_desc, (all_mus, all_logvars, js_div) = model(
+                    # Forward pass through the model with possible missing modality
+                    recon_spec, recon_desc, (all_mus, all_logvars, mixture_prior, js_div) = model(
                         spec_in, desc_in, test_id_in,
-                        training=True
+                        training=True,
+                        missing_modality=missing_modality
                     )
                     
                     # Compute losses for each modality
-                    spec_loss = complex_spectrogram_loss(spec_in, recon_spec)
-                    desc_loss = weighted_descriptor_mse_loss(desc_in, recon_desc)
+                    spec_loss = complex_spectrogram_loss(spec_in, recon_spec) if missing_modality != 'spec' else 0.0
+                    desc_loss = weighted_descriptor_mse_loss(desc_in, recon_desc) if missing_modality != 'desc' else 0.0
                     
                     # Combined reconstruction loss with dynamic weighting
-                    recon_loss = spec_weight * spec_loss + desc_weight * desc_loss
+                    if missing_modality is None:
+                        # Both modalities present
+                        recon_loss = spec_weight * spec_loss + desc_weight * desc_loss
+                        n_full += 1
+                        epoch_train_full += recon_loss.numpy()
+                    elif missing_modality == 'spec':
+                        # Only descriptor modality present
+                        recon_loss = desc_loss  # Weight is already 1.0 since it's the only modality
+                        n_desc_only += 1
+                        epoch_train_desc_only += recon_loss.numpy()
+                    else:  # missing_modality == 'desc'
+                        # Only spectrogram modality present
+                        recon_loss = spec_loss  # Weight is already 1.0 since it's the only modality
+                        n_spec_only += 1
+                        epoch_train_spec_only += recon_loss.numpy()
                     
                     # Total loss = reconstruction loss + beta * JS divergence
+                    # The JS divergence is already properly scaled in the compute_js_divergence function
                     total_loss = recon_loss + beta * js_div
 
-                # Gradient clipping to prevent extreme updates
-                grads = tape.gradient(total_loss, model.trainable_variables)
-                # Clip gradients to prevent exploding gradients
-                clipped_grads, _ = tf.clip_by_global_norm(grads, 5.0)
-                optimizer.apply_gradients(zip(clipped_grads, model.trainable_variables))
+                    # Check for NaNs
+                    if tf.math.is_nan(total_loss):
+                        print("❌ WARNING: NaN loss detected! Skipping gradient update.")
+                        continue
+
+                    # Gradient clipping to prevent extreme updates
+                    grads = tape.gradient(total_loss, model.trainable_variables)
+
+                    # Add gradient norm monitoring here
+                    grad_norm = tf.linalg.global_norm(grads)
+                    if tf.math.is_nan(grad_norm) or tf.math.is_inf(grad_norm):
+                        print(f"❌ WARNING: NaN/Inf gradient detected! Norm: {grad_norm}. Skipping update.")
+                        continue
+
+                    # Clip gradients to prevent exploding gradients
+                    clipped_grads, _ = tf.clip_by_global_norm(grads, 5.0)
+                    optimizer.apply_gradients(zip(clipped_grads, model.trainable_variables))
 
                 # Track losses
                 epoch_train_total += total_loss.numpy()
-                epoch_train_spec += spec_loss.numpy()
-                epoch_train_desc += desc_loss.numpy()
+                epoch_train_spec += spec_loss.numpy() if missing_modality != 'spec' else 0.0
+                epoch_train_desc += desc_loss.numpy() if missing_modality != 'desc' else 0.0
                 epoch_train_js += js_div.numpy()
                 train_steps += 1
 
             # Compute average training losses for the epoch
             if train_steps > 0:
                 train_total_losses.append(epoch_train_total / train_steps)
-                train_spec_losses.append(epoch_train_spec / train_steps)
-                train_desc_losses.append(epoch_train_desc / train_steps)
+                
+                # Handle potential division by zero for modality-specific metrics
+                train_spec_losses.append(epoch_train_spec / max(train_steps - n_desc_only, 1))
+                train_desc_losses.append(epoch_train_desc / max(train_steps - n_spec_only, 1))
                 train_js_losses.append(epoch_train_js / train_steps)
+                
+                # Track modality combination losses
+                modality_losses = {
+                    'full': epoch_train_full / max(n_full, 1),
+                    'spec_only': epoch_train_spec_only / max(n_spec_only, 1),
+                    'desc_only': epoch_train_desc_only / max(n_desc_only, 1)
+                }
+                train_mode_losses.append(modality_losses)
             
             # Debug information
             print(f"✅ Train Loss: {train_total_losses[-1]:.4f} | "
-                f"Spec: {train_spec_losses[-1]:.4f} | "
-                f"Desc: {train_desc_losses[-1]:.4f} | " 
-                f"JS: {train_js_losses[-1]:.4f}")
+                  f"Spec: {train_spec_losses[-1]:.4f} | "
+                  f"Desc: {train_desc_losses[-1]:.4f} | " 
+                  f"JS: {train_js_losses[-1]:.4f}")
+            
+            if n_full > 0 or n_spec_only > 0 or n_desc_only > 0:
+                print(f"  📊 Modalities: Full={n_full}, Spec-only={n_spec_only}, Desc-only={n_desc_only}")
 
-            # Validation loop
+            # Validation loop - no modality dropout during validation
             epoch_val_total = 0.0
             epoch_val_spec = 0.0
             epoch_val_desc = 0.0
@@ -1189,10 +1362,11 @@ def train_spectral_mmvae(
             val_steps = 0
 
             for step, (spec_in, desc_in, test_id_in) in enumerate(val_dataset):
-                # Forward pass
-                recon_spec, recon_desc, (all_mus, all_logvars, js_div) = model(
+                # Forward pass - use all modalities for validation
+                recon_spec, recon_desc, (all_mus, all_logvars, mixture_prior, js_div) = model(
                     spec_in, desc_in, test_id_in, 
-                    training=False
+                    training=False,
+                    missing_modality=None  # No dropout during validation
                 )
 
                 # Compute losses for each modality
@@ -1220,9 +1394,9 @@ def train_spectral_mmvae(
                 val_js_losses.append(epoch_val_js / val_steps)
 
             print(f"  🔵 Val => Total: {val_total_losses[-1]:.4f} | "
-                f"Spec: {val_spec_losses[-1]:.4f} | "
-                f"Desc: {val_desc_losses[-1]:.4f} | "
-                f"JS: {val_js_losses[-1]:.4f}")
+                  f"Spec: {val_spec_losses[-1]:.4f} | "
+                  f"Desc: {val_desc_losses[-1]:.4f} | "
+                  f"JS: {val_js_losses[-1]:.4f}")
 
             # Early Stopping
             current_val_loss = val_total_losses[-1]
@@ -1243,6 +1417,8 @@ def train_spectral_mmvae(
 
             if no_improvement_count >= patience:
                 print(f"🛑 Early stopping triggered at epoch {epoch+1}. No improvement for {patience} epochs.")
+                model.save_weights("results/final_spectral_mmvae.weights.h5")
+                print("✅ Saved best model weights")
                 break
 
     return {
@@ -1250,28 +1426,37 @@ def train_spectral_mmvae(
         'train_spec': train_spec_losses,
         'train_desc': train_desc_losses,
         'train_js': train_js_losses,
+        'train_mode': train_mode_losses,
         'val_total': val_total_losses,
         'val_spec': val_spec_losses,
         'val_desc': val_desc_losses,
         'val_js': val_js_losses
     }
-
-# ----- Visualization Functions -----
+  
+# ----- Visualization Functions and tests -----
 def plot_training_curves(metrics):
     """
-    Plot training curves with improved visualization.
+    Plot training curves with improved visualization for MoE model.
     
     Args:
         metrics: Dictionary of training and validation metrics
     """
     epochs = list(range(1, len(metrics['train_total']) + 1))
     
+    # Create output directory if it doesn't exist
+    os.makedirs("results/plots", exist_ok=True)
+    
     # 1. Total Loss
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=epochs, y=metrics['train_total'], mode='lines+markers', name="Train Total", line=dict(color='blue')))
     fig.add_trace(go.Scatter(x=epochs, y=metrics['val_total'], mode='lines+markers', name="Val Total", line=dict(color='red')))
-    fig.update_layout(title="Total Loss vs Epochs", xaxis_title="Epoch", yaxis_title="Loss")
-    pio.write_html(fig, file="results/train_val_total_loss.html", auto_open=True)
+    fig.update_layout(
+        title="Total Loss vs Epochs", 
+        xaxis_title="Epoch", 
+        yaxis_title="Loss",
+        template="plotly_white"
+    )
+    pio.write_html(fig, file="results/plots/train_val_total_loss.html", auto_open=False)
     
     # 2. Spectrogram & Descriptor Losses
     fig = go.Figure()
@@ -1279,46 +1464,44 @@ def plot_training_curves(metrics):
     fig.add_trace(go.Scatter(x=epochs, y=metrics['val_spec'], mode='lines+markers', name="Val Spec", line=dict(color='red')))
     fig.add_trace(go.Scatter(x=epochs, y=metrics['train_desc'], mode='lines+markers', name="Train Desc", line=dict(color='green')))
     fig.add_trace(go.Scatter(x=epochs, y=metrics['val_desc'], mode='lines+markers', name="Val Desc", line=dict(color='orange')))
-    fig.update_layout(title="Modality Losses vs Epochs", xaxis_title="Epoch", yaxis_title="Loss")
-    pio.write_html(fig, file="results/train_val_modality_loss.html", auto_open=True)
+    fig.update_layout(
+        title="Modality Losses vs Epochs", 
+        xaxis_title="Epoch", 
+        yaxis_title="Loss",
+        template="plotly_white"
+    )
+    pio.write_html(fig, file="results/plots/train_val_modality_loss.html", auto_open=False)
     
     # 3. JS Divergence
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=epochs, y=metrics['train_js'], mode='lines+markers', name="Train JS", line=dict(color='blue')))
     fig.add_trace(go.Scatter(x=epochs, y=metrics['val_js'], mode='lines+markers', name="Val JS", line=dict(color='red')))
-    fig.update_layout(title="JS Divergence vs Epochs", xaxis_title="Epoch", yaxis_title="JS Divergence")
-    pio.write_html(fig, file="results/train_val_js_div.html", auto_open=True)
-
-def visualize_spectrogram(spectrogram_features, title="Spectrogram", channel=0, output_path=None):
-    """
-    Visualize a single channel from spectrogram features.
-    
-    Args:
-        spectrogram_features: Spectrogram features with shape (batch, freq, time, channels*2)
-        title: Plot title
-        channel: Which original channel to visualize (magnitude only)
-        output_path: Path to save the visualization
-    """
-    # Extract magnitude for selected channel
-    magnitude = spectrogram_features[0, :, :, channel*2]
-    
-    # Create heatmap
-    fig = go.Figure(data=go.Heatmap(
-        z=magnitude,
-        colorscale='Viridis'
-    ))
-    
     fig.update_layout(
-        title=title,
-        xaxis_title="Time Frames",
-        yaxis_title="Frequency Bins",
-        yaxis=dict(autorange="reversed")  # Flip y-axis to have low frequencies at bottom
+        title="JS Divergence vs Epochs", 
+        xaxis_title="Epoch", 
+        yaxis_title="JS Divergence",
+        template="plotly_white"
     )
+    pio.write_html(fig, file="results/plots/train_val_js_div.html", auto_open=False)
     
-    if output_path:
-        pio.write_html(fig, file=output_path, auto_open=True)
-    else:
-        fig.show()
+    # 4. Missing Modality Performance (if available)
+    if 'train_mode' in metrics:
+        fig = go.Figure()
+        full_losses = [mode_loss['full'] for mode_loss in metrics['train_mode']]
+        spec_only_losses = [mode_loss['spec_only'] for mode_loss in metrics['train_mode']]
+        desc_only_losses = [mode_loss['desc_only'] for mode_loss in metrics['train_mode']]
+        
+        fig.add_trace(go.Scatter(x=epochs, y=full_losses, mode='lines+markers', name="Both Modalities", line=dict(color='blue')))
+        fig.add_trace(go.Scatter(x=epochs, y=spec_only_losses, mode='lines+markers', name="Spec Only", line=dict(color='green')))
+        fig.add_trace(go.Scatter(x=epochs, y=desc_only_losses, mode='lines+markers', name="Desc Only", line=dict(color='red')))
+        
+        fig.update_layout(
+            title="Reconstruction Loss by Modality Combination", 
+            xaxis_title="Epoch", 
+            yaxis_title="Recon Loss",
+            template="plotly_white"
+        )
+        pio.write_html(fig, file="results/plots/modality_combo_loss.html", auto_open=False)
 
 def visualize_reconstructions(model, val_dataset, data_loader, num_samples=5, fs=200, nperseg=256, noverlap=128):
     """
@@ -1456,7 +1639,15 @@ def extract_latent_representations(model, dataset):
         latent_vectors.append(mu_q.numpy())
         test_ids.append(test_id_in)
 
-    return np.concatenate(latent_vectors, axis=0), np.concatenate(test_ids, axis=0)
+    latent_vectors = np.concatenate(latent_vectors, axis=0)
+
+    # Check for NaN values
+    if np.isnan(latent_vectors).any():
+        print("⚠️ Warning: NaN values detected in latent vectors.")
+        # Replace NaN with zeros to allow visualization
+        latent_vectors = np.nan_to_num(latent_vectors)
+
+    return latent_vectors, np.concatenate(test_ids, axis=0)
 
 def reduce_latent_dim_umap(latent_vectors):
     """
@@ -1586,6 +1777,592 @@ def generate_samples(model, data_loader, num_samples=5, fs=200, nperseg=256, nov
         except Exception as e:
             print(f"Error visualizing generated mask for sample {i+1}: {e}")
 
+def visualize_latent_structure(model, dataset, n_samples=500):
+    """
+    Visualize the latent space structure of the MoE model.
+    Compares modality-specific encodings and the mixture prior.
+    
+    Args:
+        model: The trained MoE MMVAE model
+        dataset: Dataset to visualize
+        n_samples: Number of samples to use
+    """
+    # Create output directory
+    os.makedirs("results/latent_analysis", exist_ok=True)
+    
+    # Collect latent encodings
+    spec_mus = []
+    desc_mus = []
+    mixture_mus = []
+    test_ids = []
+    
+    # Limit to n_samples
+    sample_count = 0
+    for spec_in, desc_in, test_id_in in dataset:
+        if sample_count >= n_samples:
+            break
+            
+        # Encode all modalities
+        mus, logvars, mixture_mu, mixture_logvar = model.encode_all_modalities(spec_in, desc_in, training=False)
+        
+        # Store means
+        spec_mus.append(mus[0].numpy())
+        desc_mus.append(mus[1].numpy())
+        mixture_mus.append(mixture_mu.numpy())
+        
+        # Store test IDs
+        if isinstance(test_id_in, tf.Tensor):
+            test_id_in = test_id_in.numpy()
+        test_ids.append(test_id_in)
+        
+        sample_count += spec_in.shape[0]
+    
+    # Concatenate results
+    spec_mus = np.concatenate(spec_mus, axis=0)
+    desc_mus = np.concatenate(desc_mus, axis=0)
+    mixture_mus = np.concatenate(mixture_mus, axis=0)
+    test_ids = np.concatenate(test_ids, axis=0).flatten()
+    
+    # Reduce dimensionality for visualization
+    reducer = umap.UMAP(n_components=2, random_state=42, n_neighbors=15, min_dist=0.1)
+    
+    # Combine all encodings for a single UMAP embedding
+    all_mus = np.concatenate([spec_mus, desc_mus, mixture_mus], axis=0)
+    all_embeddings = reducer.fit_transform(all_mus)
+    
+    # Split back into modality-specific embeddings
+    n_points = spec_mus.shape[0]
+    spec_embeddings = all_embeddings[:n_points]
+    desc_embeddings = all_embeddings[n_points:2*n_points]
+    mixture_embeddings = all_embeddings[2*n_points:]
+    
+    # Visualize the latent space
+    fig = go.Figure()
+    
+    # Create a color scale based on test IDs
+    # Add spectrogram embeddings
+    fig.add_trace(go.Scatter(
+        x=spec_embeddings[:, 0], 
+        y=spec_embeddings[:, 1],
+        mode='markers',
+        marker=dict(
+            color=test_ids,
+            colorscale='Viridis',
+            size=8,
+            symbol='circle',
+            line=dict(width=1, color='DarkSlateGrey')
+        ),
+        name='Spectrogram Encoder'
+    ))
+    
+    # Add descriptor embeddings
+    fig.add_trace(go.Scatter(
+        x=desc_embeddings[:, 0], 
+        y=desc_embeddings[:, 1],
+        mode='markers',
+        marker=dict(
+            color=test_ids,
+            colorscale='Viridis',
+            size=8,
+            symbol='x',
+            line=dict(width=1, color='DarkSlateGrey')
+        ),
+        name='Descriptor Encoder'
+    ))
+    
+    # Add mixture embeddings
+    fig.add_trace(go.Scatter(
+        x=mixture_embeddings[:, 0], 
+        y=mixture_embeddings[:, 1],
+        mode='markers',
+        marker=dict(
+            color=test_ids,
+            colorscale='Viridis',
+            size=8,
+            symbol='diamond',
+            line=dict(width=1, color='DarkSlateGrey')
+        ),
+        name='Mixture Prior'
+    ))
+    
+    # Update layout
+    fig.update_layout(
+        title="Latent Space Structure of Mixture-of-Experts MMVAE",
+        xaxis_title="UMAP Dimension 1",
+        yaxis_title="UMAP Dimension 2",
+        legend_title="Encoder Type",
+        template="plotly_white"
+    )
+    
+    # Save figure
+    pio.write_html(fig, file="results/latent_analysis/latent_structure.html", auto_open=False)
+    
+    return {
+        'spec_mus': spec_mus,
+        'desc_mus': desc_mus,
+        'mixture_mus': mixture_mus,
+        'test_ids': test_ids
+    }
+
+def evaluate_cross_modal_generation(model, dataset, data_loader, n_samples=10):
+    """
+    Evaluate cross-modal generation capabilities of the MoE model.
+    
+    Args:
+        model: The trained MoE MMVAE model
+        dataset: Dataset to use for evaluation
+        data_loader: Data loader module with utility functions
+        n_samples: Number of samples to evaluate
+    """
+    # Create output directory
+    os.makedirs("results/cross_modal", exist_ok=True)
+    
+    # Get a batch of samples
+    sample_count = 0
+    for spec_in, desc_in, test_id_in in dataset:
+        if sample_count >= n_samples:
+            break
+            
+        # Select a few samples from the batch
+        for i in range(min(n_samples - sample_count, spec_in.shape[0])):
+            # Extract single sample
+            spec_sample = tf.expand_dims(spec_in[i], 0)
+            desc_sample = tf.expand_dims(desc_in[i], 0)
+            test_id = test_id_in[i].numpy() if isinstance(test_id_in, tf.Tensor) else test_id_in[i]
+            
+            # 1. Encode using spectrogram only
+            mu_spec, logvar_spec = model.spec_encoder(spec_sample, training=False)
+            z_spec = reparameterize(mu_spec, logvar_spec)
+            
+            # Generate descriptor from spectrogram encoding
+            gen_desc_from_spec = model.desc_decoder(z_spec, training=False)
+            
+            # 2. Encode using descriptor only
+            mu_desc, logvar_desc = model.desc_encoder(desc_sample, training=False)
+            z_desc = reparameterize(mu_desc, logvar_desc)
+            
+            # Generate spectrogram from descriptor encoding
+            gen_spec_from_desc = model.spec_decoder(z_desc, training=False)
+            
+            # 3. Encode using both to get mixture prior
+            mus, logvars, mixture_mu, mixture_logvar = model.encode_all_modalities(spec_sample, desc_sample, training=False)
+            z_mixture = reparameterize(mixture_mu, mixture_logvar)
+            
+            # Generate from mixture encoding
+            gen_spec_from_mixture = model.spec_decoder(z_mixture, training=False)
+            gen_desc_from_mixture = model.desc_decoder(z_mixture, training=False)
+            
+            # Visualize original and cross-modal reconstructions
+            # A. Original spectrogram vs generated from descriptor/mixture
+            fig = make_subplots(rows=1, cols=3, subplot_titles=[
+                "Original Spectrogram", 
+                "Generated from Descriptor", 
+                "Generated from Mixture"
+            ])
+            
+            # Plot original spectrogram
+            visualize_spectrogram(
+                spec_sample.numpy(), 
+                title=f"Original Spectrogram (ID: {test_id})", 
+                channel=0,
+                output_path=f"results/cross_modal/sample_{sample_count+i}_orig_spec.html"
+            )
+            
+            # Plot generated spectrograms
+            visualize_spectrogram(
+                gen_spec_from_desc.numpy(), 
+                title=f"Spec from Desc (ID: {test_id})", 
+                channel=0,
+                output_path=f"results/cross_modal/sample_{sample_count+i}_spec_from_desc.html"
+            )
+            
+            visualize_spectrogram(
+                gen_spec_from_mixture.numpy(), 
+                title=f"Spec from Mixture (ID: {test_id})", 
+                channel=0,
+                output_path=f"results/cross_modal/sample_{sample_count+i}_spec_from_mixture.html"
+            )
+            
+            # B. Compare crack descriptors
+            try:
+                # Original descriptor
+                desc_np = desc_sample.numpy()[0]
+                valid_mask = np.any(desc_np != 0, axis=1)
+                valid_descriptors = desc_np[valid_mask]
+                
+                # Generated from spectrogram
+                gen_desc_from_spec_np = gen_desc_from_spec.numpy()[0]
+                valid_gen_mask = np.any(gen_desc_from_spec_np != 0, axis=1)
+                valid_gen_descriptors = gen_desc_from_spec_np[valid_gen_mask]
+                
+                # Generated from mixture
+                gen_desc_from_mixture_np = gen_desc_from_mixture.numpy()[0]
+                valid_mix_mask = np.any(gen_desc_from_mixture_np != 0, axis=1)
+                valid_mix_descriptors = gen_desc_from_mixture_np[valid_mix_mask]
+                
+                # Use data_loader to visualize masks
+                orig_mask = data_loader.reconstruct_mask_from_descriptors(
+                    valid_descriptors, 
+                    image_shape=(256, 768), 
+                    line_thickness=1
+                )
+                
+                gen_mask = data_loader.reconstruct_mask_from_descriptors(
+                    valid_gen_descriptors, 
+                    image_shape=(256, 768), 
+                    line_thickness=1
+                )
+                
+                mix_mask = data_loader.reconstruct_mask_from_descriptors(
+                    valid_mix_descriptors, 
+                    image_shape=(256, 768), 
+                    line_thickness=1
+                )
+                
+                # Visualize masks
+                fig = go.Figure()
+                fig.add_trace(go.Heatmap(
+                    z=orig_mask, 
+                    colorscale='Reds',
+                    showscale=False
+                ))
+                fig.update_layout(title=f"Original Mask (ID: {test_id})")
+                fig.write_html(f"results/cross_modal/sample_{sample_count+i}_orig_mask.html", auto_open=False)
+                
+                fig = go.Figure()
+                fig.add_trace(go.Heatmap(
+                    z=gen_mask, 
+                    colorscale='Blues',
+                    showscale=False
+                ))
+                fig.update_layout(title=f"Mask from Spectrogram (ID: {test_id})")
+                fig.write_html(f"results/cross_modal/sample_{sample_count+i}_mask_from_spec.html", auto_open=False)
+                
+                fig = go.Figure()
+                fig.add_trace(go.Heatmap(
+                    z=mix_mask, 
+                    colorscale='Greens',
+                    showscale=False
+                ))
+                fig.update_layout(title=f"Mask from Mixture (ID: {test_id})")
+                fig.write_html(f"results/cross_modal/sample_{sample_count+i}_mask_from_mixture.html", auto_open=False)
+                
+            except Exception as e:
+                print(f"Error visualizing masks for sample {sample_count+i}: {e}")
+            
+            sample_count += 1
+            if sample_count >= n_samples:
+                break
+
+def evaluate_missing_modality(model, dataset, n_samples=10):
+    """
+    Evaluate model performance when modalities are missing.
+    
+    Args:
+        model: The trained MoE MMVAE model
+        dataset: Dataset to use for evaluation
+        n_samples: Number of samples to evaluate
+    """
+    # Create output directory
+    os.makedirs("results/missing_modality", exist_ok=True)
+    
+    # Metrics to track
+    spec_full_losses = []
+    spec_miss_losses = []
+    desc_full_losses = []
+    desc_miss_losses = []
+    
+    # Get samples
+    sample_count = 0
+    for spec_in, desc_in, _ in dataset:
+        if sample_count >= n_samples:
+            break
+            
+        # Get full reconstructions
+        recon_spec_full, recon_desc_full, _ = model(
+            spec_in, desc_in,
+            training=False,
+            missing_modality=None  # No missing modality
+        )
+        
+        # Get reconstructions with missing spectrogram
+        recon_spec_miss_spec, recon_desc_miss_spec, _ = model(
+            spec_in, desc_in,
+            training=False,
+            missing_modality='spec'  # Missing spectrogram
+        )
+        
+        # Get reconstructions with missing descriptor
+        recon_spec_miss_desc, recon_desc_miss_desc, _ = model(
+            spec_in, desc_in,
+            training=False,
+            missing_modality='desc'  # Missing descriptor
+        )
+        
+        # Compute losses
+        spec_full_loss = complex_spectrogram_loss(spec_in, recon_spec_full).numpy()
+        spec_miss_loss = complex_spectrogram_loss(spec_in, recon_spec_miss_spec).numpy()
+        
+        desc_full_loss = weighted_descriptor_mse_loss(desc_in, recon_desc_full).numpy()
+        desc_miss_loss = weighted_descriptor_mse_loss(desc_in, recon_desc_miss_desc).numpy()
+        
+        # Track metrics
+        spec_full_losses.append(spec_full_loss)
+        spec_miss_losses.append(spec_miss_loss)
+        desc_full_losses.append(desc_full_loss)
+        desc_miss_losses.append(desc_miss_loss)
+        
+        sample_count += spec_in.shape[0]
+    
+    # Compute averages
+    avg_spec_full = np.mean(spec_full_losses)
+    avg_spec_miss = np.mean(spec_miss_losses)
+    avg_desc_full = np.mean(desc_full_losses)
+    avg_desc_miss = np.mean(desc_miss_losses)
+    
+    # Create summary table
+    data = {
+        'Modality': ['Spectrogram', 'Descriptor'],
+        'Full Model': [avg_spec_full, avg_desc_full],
+        'Missing Other Modality': [avg_spec_miss, avg_desc_miss],
+        'Performance Drop (%)': [
+            (avg_spec_miss - avg_spec_full) / avg_spec_full * 100,
+            (avg_desc_miss - avg_desc_full) / avg_desc_full * 100
+        ]
+    }
+    df = pd.DataFrame(data)
+    
+    # Save results
+    df.to_csv("results/missing_modality/performance_summary.csv", index=False)
+    
+    # Plot results
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=['Spectrogram', 'Descriptor'],
+        y=[avg_spec_full, avg_desc_full],
+        name='Full Model'
+    ))
+    fig.add_trace(go.Bar(
+        x=['Spectrogram', 'Descriptor'],
+        y=[avg_spec_miss, avg_desc_miss],
+        name='Missing Other Modality'
+    ))
+    
+    fig.update_layout(
+        title="Reconstruction Performance with Missing Modalities",
+        xaxis_title="Reconstructed Modality",
+        yaxis_title="Reconstruction Loss",
+        barmode='group',
+        template="plotly_white"
+    )
+    
+    pio.write_html(fig, file="results/missing_modality/performance_comparison.html", auto_open=False)
+    
+    return {
+        'spec_full': avg_spec_full,
+        'spec_miss': avg_spec_miss,
+        'desc_full': avg_desc_full,
+        'desc_miss': avg_desc_miss
+    }
+
+def evaluate_modality_alignment(latent_data):
+    """
+    Evaluate how well modalities are aligned in the latent space.
+    
+    Args:
+        latent_data: Dictionary with latent encodings from visualize_latent_structure
+        
+    Returns:
+        Dictionary of alignment metrics
+    """
+    # Create output directory
+    os.makedirs("results/latent_analysis", exist_ok=True)
+    
+    # Extract data
+    spec_mus = latent_data['spec_mus']
+    desc_mus = latent_data['desc_mus']
+    mixture_mus = latent_data['mixture_mus']
+    
+    # 1. Compute average cosine distance between modality encodings
+    # This measures how aligned the encodings are in direction
+    
+    # Normalize vectors for cosine similarity
+    spec_norm = spec_mus / np.linalg.norm(spec_mus, axis=1, keepdims=True)
+    desc_norm = desc_mus / np.linalg.norm(desc_mus, axis=1, keepdims=True)
+    
+    # Compute batch-wise cosine similarity
+    cosine_similarities = np.sum(spec_norm * desc_norm, axis=1)
+    avg_cosine_sim = np.mean(cosine_similarities)
+    
+    # 2. Compute Euclidean distances between modality encodings
+    euclidean_distances = np.sqrt(np.sum(np.square(spec_mus - desc_mus), axis=1))
+    avg_euclidean_dist = np.mean(euclidean_distances)
+    
+    # 3. Compute distances between each modality and the mixture
+    spec_to_mixture_dist = np.sqrt(np.sum(np.square(spec_mus - mixture_mus), axis=1))
+    desc_to_mixture_dist = np.sqrt(np.sum(np.square(desc_mus - mixture_mus), axis=1))
+    
+    avg_spec_to_mixture = np.mean(spec_to_mixture_dist)
+    avg_desc_to_mixture = np.mean(desc_to_mixture_dist)
+    
+    # Create summary of results
+    alignment_metrics = {
+        'avg_cosine_similarity': avg_cosine_sim,
+        'avg_euclidean_distance': avg_euclidean_dist,
+        'avg_spec_to_mixture_distance': avg_spec_to_mixture,
+        'avg_desc_to_mixture_distance': avg_desc_to_mixture
+    }
+    
+    # Save metrics
+    pd.DataFrame([alignment_metrics]).to_csv("results/latent_analysis/alignment_metrics.csv", index=False)
+    
+    # Create visualization of distances
+    fig = go.Figure()
+    
+    # Add cosine similarity histogram
+    fig.add_trace(go.Histogram(
+        x=cosine_similarities,
+        name='Cosine Similarity',
+        histnorm='probability density',
+        marker_color='blue',
+        opacity=0.7
+    ))
+    
+    fig.update_layout(
+        title="Distribution of Cosine Similarity Between Modality Encodings",
+        xaxis_title="Cosine Similarity",
+        yaxis_title="Probability Density",
+        template="plotly_white"
+    )
+    
+    pio.write_html(fig, file="results/latent_analysis/cosine_similarity_dist.html", auto_open=False)
+    
+    # Create visualization of modality to mixture distances
+    fig = go.Figure()
+    
+    # Add distance histograms
+    fig.add_trace(go.Histogram(
+        x=spec_to_mixture_dist,
+        name='Spectrogram to Mixture',
+        histnorm='probability density',
+        marker_color='blue',
+        opacity=0.7
+    ))
+    
+    fig.add_trace(go.Histogram(
+        x=desc_to_mixture_dist,
+        name='Descriptor to Mixture',
+        histnorm='probability density',
+        marker_color='green',
+        opacity=0.7
+    ))
+    
+    fig.update_layout(
+        title="Distribution of Distances Between Modality and Mixture Encodings",
+        xaxis_title="Euclidean Distance",
+        yaxis_title="Probability Density",
+        template="plotly_white",
+        barmode='overlay'
+    )
+    
+    pio.write_html(fig, file="results/latent_analysis/modality_mixture_dist.html", auto_open=False)
+    
+    return alignment_metrics
+
+def visualize_spectrogram(spectrogram_features, title="Spectrogram", channel=0, output_path=None):
+    """
+    Visualize a single channel from spectrogram features.
+    
+    Args:
+        spectrogram_features: Spectrogram features with shape (batch, freq, time, channels*2)
+        title: Plot title
+        channel: Which original channel to visualize (magnitude only)
+        output_path: Path to save the visualization
+    """
+    # Extract magnitude for selected channel
+    magnitude = spectrogram_features[0, :, :, channel*2]
+    
+    # Create heatmap
+    fig = go.Figure(data=go.Heatmap(
+        z=magnitude,
+        colorscale='Viridis'
+    ))
+    
+    fig.update_layout(
+        title=title,
+        xaxis_title="Time Frames",
+        yaxis_title="Frequency Bins",
+        yaxis=dict(autorange="reversed"),  # Flip y-axis to have low frequencies at bottom
+        template="plotly_white"
+    )
+    
+    if output_path:
+        pio.write_html(fig, file=output_path, auto_open=False)
+    else:
+        fig.show()
+
+def test_latent_interpolation(model, val_dataset, output_dir="results/interpolation"):
+    """
+    Perform latent space interpolation between samples in the validation set.
+    
+    Args:
+        model: Trained SpectralMMVAE model
+        output_dir: Directory to save interpolation results
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Get two samples from validation dataset
+    for spec_batch, desc_batch, _ in val_dataset.take(1):
+        # Use first two samples in batch
+        if spec_batch.shape[0] < 2:
+            print("❌ Need at least 2 samples for interpolation")
+            return
+            
+        source_spec = tf.expand_dims(spec_batch[0], 0)
+        source_desc = tf.expand_dims(desc_batch[0], 0)
+        
+        target_spec = tf.expand_dims(spec_batch[1], 0)
+        target_desc = tf.expand_dims(desc_batch[1], 0)
+        
+        # Encode samples to get latent vectors
+        _, _, source_mixture = model(source_spec, source_desc, training=False)
+        _, _, target_mixture = model(target_spec, target_desc, training=False)
+        
+        # Get mixture means
+        source_mus, source_logvars, _, _ = source_mixture
+        target_mus, target_logvars, _, _ = target_mixture
+        
+        # Use spectrogram encoder means for interpolation
+        source_z = source_mus[0]  # Assuming index 0 is spectrogram encoder
+        target_z = target_mus[0]  # Assuming index 0 is spectrogram encoder
+        
+        # Create interpolations
+        num_steps = 8
+        alphas = np.linspace(0, 1, num_steps)
+        
+        # Generate and visualize interpolated spectrograms
+        plt.figure(figsize=(num_steps*2, 4))
+        
+        for i, alpha in enumerate(alphas):
+            # Linear interpolation in latent space
+            interp_z = (1 - alpha) * source_z + alpha * target_z
+            
+            # Generate spectrogram from interpolated latent
+            interp_spec = model.spec_decoder(interp_z, training=False)
+            
+            # Plot
+            plt.subplot(1, num_steps, i+1)
+            plt.imshow(interp_spec[0, :, :, 0].numpy(), aspect='auto', cmap='viridis')
+            plt.title(f"α={alpha:.1f}")
+            plt.axis('off')
+        
+        plt.tight_layout()
+        plt.savefig(os.path.join(output_dir, "latent_interpolation.png"), dpi=300)
+        plt.close()
+        
+        print("✅ Generated latent space interpolation visualization")
+        break
+
 # ----- Main Function -----
 def main():
     # Set debug mode
@@ -1593,6 +2370,8 @@ def main():
     # ------------------------ 1) Configure Environment ------------------------
     os.makedirs("results", exist_ok=True)
     os.makedirs("results/model_checkpoints", exist_ok=True)
+    os.makedirs("results/latent_analysis", exist_ok=True)
+    os.makedirs("results/cross_modal", exist_ok=True)
 
     sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     
@@ -1602,9 +2381,9 @@ def main():
     noverlap = 224  # STFT overlap
     
     latent_dim = 64 
-    batch_size = 32  
-    num_epochs = 200  
-    patience = 5  
+    batch_size = 64  
+    num_epochs = 500 
+    patience = 400  
 
     # Cached file paths
     stft_path = "cached_stft.npy"
@@ -1659,7 +2438,7 @@ def main():
         print(f"Descriptor shape: {max_num_cracks} cracks x {desc_length} features")
 
     else:
-        # Thia is a hardcoded standart -> needs to be changed to dynamic later
+        # This is a hardcoded standard -> needs to be changed to dynamic later
         max_num_cracks = 770  
         desc_length = 42      
 
@@ -1701,22 +2480,29 @@ def main():
 
     # ------------------------ 9) Build Model ------------------------
     spec_shape = spectral_features.shape[1:]  
-    
+
     print(f"📐 Building model with:")
     print(f"  - Latent dimension: {latent_dim}")
     print(f"  - Spectrogram shape: {spec_shape}")
     print(f"  - Descriptor shape: ({max_num_cracks}, {desc_length})")
-    
+
     model = SpectralMMVAE(latent_dim, spec_shape, max_num_cracks, desc_length)
 
+    # Build the model with a dummy forward pass before creating the optimizer
+    dummy_spec = tf.zeros((1, *spec_shape))
+    dummy_desc = tf.zeros((1, max_num_cracks, desc_length))
+    _ = model(dummy_spec, dummy_desc, training=True)
+    print("✅ Model built successfully with dummy inputs")
+
+    # Now create the optimizer
     # ------------------------ 10) Set Up Optimizer ------------------------
     lr_schedule = ExponentialDecay(
-        initial_learning_rate=1e-4,
+        initial_learning_rate=5e-5,
         decay_steps=10000,
         decay_rate=0.9,
         staircase=True
     )
-    
+    # consider using RAdam if AndamW doesnt work
     optimizer = keras.optimizers.AdamW(
         learning_rate=lr_schedule,
         weight_decay=1e-5,
@@ -1727,28 +2513,74 @@ def main():
 
     # ------------------------ 11) Train Model ------------------------
     print("🚀 Starting training...")
-    training_metrics = train_spectral_mmvae(model, train_dataset, val_dataset, optimizer, num_epochs, patience)
+    training_metrics = train_spectral_mmvae(
+        model, 
+        train_dataset, 
+        val_dataset, 
+        optimizer, 
+        num_epochs=num_epochs, 
+        patience=patience,
+        beta_schedule='linear',
+        modality_dropout_prob=0.15  # Enable modality dropout
+    )
 
     # ------------------------ 12) Save & Visualize Training Results ------------------------
     np.save("results/training_metrics.npy", training_metrics)
+    
+    # Use new, enhanced plotting function
     plot_training_curves(training_metrics)
 
     # ------------------------ 13) Load Best Model ------------------------
-    model.load_weights("results/best_spectral_mmvae.weights.h5")
+    best_weights_path = "results/best_spectral_mmvae.weights.h5"
+    final_weights_path = "results/final_spectral_mmvae.weights.h5"
 
-    # ------------------------ 14) Extract & Visualize Latent Space ------------------------
+    if os.path.exists(best_weights_path):
+        model.load_weights(best_weights_path)
+        print("✅ Loaded best model weights")
+    elif os.path.exists(final_weights_path):
+        model.load_weights(final_weights_path)
+        print("✅ Loaded final model weights")
+    else:
+        print("⚠️ No saved weights found, using model from last epoch")
+
+    # ------------------------ 14) Evaluate Latent Space ------------------------
+    # A) First use your original latent visualization
     latent_vectors, test_ids_arr = extract_latent_representations(model, train_dataset)
     latent_3d = reduce_latent_dim_umap(latent_vectors)
     plot_latent_space_3d(latent_3d, test_ids_arr, output_file="results/latent_space_3d.html")
+    
+    # B) Then use the new, enhanced latent visualization (provides more detailed analysis)
+    latent_data = visualize_latent_structure(model, val_dataset, n_samples=500)
+    
+    # C) Evaluate modality alignment in latent space
+    alignment_metrics = evaluate_modality_alignment(latent_data)
+    print("Modality Alignment Metrics:")
+    for metric, value in alignment_metrics.items():
+        print(f"  - {metric}: {value:.4f}")
 
-    # ------------------------ 15) Evaluate Reconstructions ------------------------
+    # ------------------------ 15) Evaluate Reconstructions and Cross-Modal Generation ------------------------
+    # A) Your original reconstruction visualization
     visualize_reconstructions(model, val_dataset, data_loader, num_samples=5, fs=fs, nperseg=nperseg, noverlap=noverlap)
+    
+    # B) New cross-modal generation evaluation (spec→desc and desc→spec)
+    evaluate_cross_modal_generation(model, val_dataset, data_loader, n_samples=5)
+    
+    # C) Test performance with missing modalities
+    missing_modality_metrics = evaluate_missing_modality(model, val_dataset, n_samples=10)
+    print("Missing Modality Performance:")
+    print(f"  - Spectrogram (full): {missing_modality_metrics['spec_full']:.4f}")
+    print(f"  - Spectrogram (missing desc): {missing_modality_metrics['spec_miss']:.4f}")
+    print(f"  - Descriptor (full): {missing_modality_metrics['desc_full']:.4f}")
+    print(f"  - Descriptor (missing spec): {missing_modality_metrics['desc_miss']:.4f}")
 
     # ------------------------ 16) Generate New Samples ------------------------
+    # A) Use your original sample generation function
     generate_samples(model, data_loader, num_samples=5, fs=fs, nperseg=nperseg, noverlap=noverlap)
+    
+    # B) Use new interpolation-based generation example
+    test_latent_interpolation(model, val_dataset,"results/samples")
 
     print("✅ Training & evaluation complete. Results saved in 'results/' directory.")
-
 
 if __name__ == "__main__":
     main()
