@@ -1,124 +1,229 @@
-"""
-Custom implementation of distribution-related functions to replace TensorFlow Probability.
-This module provides simplified Gaussian distribution operations for computing JS divergence.
-"""
-
 import tensorflow as tf
+import numpy as np
 
-class GaussianDistribution:
-    """
-    Simple Gaussian distribution with diagonal covariance.
-    """
-    def __init__(self, mu, logvar):
-        """
-        Initialize a Gaussian distribution.
-        
-        Args:
-            mu: Mean vector (batch_size, latent_dim)
-            logvar: Log variance vector (batch_size, latent_dim)
-        """
-        self.mu = mu
-        self.logvar = tf.clip_by_value(logvar, -10.0, 8.0)  # Clip for numerical stability
-        self.var = tf.exp(self.logvar)
-        self.stddev = tf.sqrt(self.var)
-    
-    def kl_divergence(self, other):
-        """
-        Compute KL(self || other) for two Gaussian distributions.
-        
-        Args:
-            other: Another GaussianDistribution instance
-            
-        Returns:
-            KL divergence per batch element (batch_size,)
-        """
-        # KL divergence between two multivariate Gaussians with diagonal covariance:
-        # 0.5 * sum(log(var_other/var_self) + (var_self + (mu_self - mu_other)²)/var_other - 1)
-        kl = 0.5 * tf.reduce_sum(
-            other.logvar - self.logvar + 
-            (self.var + tf.square(self.mu - other.mu)) / other.var - 1.0,
-            axis=-1
-        )
-        return kl
+# Constants for numerical stability
+EPSILON = 1e-8
+LOGVAR_MIN = -10.0
+LOGVAR_MAX = 8.0
 
-def compute_mixture_distribution(distributions, weights=None):
+def reparameterize(mean, logvar):
     """
-    Create a mixture distribution from a list of distributions.
+    Reparameterization trick for sampling from a Gaussian distribution.
+    Added clipping for numerical stability.
     
     Args:
-        distributions: List of GaussianDistribution instances
-        weights: Optional weights for the mixture (defaults to uniform)
+        mean: Mean of the Gaussian
+        logvar: Log variance of the Gaussian
         
     Returns:
-        A simplified representation of the mixture suitable for KL calculations
+        Sampled latent vector
     """
-    n_components = len(distributions)
+    # Clip logvar to avoid numerical issues
+    logvar = tf.clip_by_value(logvar, LOGVAR_MIN, LOGVAR_MAX)
     
-    if weights is None:
-        weights = [1.0 / n_components] * n_components
+    eps = tf.random.normal(shape=tf.shape(mean))
+    std = tf.exp(0.5 * logvar)
+    return mean + eps * std
+
+def compute_kl_divergence(mu_q, logvar_q, mu_p=None, logvar_p=None):
+    """
+    Compute KL divergence between two Gaussian distributions: q(z|x) and p(z).
+    Added clipping and epsilon for numerical stability.
     
-    # For simplicity, we'll approximate the mixture's properties
-    # This is not exact but works well enough for our JS divergence calculation
-    weighted_mu = tf.zeros_like(distributions[0].mu)
-    weighted_var = tf.zeros_like(distributions[0].var)
+    Args:
+        mu_q: Mean of q distribution
+        logvar_q: Log variance of q distribution
+        mu_p: Mean of p distribution (None means standard normal)
+        logvar_p: Log variance of p distribution (None means standard normal)
+        
+    Returns:
+        KL divergence
+    """
+    # Clip logvar for stability
+    logvar_q = tf.clip_by_value(logvar_q, LOGVAR_MIN, LOGVAR_MAX)
     
-    for i, dist in enumerate(distributions):
-        weighted_mu += weights[i] * dist.mu
-        # Add variance plus squared difference from mixture mean
-        weighted_var += weights[i] * (dist.var + tf.square(dist.mu))
+    if mu_p is None:
+        # KL with standard normal
+        kl = -0.5 * tf.reduce_sum(
+            1 + logvar_q - tf.square(mu_q) - tf.exp(logvar_q),
+            axis=-1
+        )
+    else:
+        # Clip p distribution logvar as well
+        logvar_p = tf.clip_by_value(logvar_p, LOGVAR_MIN, LOGVAR_MAX)
+        
+        # Compute variances with epsilon for stability
+        var_q = tf.exp(logvar_q) + EPSILON
+        var_p = tf.exp(logvar_p) + EPSILON
+        
+        # Compute KL divergence between two Gaussians
+        kl = 0.5 * tf.reduce_sum(
+            logvar_p - logvar_q + (var_q + tf.square(mu_q - mu_p)) / var_p - 1,
+            axis=-1
+        )
     
-    # Correct the variance by subtracting squared mixture mean
-    weighted_var -= tf.square(weighted_mu)
+    # Apply tf.maximum to avoid extreme negative values
+    return tf.reduce_mean(tf.maximum(kl, 0.0))
+
+def compute_mixture_prior(mus, logvars):
+    """
+    Compute the Mixture-of-Experts prior parameters.
+    The prior is a mixture of the unimodal posteriors.
+    Added clipping and epsilon for numerical stability.
     
-    # Create a new distribution with these properties
-    weighted_logvar = tf.math.log(tf.maximum(weighted_var, 1e-8))
-    return GaussianDistribution(weighted_mu, weighted_logvar)
+    Args:
+        mus: List of means from each modality encoder
+        logvars: List of log variances from each modality encoder
+        
+    Returns:
+        Tuple of (mixture_mu, mixture_logvar)
+    """
+    # Check for empty list
+    if not mus or len(mus) == 0:
+        raise ValueError("Empty list of means provided to compute_mixture_prior")
+    
+    # Clip logvars for stability
+    logvars = [tf.clip_by_value(lv, LOGVAR_MIN, LOGVAR_MAX) for lv in logvars]
+    
+    # Stack means and variances
+    all_mus = tf.stack(mus, axis=0)      # [num_modalities, batch_size, latent_dim]
+    all_logvars = tf.stack(logvars, axis=0)  # [num_modalities, batch_size, latent_dim]
+    
+    # Compute mixture parameters (average over modalities)
+    mixture_mu = tf.reduce_mean(all_mus, axis=0)  # [batch_size, latent_dim]
+    
+    # For the mixture variance, we need to account for both the mean of variances
+    # and the variance of means (law of total variance)
+    exp_logvars = tf.exp(all_logvars)  # [num_modalities, batch_size, latent_dim]
+    mean_var = tf.reduce_mean(exp_logvars, axis=0)  # [batch_size, latent_dim]
+    
+    # Compute variance of means
+    mu_diff_sq = tf.reduce_mean(tf.square(all_mus - mixture_mu[tf.newaxis, :, :]), axis=0)
+    
+    # Total variance is mean of variances plus variance of means, add epsilon for stability
+    mixture_var = mean_var + mu_diff_sq + EPSILON
+    mixture_logvar = tf.math.log(mixture_var)
+    
+    # Final clip on the mixture logvar
+    mixture_logvar = tf.clip_by_value(mixture_logvar, LOGVAR_MIN, LOGVAR_MAX)
+    
+    return mixture_mu, mixture_logvar
 
 def compute_js_divergence(mus, logvars):
     """
-    Compute JS divergence among a set of Gaussian distributions.
+    Compute the Jensen-Shannon divergence among multiple Gaussian distributions.
+    This follows the Unity by Diversity paper approach where JS is computed between
+    each unimodal posterior and the mixture-of-experts prior.
+    Added clipping and error handling for stability.
     
     Args:
-        mus: List of mean vectors [tensor1, tensor2, ...], each with shape (batch, latent_dim)
-        logvars: List of log variance vectors, matching mus
+        mus: List of means from each modality encoder
+        logvars: List of log variances from each modality encoder
         
     Returns:
-        JS divergence (scalar)
+        JS divergence (scaled by number of modalities)
     """
-    M = len(mus)
-    if M <= 1:
+    # Handle empty or single distributions
+    num_modalities = len(mus)
+    if num_modalities <= 1:
         return tf.constant(0.0, dtype=tf.float32)
     
-    # Create distributions
-    distributions = [GaussianDistribution(mu, logvar) for mu, logvar in zip(mus, logvars)]
+    # Compute mixture prior parameters
+    try:
+        mixture_mu, mixture_logvar = compute_mixture_prior(mus, logvars)
+    except ValueError:
+        # Return zero if mixture computation fails
+        return tf.constant(0.0, dtype=tf.float32)
     
-    # Create the mixture distribution (uniform weighting)
-    mixture = compute_mixture_distribution(distributions)
+    # Compute KL divergence for each modality from the mixture
+    kl_divs = []
+    for i in range(num_modalities):
+        # Clip inputs to KL computation
+        mu_i = tf.clip_by_norm(mus[i], 10.0, axes=-1)  # Prevent extreme means
+        logvar_i = tf.clip_by_value(logvars[i], LOGVAR_MIN, LOGVAR_MAX)
+        
+        kl_div = compute_kl_divergence(
+            mu_i, logvar_i, 
+            mixture_mu, mixture_logvar
+        )
+        kl_divs.append(kl_div)
     
-    # Compute KL(dist_i || mixture) for each component
-    kl_terms = []
-    for dist in distributions:
-        kl_i = dist.kl_divergence(mixture)
-        kl_terms.append(kl_i)
+    # Compute JS divergence (average of KLs)
+    js_div = tf.reduce_mean(tf.stack(kl_divs))
     
-    # Average the KL terms
-    kl_stack = tf.stack(kl_terms, axis=0)
-    kl_mean = tf.reduce_mean(kl_stack)
+    # Scale by number of modalities (as in paper)
+    # This is because JS = (1/M) * sum(KL(q_i || mixture))
+    scaled_js = js_div * num_modalities
     
-    # JS = (1/M) * sum(KL(p_i || mixture))
-    return kl_mean
+    # Final clip to prevent extreme values
+    return tf.clip_by_value(scaled_js, 0.0, 1000.0)
 
-def reparameterize(mu, logvar):
+def sample_from_mixture_prior(mus, logvars):
     """
-    Reparameterization trick for sampling from a Gaussian.
+    Sample from the mixture-of-experts prior.
+    Added error handling for stability.
     
     Args:
-        mu: Mean vector
-        logvar: Log variance vector
+        mus: List of means from each modality encoder
+        logvars: List of log variances from each modality encoder
         
     Returns:
-        Sampled vector
+        Sampled latent vector
     """
-    sigma = tf.exp(0.5 * logvar)
-    eps = tf.random.normal(tf.shape(sigma))
-    return mu + eps * sigma
+    num_modalities = len(mus)
+    if num_modalities == 0:
+        raise ValueError("Cannot sample from empty mixture")
+        
+    batch_size = tf.shape(mus[0])[0]
+    
+    # Randomly select which mixture component to sample from for each example in batch
+    # This implements a proper mixture model sampling
+    component_indices = tf.random.uniform(
+        shape=[batch_size], 
+        minval=0, 
+        maxval=num_modalities,
+        dtype=tf.int32
+    )
+    
+    # Stack all means and logvars
+    all_mus = tf.stack(mus, axis=1)      # [batch_size, num_modalities, latent_dim]
+    
+    # Clip logvars for stability before stacking
+    clipped_logvars = [tf.clip_by_value(lv, LOGVAR_MIN, LOGVAR_MAX) for lv in logvars]
+    all_logvars = tf.stack(clipped_logvars, axis=1)  # [batch_size, num_modalities, latent_dim]
+    
+    # Create batch indices
+    batch_indices = tf.range(batch_size)
+    
+    # Select the means and logvars for the sampled components
+    selected_mus = tf.gather_nd(all_mus, tf.stack([batch_indices, component_indices], axis=1))
+    selected_logvars = tf.gather_nd(all_logvars, tf.stack([batch_indices, component_indices], axis=1))
+    
+    # Sample using reparameterization trick (which has its own clipping)
+    return reparameterize(selected_mus, selected_logvars)
+
+def impute_missing_modality(present_mus, present_logvars, missing_idx, num_total_modalities):
+    """
+    Impute a missing modality by sampling from the mixture of available modalities.
+    Added error handling and stability measures.
+    
+    Args:
+        present_mus: List of means from available modality encoders
+        present_logvars: List of log variances from available modality encoders
+        missing_idx: Index of the missing modality
+        num_total_modalities: Total number of modalities in the model
+        
+    Returns:
+        Sampled latent vector for the missing modality
+    """
+    # Check if there are any available modalities
+    if not present_mus or len(present_mus) == 0:
+        raise ValueError("No modalities available for imputation")
+    
+    # Compute mixture prior parameters from available modalities
+    mixture_mu, mixture_logvar = compute_mixture_prior(present_mus, present_logvars)
+    
+    # Sample from the mixture prior using the stabilized reparameterization
+    imputed_z = reparameterize(mixture_mu, mixture_logvar)
+    
+    return imputed_z

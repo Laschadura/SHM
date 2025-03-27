@@ -10,3 +10,5 @@ debug_images/
 evaluation_plots/
 best_params_validation/
 correlation_results/
+Euler_MMVAE/
+clean_env_mirror/
