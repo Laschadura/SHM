@@ -1,10 +1,37 @@
 import os
-import warnings
 import sys
+import gc
+import time
+import warnings
+import logging
+import psutil
+import numpy as np
+import cv2
+import keras
+from keras import layers, Model, optimizers
+from keras.optimizers.schedules import ExponentialDecay  
+from scipy import signal
+import matplotlib.pyplot as plt
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+import plotly.io as pio
+import plotly.express as px
+import pandas as pd
+import umap
+from sklearn.mixture import GaussianMixture
+import GPUtil
 import tensorflow as tf
 
+# Multithreading
+tf.config.threading.set_intra_op_parallelism_threads(3)
+tf.config.threading.set_inter_op_parallelism_threads(1)
+
+# Set working directory
+os.chdir("/cluster/scratch/scansimo/Euler_MMVAE")
+print("✅ Script has started executing")
+
+# GPU Configuration
 def configure_gpu():
-    """Enables memory growth for GPUs and prints the available devices."""
     physical_devices = tf.config.list_physical_devices('GPU')
     if physical_devices:
         try:
@@ -13,42 +40,26 @@ def configure_gpu():
             print(f"✅ Memory growth enabled on {len(physical_devices)} GPU(s)")
         except RuntimeError as e:
             print(f"❌ GPU Memory Growth Error: {e}")
+    else:
+        print("⚠️ No GPU devices found — this script will run on CPU.")
 
-    # Check which device TensorFlow is using
     print(f"🔍 TensorFlow will run on: {tf.config.list_logical_devices('GPU')}")
 
-# Call GPU configuration before importing any other TensorFlow-related code
 configure_gpu()
 
-# ✅ Now import all other libraries
-import cv2
-import sys
-import gc
-import time
-import psutil
-import GPUtil
-import numpy as np
-import keras 
-from keras import layers, Model, optimizers
-from keras.optimizers.schedules import ExponentialDecay #type: ignore
-import logging
-from scipy import signal
-import matplotlib.pyplot as plt
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-import plotly.io as pio
-import umap
-import plotly.express as px
-import pandas as pd
-from sklearn.mixture import GaussianMixture
 
-# Import our custom module instead of tensorflow_probability
-from custom_distributions import compute_js_divergence, reparameterize, compute_mixture_prior, compute_kl_divergence
+# Import custom modules
+from custom_distributions import (
+    compute_js_divergence,
+    reparameterize,
+    compute_mixture_prior,
+    compute_kl_divergence,
+)
 
-# Append parent directory to find data_loader.py
-sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
+# Ensure access to sibling files
+sys.path.append(os.path.dirname(__file__))
 import data_loader
+
 
 # ----- Recource Monitoring and Usage -----
 def print_memory_stats():
@@ -161,10 +172,25 @@ def segment_and_transform(
     all_descriptor_segments = []
     all_test_ids = []
     
+    # Dictionary to count segments per test ID for debugging
+    seg_counts = {}
+    
     for i in range(0, len(test_ids), chunk_size):
         chunk_ids = test_ids[i:i + chunk_size]
         
         for test_id in chunk_ids:
+            if test_id not in descriptor_dict:
+                print(f"Warning: Test ID {test_id} not found in descriptor_dict; skipping.")
+                continue
+
+            # Debug: print out the shape (or length) of the descriptor for this test
+            desc_val = descriptor_dict[test_id]
+            try:
+                desc_shape = np.array(desc_val).shape
+            except Exception:
+                desc_shape = "unknown"
+            print(f"Processing Test ID {test_id}: descriptor shape = {desc_shape}")
+            
             all_ts = accel_dict[test_id]
             
             for ts_raw in all_ts:
@@ -189,13 +215,21 @@ def segment_and_transform(
                     all_raw_segments.append(segment_raw)
                     all_descriptor_segments.append(descriptor_dict[test_id])
                     all_test_ids.append(int(test_id))
+                    
+                    seg_counts[test_id] = seg_counts.get(test_id, 0) + 1
+                    
+    # Debug: print summary of segments per test ID
+    unique_test_ids = np.unique(all_test_ids)
+    print("Segment counts by test ID:", seg_counts)
+    print("Unique test IDs from segmentation:", unique_test_ids)
     
     # Convert lists to numpy arrays
     raw_segments = np.array(all_raw_segments, dtype=np.float32)
     descriptor_segments = np.array(all_descriptor_segments, dtype=np.float32)
     test_ids = np.array(all_test_ids, dtype=np.int32)
     
-    print(f"Extracted {len(raw_segments)} segments from {len(test_ids)} unique test IDs")
+    print(f"Extracted {len(raw_segments)} segments, each with a corresponding test ID.")
+    print(f"Number of unique test IDs in segmentation: {len(unique_test_ids)}")
     
     return raw_segments, descriptor_segments, test_ids
 
@@ -212,8 +246,8 @@ def compute_and_cache_spectrograms(raw_segments, fs=200, nperseg=256, noverlap=1
         Spectrogram features (N, freq_bins, time_bins, channels*2)
     """
     if os.path.exists(cache_path):
-        print(f"📂 Loading raw STFT from {cache_path} (mmap_mode='r')...")
-        return np.load(cache_path, mmap_mode='r')
+        print(f"📂 Loading raw STFT from {cache_path}")
+        return np.load(cache_path)
     
     print("⏳ Computing STFT for all segments...")
     complex_spectrograms = compute_complex_spectrogram(raw_segments, fs, nperseg, noverlap)
@@ -226,7 +260,7 @@ def compute_complex_spectrogram(
     fs=200,
     nperseg=128,   # Adjusted window size (was 256)
     noverlap=64     # Adjusted overlap (was 192)
-):
+    ):
     """
     Compute STFT-based spectrograms with debugging.
     
@@ -362,8 +396,8 @@ def cache_final_features(complex_specs, cache_path="cached_spectral_features.npy
     save to disk, then memory-map.
     """
     if os.path.exists(cache_path):
-        print(f"📂 Loading final spectral features from {cache_path} (mmap_mode='r')...")
-        return np.load(cache_path, mmap_mode='r')
+        print(f"📂 Loading final spectral features from {cache_path}")
+        return np.load(cache_path)
     
     # Convert to final shape (mag+phase)
     print("⏳ Converting complex STFT -> final magnitude+phase features...")
@@ -373,8 +407,7 @@ def cache_final_features(complex_specs, cache_path="cached_spectral_features.npy
     np.save(cache_path, spectral_features)
     print(f"✅ Final spectral features saved to {cache_path}")
 
-    # Load in mmap mode to reduce memory usage
-    return np.load(cache_path, mmap_mode='r')
+    return np.load(cache_path)
 
 def spectrogram_to_features(complex_spectrograms):
     """
@@ -871,10 +904,10 @@ def get_beta_schedule(epoch, max_epochs, schedule_type='cyclical'):
     """
     # Define beta limits
     BETA_MIN = 1e-8   # Start with very small value
-    BETA_MAX = 0.01   # Maximum value
+    BETA_MAX = 0.1   # Maximum value
     
     # Define warmup phase length (in epochs)
-    WARMUP_EPOCHS = 50
+    WARMUP_EPOCHS = 150
     
     # Define schedule based on type
     if schedule_type == 'linear':
@@ -1151,7 +1184,7 @@ def create_tf_dataset(
     """
     # Convert file path to memory-mapped array if string is provided
     if isinstance(spectrograms, str):
-        spectrograms = np.load(spectrograms, mmap_mode='r')
+        spectrograms = np.load(spectrograms)
     
     # Apply debug mode limit
     if debug_mode:
@@ -1186,38 +1219,20 @@ def train_spectral_mmvae(
     num_epochs=100, 
     patience=10,
     beta_schedule='cyclical',
-    modality_dropout_prob=0.1  # Probability of dropping a modality during training
+    modality_dropout_prob=0.1
 ):
-    """
-    Training function for Spectral MMVAE with Mixture-of-Experts approach.
-    Implementation follows the "Unity by Diversity" paper.
+    import gc
 
-    Args:
-        model: Spectral MMVAE model
-        train_dataset: Training dataset
-        val_dataset: Validation dataset
-        optimizer: Optimizer
-        num_epochs: Maximum number of epochs
-        patience: Early stopping patience
-        beta_schedule: Type of beta schedule ('linear', 'exponential', 'cyclical')
-        modality_dropout_prob: Probability of dropping a modality during training
+    metrics = {
+        'train_total': [], 'train_spec': [], 'train_desc': [], 
+        'train_js': [], 'train_mode': [],
+        'val_total': [], 'val_spec': [], 'val_desc': [], 'val_js': []
+    }
 
-    Returns:
-        Training and validation metrics
-    """
-    # Initialize metrics tracking
-    train_total_losses = []
-    train_spec_losses = []
-    train_desc_losses = []
-    train_js_losses = []
-    train_mode_losses = []  # Track different modality combinations (full, spec-only, desc-only)
+    print("Trainable Variables:")
+    for var in model.trainable_variables:
+        print(f"  - {var.name}: {var.shape}")
 
-    val_total_losses = []
-    val_spec_losses = []
-    val_desc_losses = []
-    val_js_losses = []
-
-    # For early stopping
     best_val_loss = float('inf')
     no_improvement_count = 0
 
@@ -1225,214 +1240,144 @@ def train_spectral_mmvae(
 
     train_batches_count = sum(1 for _ in train_dataset)
     val_batches_count = sum(1 for _ in val_dataset)
-    
     print(f"Training on {train_batches_count} batches, validating on {val_batches_count} batches")
 
-    with tf.device('/GPU:0'):
-        for epoch in range(num_epochs):
-            start_time = time.time()  # Track epoch duration
+    for epoch in range(num_epochs):
+        epoch_metrics = {
+            'train_total': 0.0, 'train_spec': 0.0, 'train_desc': 0.0, 
+            'train_js': 0.0, 'train_full': 0.0, 
+            'train_spec_only': 0.0, 'train_desc_only': 0.0,
+            'n_full': 0, 'n_spec_only': 0, 'n_desc_only': 0,
+            'train_steps': 0
+        }
 
-            # Get beta value for this epoch using the specified schedule
-            beta = get_beta_schedule(epoch, num_epochs, beta_schedule)
-            
-            # Get dynamic loss weights for reconstructions
-            desc_weight = dynamic_weighting(epoch, num_epochs)
-            spec_weight = 1.0 - desc_weight
-            
-            print(f"📌 Epoch {epoch+1}/{num_epochs} | Beta: {beta:.6f} | Descriptor Weight: {desc_weight:.2f}")
-            
-            # Training loop
-            epoch_train_total = 0.0
-            epoch_train_spec = 0.0
-            epoch_train_desc = 0.0
-            epoch_train_js = 0.0
-            
-            # Track losses by modality combination
-            epoch_train_full = 0.0
-            epoch_train_spec_only = 0.0
-            epoch_train_desc_only = 0.0
-            
-            # Count examples of each modality combination
-            n_full = 0
-            n_spec_only = 0
-            n_desc_only = 0
-            
-            train_steps = 0
+        beta = get_beta_schedule(epoch, num_epochs, beta_schedule)
+        desc_weight = dynamic_weighting(epoch, num_epochs)
+        spec_weight = 1.0 - desc_weight
 
-            for step, (spec_in, desc_in, test_id_in) in enumerate(train_dataset):
-                # Randomly decide if a modality should be dropped for this batch
-                missing_modality = None
-                random_value = tf.random.uniform(shape=[], minval=0, maxval=1)
-                
-                if random_value < modality_dropout_prob * 2:  # Split probability between two modalities
-                    if random_value < modality_dropout_prob:
-                        missing_modality = 'spec'
-                    else:
-                        missing_modality = 'desc'
-                
-                with tf.GradientTape() as tape:
-                    # Forward pass through the model with possible missing modality
+        print(f"📌 Epoch {epoch+1}/{num_epochs} | Beta: {beta:.6f} | Descriptor Weight: {desc_weight:.2f}")
+
+        for step, (spec_in, desc_in, test_id_in) in enumerate(train_dataset):
+            missing_modality = None
+            random_value = tf.random.uniform(shape=[], minval=0, maxval=1)
+            if random_value < modality_dropout_prob * 2:
+                missing_modality = 'spec' if random_value < modality_dropout_prob else 'desc'
+
+            with tf.GradientTape(persistent=True) as tape:
+                try:
                     recon_spec, recon_desc, (all_mus, all_logvars, mixture_prior, js_div) = model(
                         spec_in, desc_in, test_id_in,
                         training=True,
                         missing_modality=missing_modality
                     )
-                    
-                    # Compute losses for each modality
+                except Exception as e:
+                    print(f"❌ Forward pass error: {e}")
+                    continue
+
+                try:
                     spec_loss = complex_spectrogram_loss(spec_in, recon_spec) if missing_modality != 'spec' else 0.0
                     desc_loss = weighted_descriptor_mse_loss(desc_in, recon_desc) if missing_modality != 'desc' else 0.0
-                    
-                    # Combined reconstruction loss with dynamic weighting
-                    if missing_modality is None:
-                        # Both modalities present
-                        recon_loss = spec_weight * spec_loss + desc_weight * desc_loss
-                        n_full += 1
-                        epoch_train_full += recon_loss.numpy()
-                    elif missing_modality == 'spec':
-                        # Only descriptor modality present
-                        recon_loss = desc_loss  # Weight is already 1.0 since it's the only modality
-                        n_desc_only += 1
-                        epoch_train_desc_only += recon_loss.numpy()
-                    else:  # missing_modality == 'desc'
-                        # Only spectrogram modality present
-                        recon_loss = spec_loss  # Weight is already 1.0 since it's the only modality
-                        n_spec_only += 1
-                        epoch_train_spec_only += recon_loss.numpy()
-                    
-                    # Total loss = reconstruction loss + beta * JS divergence
-                    # The JS divergence is already properly scaled in the compute_js_divergence function
-                    total_loss = recon_loss + beta * js_div
+                except Exception as e:
+                    print(f"❌ Loss computation error: {e}")
+                    continue
 
-                    # Check for NaNs
-                    if tf.math.is_nan(total_loss):
-                        print("❌ WARNING: NaN loss detected! Skipping gradient update.")
-                        continue
+                if missing_modality is None:
+                    recon_loss = spec_weight * spec_loss + desc_weight * desc_loss
+                    epoch_metrics['n_full'] += 1
+                    epoch_metrics['train_full'] += float(recon_loss)
+                elif missing_modality == 'spec':
+                    recon_loss = desc_loss
+                    epoch_metrics['n_desc_only'] += 1
+                    epoch_metrics['train_desc_only'] += float(recon_loss)
+                else:
+                    recon_loss = spec_loss
+                    epoch_metrics['n_spec_only'] += 1
+                    epoch_metrics['train_spec_only'] += float(recon_loss)
 
-                    # Gradient clipping to prevent extreme updates
-                    grads = tape.gradient(total_loss, model.trainable_variables)
-
-                    # Add gradient norm monitoring here
-                    grad_norm = tf.linalg.global_norm(grads)
-                    if tf.math.is_nan(grad_norm) or tf.math.is_inf(grad_norm):
-                        print(f"❌ WARNING: NaN/Inf gradient detected! Norm: {grad_norm}. Skipping update.")
-                        continue
-
-                    # Clip gradients to prevent exploding gradients
-                    clipped_grads, _ = tf.clip_by_global_norm(grads, 5.0)
-                    optimizer.apply_gradients(zip(clipped_grads, model.trainable_variables))
-
-                # Track losses
-                epoch_train_total += total_loss.numpy()
-                epoch_train_spec += spec_loss.numpy() if missing_modality != 'spec' else 0.0
-                epoch_train_desc += desc_loss.numpy() if missing_modality != 'desc' else 0.0
-                epoch_train_js += js_div.numpy()
-                train_steps += 1
-
-            # Compute average training losses for the epoch
-            if train_steps > 0:
-                train_total_losses.append(epoch_train_total / train_steps)
-                
-                # Handle potential division by zero for modality-specific metrics
-                train_spec_losses.append(epoch_train_spec / max(train_steps - n_desc_only, 1))
-                train_desc_losses.append(epoch_train_desc / max(train_steps - n_spec_only, 1))
-                train_js_losses.append(epoch_train_js / train_steps)
-                
-                # Track modality combination losses
-                modality_losses = {
-                    'full': epoch_train_full / max(n_full, 1),
-                    'spec_only': epoch_train_spec_only / max(n_spec_only, 1),
-                    'desc_only': epoch_train_desc_only / max(n_desc_only, 1)
-                }
-                train_mode_losses.append(modality_losses)
-            
-            # Debug information
-            print(f"✅ Train Loss: {train_total_losses[-1]:.4f} | "
-                  f"Spec: {train_spec_losses[-1]:.4f} | "
-                  f"Desc: {train_desc_losses[-1]:.4f} | " 
-                  f"JS: {train_js_losses[-1]:.4f}")
-            
-            if n_full > 0 or n_spec_only > 0 or n_desc_only > 0:
-                print(f"  📊 Modalities: Full={n_full}, Spec-only={n_spec_only}, Desc-only={n_desc_only}")
-
-            # Validation loop - no modality dropout during validation
-            epoch_val_total = 0.0
-            epoch_val_spec = 0.0
-            epoch_val_desc = 0.0
-            epoch_val_js = 0.0
-            val_steps = 0
-
-            for step, (spec_in, desc_in, test_id_in) in enumerate(val_dataset):
-                # Forward pass - use all modalities for validation
-                recon_spec, recon_desc, (all_mus, all_logvars, mixture_prior, js_div) = model(
-                    spec_in, desc_in, test_id_in, 
-                    training=False,
-                    missing_modality=None  # No dropout during validation
-                )
-
-                # Compute losses for each modality
-                spec_loss = complex_spectrogram_loss(spec_in, recon_spec)
-                desc_loss = weighted_descriptor_mse_loss(desc_in, recon_desc)
-                
-                # Combined reconstruction loss with the same weighting
-                recon_loss = spec_weight * spec_loss + desc_weight * desc_loss
-                
-                # Total loss with the same Beta value
                 total_loss = recon_loss + beta * js_div
 
-                # Track validation losses
-                epoch_val_total += total_loss.numpy()
-                epoch_val_spec += spec_loss.numpy()
-                epoch_val_desc += desc_loss.numpy()
-                epoch_val_js += js_div.numpy()
-                val_steps += 1
+                if tf.math.is_nan(total_loss) or tf.math.is_inf(total_loss):
+                    print("❌ WARNING: Invalid loss detected! Skipping gradient update.")
+                    continue
 
-            # Compute average validation losses
-            if val_steps > 0:
-                val_total_losses.append(epoch_val_total / val_steps)
-                val_spec_losses.append(epoch_val_spec / val_steps)
-                val_desc_losses.append(epoch_val_desc / val_steps)
-                val_js_losses.append(epoch_val_js / val_steps)
+            try:
+                grads = tape.gradient(total_loss, model.trainable_variables)
+                clipped_grads, grad_norm = tf.clip_by_global_norm(grads, 5.0)
+                optimizer.apply_gradients(zip(clipped_grads, model.trainable_variables))
+            except Exception as e:
+                print(f"❌ Gradient computation error: {e}")
+                continue
 
-            print(f"  🔵 Val => Total: {val_total_losses[-1]:.4f} | "
-                  f"Spec: {val_spec_losses[-1]:.4f} | "
-                  f"Desc: {val_desc_losses[-1]:.4f} | "
-                  f"JS: {val_js_losses[-1]:.4f}")
+            epoch_metrics['train_total'] += float(total_loss)
+            epoch_metrics['train_spec'] += float(spec_loss) if missing_modality != 'spec' else 0.0
+            epoch_metrics['train_desc'] += float(desc_loss) if missing_modality != 'desc' else 0.0
+            epoch_metrics['train_js'] += float(js_div)
+            epoch_metrics['train_steps'] += 1
 
-            # Early Stopping
-            current_val_loss = val_total_losses[-1]
-            if current_val_loss < best_val_loss:
-                best_val_loss = current_val_loss
-                no_improvement_count = 0
-                # Save best model weights
-                model.save_weights("results/best_spectral_mmvae.weights.h5")
-                print("✅ Saved best model weights")
-            else:
-                no_improvement_count += 1
-                print(f"🚨 No improvement for {no_improvement_count}/{patience} epochs.")
+        if epoch_metrics['train_steps'] > 0:
+            metrics['train_total'].append(epoch_metrics['train_total'] / epoch_metrics['train_steps'])
+            metrics['train_spec'].append(epoch_metrics['train_spec'] / max(epoch_metrics['train_steps'] - epoch_metrics['n_desc_only'], 1))
+            metrics['train_desc'].append(epoch_metrics['train_desc'] / max(epoch_metrics['train_steps'] - epoch_metrics['n_spec_only'], 1))
+            metrics['train_js'].append(epoch_metrics['train_js'] / epoch_metrics['train_steps'])
+            metrics['train_mode'].append({
+                'full': epoch_metrics['train_full'] / max(epoch_metrics['n_full'], 1),
+                'spec_only': epoch_metrics['train_spec_only'] / max(epoch_metrics['n_spec_only'], 1),
+                'desc_only': epoch_metrics['train_desc_only'] / max(epoch_metrics['n_desc_only'], 1)
+            })
 
-            # ✅ CLEAR MEMORY AFTER EACH EPOCH
-            print(f"✅ Finished epoch {epoch+1}, clearing memory...")
-            tf.keras.backend.clear_session()
-            gc.collect()
+            print(f"✅ Train Loss: {metrics['train_total'][-1]:.4f} | "
+                  f"Spec: {metrics['train_spec'][-1]:.4f} | "
+                  f"Desc: {metrics['train_desc'][-1]:.4f} | "
+                  f"JS: {metrics['train_js'][-1]:.4f}")
 
-            if no_improvement_count >= patience:
-                print(f"🛑 Early stopping triggered at epoch {epoch+1}. No improvement for {patience} epochs.")
-                model.save_weights("results/final_spectral_mmvae.weights.h5")
-                print("✅ Saved best model weights")
-                break
+        # Validation loop
+        epoch_val_metrics = {'total': 0.0, 'spec': 0.0, 'desc': 0.0, 'js': 0.0, 'steps': 0}
+        for step, (spec_in, desc_in, test_id_in) in enumerate(val_dataset):
+            recon_spec, recon_desc, (all_mus, all_logvars, mixture_prior, js_div) = model(
+                spec_in, desc_in, test_id_in, training=False, missing_modality=None)
 
-    return {
-        'train_total': train_total_losses,
-        'train_spec': train_spec_losses,
-        'train_desc': train_desc_losses,
-        'train_js': train_js_losses,
-        'train_mode': train_mode_losses,
-        'val_total': val_total_losses,
-        'val_spec': val_spec_losses,
-        'val_desc': val_desc_losses,
-        'val_js': val_js_losses
-    }
-  
+            spec_loss = complex_spectrogram_loss(spec_in, recon_spec)
+            desc_loss = weighted_descriptor_mse_loss(desc_in, recon_desc)
+            recon_loss = spec_weight * spec_loss + desc_weight * desc_loss
+            total_loss = recon_loss + beta * js_div
+
+            epoch_val_metrics['total'] += float(total_loss)
+            epoch_val_metrics['spec'] += float(spec_loss)
+            epoch_val_metrics['desc'] += float(desc_loss)
+            epoch_val_metrics['js'] += float(js_div)
+            epoch_val_metrics['steps'] += 1
+
+        if epoch_val_metrics['steps'] > 0:
+            metrics['val_total'].append(epoch_val_metrics['total'] / epoch_val_metrics['steps'])
+            metrics['val_spec'].append(epoch_val_metrics['spec'] / epoch_val_metrics['steps'])
+            metrics['val_desc'].append(epoch_val_metrics['desc'] / epoch_val_metrics['steps'])
+            metrics['val_js'].append(epoch_val_metrics['js'] / epoch_val_metrics['steps'])
+            print(f"  🔵 Val => Total: {metrics['val_total'][-1]:.4f} | "
+                  f"Spec: {metrics['val_spec'][-1]:.4f} | "
+                  f"Desc: {metrics['val_desc'][-1]:.4f} | "
+                  f"JS: {metrics['val_js'][-1]:.4f}")
+
+        current_val_loss = metrics['val_total'][-1]
+        if current_val_loss < best_val_loss:
+            best_val_loss = current_val_loss
+            no_improvement_count = 0
+            model.save_weights("results/best_spectral_mmvae.weights.h5")
+            print("✅ Saved best model weights")
+        else:
+            no_improvement_count += 1
+            print(f"🚨 No improvement for {no_improvement_count}/{patience} epochs.")
+
+        if no_improvement_count >= patience:
+            print(f"🛑 Early stopping triggered at epoch {epoch+1}. No improvement for {patience} epochs.")
+            model.save_weights("results/final_spectral_mmvae.weights.h5")
+            print("✅ Saved final model weights")
+            break
+
+    tf.keras.backend.clear_session()
+    gc.collect()
+
+    return metrics
+
 # ----- Visualization Functions and tests -----
 def plot_training_curves(metrics):
     """
@@ -2366,59 +2311,61 @@ def test_latent_interpolation(model, val_dataset, output_dir="results/interpolat
 # ----- Main Function -----
 def main():
     # Set debug mode
-    debug_mode = True
+    debug_mode = False
+    
     # ------------------------ 1) Configure Environment ------------------------
-    os.makedirs("results", exist_ok=True)
-    os.makedirs("results/model_checkpoints", exist_ok=True)
-    os.makedirs("results/latent_analysis", exist_ok=True)
-    os.makedirs("results/cross_modal", exist_ok=True)
+    os.makedirs("../results", exist_ok=True)
+    os.makedirs("../results/model_checkpoints", exist_ok=True)
+    os.makedirs("../results/latent_analysis", exist_ok=True)
+    os.makedirs("../results/cross_modal", exist_ok=True)
 
     sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     
     # ------------------------ 2) Define Parameters ------------------------
-    fs = 200  # Sampling frequency in Hz
+    fs = 200   # Sampling frequency in Hz
     nperseg = 256  # STFT segment length
-    noverlap = 224  # STFT overlap
+    noverlap = 224 # STFT overlap
     
-    latent_dim = 64 
+    latent_dim = 128 
     batch_size = 64  
-    num_epochs = 500 
-    patience = 400  
+    num_epochs = 800 
+    patience = 300  
 
     # Cached file paths
-    stft_path = "cached_stft.npy"
-    final_path = "cached_spectral_features.npy"
-    desc_path = "cached_descriptors.npy"
-    ids_path = "cached_test_ids.npy"
+    stft_path  = "scripts/cached_stft.npy"
+    final_path = "scripts/cached_spectral_features.npy"
+    desc_path  = "scripts/cached_descriptors.npy"
+    ids_path   = "scripts/cached_test_ids.npy"
 
-    # Variables for data
-    spectral_features = None
-    descriptor_segments = None
-    test_ids = None
+    # ------------------------ 3) Single Check: Are ALL caches present? ------------------------
+    all_cached = (
+        os.path.exists(final_path)
+        and os.path.exists(desc_path)
+        and os.path.exists(ids_path)
+    )
 
-    # ------------------------ 3) Load Cached Spectrograms ------------------------
-    if os.path.exists(final_path):
-        print(f"📂 Found cached spectrogram features: {final_path}")
-        spectral_features = np.load(final_path, mmap_mode='r')
-        print(f"✅ Loaded spectral features: {spectral_features.shape}")
+    if all_cached:
+        # ------------------------ A) ALL Cached: Load everything ------------------------
+        print("✅ All cached files found! Loading from disk...")
 
-    # ------------------------ 4) Load Cached Descriptors ------------------------
-    if os.path.exists(desc_path):
-        print(f"📂 Found cached descriptors: {desc_path}")
-        descriptor_segments = np.load(desc_path, mmap_mode='r')
-        print(f"✅ Loaded descriptors: {descriptor_segments.shape}")
+        spectral_features   = np.load(final_path)
+        descriptor_segments = np.load(desc_path)
+        test_ids            = np.load(ids_path)
 
-    # ------------------------ 5) Load Cached Test IDs ------------------------
-    if os.path.exists(ids_path):
-        print(f"📂 Found cached test IDs: {ids_path}")
-        test_ids = np.load(ids_path, mmap_mode='r')
-        print(f"✅ Loaded test IDs: {test_ids.shape}")
+        print(f"✅ spectral_features: {spectral_features.shape}")
+        print(f"✅ descriptor_segments: {descriptor_segments.shape}")
+        print(f"✅ test_ids: {test_ids.shape}")
 
-    # ------------------------ 6) Process Missing Data ------------------------
-    if spectral_features is None or descriptor_segments is None or test_ids is None:
-        print("⚠️ Some cached data is missing. Processing raw data...")
-        
-        # Load raw data
+        # Hard-coded shapes (adjust if needed). 
+        # Or if you prefer, read from descriptor_segments shape:
+        max_num_cracks = 770
+        desc_length    = 42
+
+    else:
+        # ------------------------ B) Missing Any Cache: Re-run entire pipeline ------------------------
+        print("⚠️ At least one cache file is missing. Recomputing EVERYTHING from scratch...")
+
+        # (1) Load raw data
         params = {
             'keypoint_count': 15,
             'max_gap': 3,
@@ -2428,7 +2375,6 @@ def main():
             'min_segment_length': 2,
             'line_thickness': 1,
         }
-
         print("📥 Loading raw data...")
         accel_dict, crack_dict, binary_masks, skeletons, padded_dict = data_loader.load_data(params)
 
@@ -2437,30 +2383,24 @@ def main():
         print(f"Loaded data for {len(accel_dict)} tests")
         print(f"Descriptor shape: {max_num_cracks} cracks x {desc_length} features")
 
-    else:
-        # This is a hardcoded standard -> needs to be changed to dynamic later
-        max_num_cracks = 770  
-        desc_length = 42      
+        # (2) Segment time series -> get raw_segments, descriptors, test_ids
+        print("✂️ Segmenting data...")
+        raw_segments, descriptor_segments, test_ids = segment_and_transform(accel_dict, padded_dict)
+        print(f"✅ Extracted {len(raw_segments)} segments")
 
-        # Only segment if descriptors or test IDs are missing
-        if descriptor_segments is None or test_ids is None:
-            print("✂️ Segmenting data...")
-            raw_segments, descriptor_segments, test_ids = segment_and_transform(accel_dict, padded_dict)
-            print(f"✅ Extracted {len(raw_segments)} segments")
-        
-            # Save segmented descriptors & test IDs
-            np.save(desc_path, descriptor_segments)
-            np.save(ids_path, test_ids)
-            print(f"✅ Saved descriptors to {desc_path}")
-            print(f"✅ Saved test IDs to {ids_path}")
+        # Save descriptors & test IDs for future use
+        np.save(desc_path, descriptor_segments)
+        np.save(ids_path, test_ids)
+        print(f"✅ Saved descriptors to {desc_path}")
+        print(f"✅ Saved test IDs to {ids_path}")
 
-        # Compute spectrograms only if missing
-        if spectral_features is None:
-            print("🔄 Computing spectrograms...")
-            complex_specs = compute_and_cache_spectrograms(raw_segments, fs, nperseg, noverlap, cache_path=stft_path)
-            
-            print("📝 Converting spectrograms to features...")
-            spectral_features = cache_final_features(complex_specs, cache_path=final_path)
+        # (3) Compute STFT -> complex spectrograms
+        print("🔄 Computing spectrograms...")
+        complex_specs = compute_and_cache_spectrograms(raw_segments, fs, nperseg, noverlap, cache_path=stft_path)
+
+        # (4) Convert spectrograms to magnitude/phase features
+        print("📝 Converting spectrograms to features...")
+        spectral_features = cache_final_features(complex_specs, cache_path=final_path)
 
     # ------------------------ 7) Split Data ------------------------
     N = spectral_features.shape[0]
@@ -2468,19 +2408,27 @@ def main():
     train_size = int(0.8 * N)
     train_idx, val_idx = indices[:train_size], indices[train_size:]
 
-    train_desc, train_ids = descriptor_segments[train_idx], test_ids[train_idx]
-    val_desc, val_ids = descriptor_segments[val_idx], test_ids[val_idx]
+    # Slice the cached arrays (they are NumPy arrays now)
+    train_spec = spectral_features[train_idx]
+    val_spec = spectral_features[val_idx]
+    train_desc = descriptor_segments[train_idx]
+    train_ids  = test_ids[train_idx]
+    val_desc   = descriptor_segments[val_idx]
+    val_ids    = test_ids[val_idx]
+
+    print(f"Training set: {train_spec.shape[0]} samples")
+    print(f"Validation set: {val_spec.shape[0]} samples")
 
     # ------------------------ 8) Create TensorFlow Datasets ------------------------
-    train_dataset = create_tf_dataset(final_path, train_desc, train_ids, batch_size, debug_mode=debug_mode)
-    val_dataset = create_tf_dataset(final_path, val_desc, val_ids, batch_size, debug_mode=debug_mode)
+    train_dataset = create_tf_dataset(train_spec, train_desc, train_ids, batch_size, debug_mode=debug_mode)
+    val_dataset   = create_tf_dataset(val_spec, val_desc, val_ids, batch_size, debug_mode=debug_mode)
 
     print(f"✅ Train batches: {sum(1 for _ in train_dataset)}")
     print(f"✅ Val batches: {sum(1 for _ in val_dataset)}")
 
+
     # ------------------------ 9) Build Model ------------------------
     spec_shape = spectral_features.shape[1:]  
-
     print(f"📐 Building model with:")
     print(f"  - Latent dimension: {latent_dim}")
     print(f"  - Spectrogram shape: {spec_shape}")
@@ -2488,13 +2436,12 @@ def main():
 
     model = SpectralMMVAE(latent_dim, spec_shape, max_num_cracks, desc_length)
 
-    # Build the model with a dummy forward pass before creating the optimizer
+    # Build with a dummy forward pass
     dummy_spec = tf.zeros((1, *spec_shape))
     dummy_desc = tf.zeros((1, max_num_cracks, desc_length))
     _ = model(dummy_spec, dummy_desc, training=True)
     print("✅ Model built successfully with dummy inputs")
 
-    # Now create the optimizer
     # ------------------------ 10) Set Up Optimizer ------------------------
     lr_schedule = ExponentialDecay(
         initial_learning_rate=5e-5,
@@ -2502,10 +2449,9 @@ def main():
         decay_rate=0.9,
         staircase=True
     )
-    # consider using RAdam if AndamW doesnt work
     optimizer = keras.optimizers.AdamW(
         learning_rate=lr_schedule,
-        weight_decay=1e-5,
+        weight_decay=1e-4,
         beta_1=0.9,
         beta_2=0.999,
         epsilon=1e-6
@@ -2520,18 +2466,16 @@ def main():
         optimizer, 
         num_epochs=num_epochs, 
         patience=patience,
-        beta_schedule='linear',
-        modality_dropout_prob=0.15  # Enable modality dropout
+        beta_schedule='cyclical',
+        modality_dropout_prob=0.05
     )
 
     # ------------------------ 12) Save & Visualize Training Results ------------------------
     np.save("results/training_metrics.npy", training_metrics)
-    
-    # Use new, enhanced plotting function
     plot_training_curves(training_metrics)
 
     # ------------------------ 13) Load Best Model ------------------------
-    best_weights_path = "results/best_spectral_mmvae.weights.h5"
+    best_weights_path  = "results/best_spectral_mmvae.weights.h5"
     final_weights_path = "results/final_spectral_mmvae.weights.h5"
 
     if os.path.exists(best_weights_path):
@@ -2544,28 +2488,20 @@ def main():
         print("⚠️ No saved weights found, using model from last epoch")
 
     # ------------------------ 14) Evaluate Latent Space ------------------------
-    # A) First use your original latent visualization
     latent_vectors, test_ids_arr = extract_latent_representations(model, train_dataset)
     latent_3d = reduce_latent_dim_umap(latent_vectors)
     plot_latent_space_3d(latent_3d, test_ids_arr, output_file="results/latent_space_3d.html")
     
-    # B) Then use the new, enhanced latent visualization (provides more detailed analysis)
     latent_data = visualize_latent_structure(model, val_dataset, n_samples=500)
-    
-    # C) Evaluate modality alignment in latent space
     alignment_metrics = evaluate_modality_alignment(latent_data)
     print("Modality Alignment Metrics:")
     for metric, value in alignment_metrics.items():
         print(f"  - {metric}: {value:.4f}")
 
     # ------------------------ 15) Evaluate Reconstructions and Cross-Modal Generation ------------------------
-    # A) Your original reconstruction visualization
     visualize_reconstructions(model, val_dataset, data_loader, num_samples=5, fs=fs, nperseg=nperseg, noverlap=noverlap)
-    
-    # B) New cross-modal generation evaluation (spec→desc and desc→spec)
     evaluate_cross_modal_generation(model, val_dataset, data_loader, n_samples=5)
     
-    # C) Test performance with missing modalities
     missing_modality_metrics = evaluate_missing_modality(model, val_dataset, n_samples=10)
     print("Missing Modality Performance:")
     print(f"  - Spectrogram (full): {missing_modality_metrics['spec_full']:.4f}")
@@ -2574,10 +2510,7 @@ def main():
     print(f"  - Descriptor (missing spec): {missing_modality_metrics['desc_miss']:.4f}")
 
     # ------------------------ 16) Generate New Samples ------------------------
-    # A) Use your original sample generation function
     generate_samples(model, data_loader, num_samples=5, fs=fs, nperseg=nperseg, noverlap=noverlap)
-    
-    # B) Use new interpolation-based generation example
     test_latent_interpolation(model, val_dataset,"results/samples")
 
     print("✅ Training & evaluation complete. Results saved in 'results/' directory.")
