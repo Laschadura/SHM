@@ -10,5 +10,7 @@ debug_images/
 evaluation_plots/
 best_params_validation/
 correlation_results/
-Euler_MMVAE/
+Euler_MMVAE/data
 clean_env_mirror/
+DataGenMethods/
+polyline_reconstruction_results/
