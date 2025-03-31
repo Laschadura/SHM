@@ -9,7 +9,7 @@ import numpy as np
 import cv2
 import keras
 from keras import layers, Model, optimizers
-from keras.optimizers.schedules import ExponentialDecay  
+from keras.optimizers.schedules import ExponentialDecay, CosineDecayRestarts  
 from scipy import signal
 import matplotlib.pyplot as plt
 import plotly.graph_objects as go
@@ -75,8 +75,6 @@ def clear_gpu_memory():
     gc.collect()
 
 def print_detailed_memory():
-    import psutil
-    import GPUtil
     process = psutil.Process()
     
     # RAM details
@@ -141,26 +139,26 @@ def load_and_prepare_data():
 
 def segment_and_transform(
     accel_dict, 
-    descriptor_dict,
+    mask_dict,
     chunk_size=1, 
     sample_rate=200, 
     segment_duration=5.0, 
     percentile=99
-):
+    ):
     """
     Extracts segments from time series data centered around peak RMS values.
-    Returns raw segments and their corresponding descriptors.
+    Returns raw segments and their corresponding binary masks.
     
     Args:
-        accel_dict: Dictionary mapping test IDs to time series data
-        descriptor_dict: Dictionary mapping test IDs to descriptor data
-        chunk_size: Number of test IDs to process in one batch
-        sample_rate: Sampling rate of the time series data (Hz)
-        segment_duration: Duration of each segment (seconds)
-        percentile: Percentile threshold for peak detection
+        accel_dict: Dictionary mapping test IDs to time series data.
+        mask_dict: Dictionary mapping test IDs to binary mask data.
+        chunk_size: Number of test IDs to process in one batch.
+        sample_rate: Sampling rate of the time series data (Hz).
+        segment_duration: Duration of each segment (seconds).
+        percentile: Percentile threshold for peak detection.
         
     Returns:
-        Tuple of arrays: (raw_segments, descriptor_segments, test_ids)
+        Tuple of arrays: (raw_segments, mask_segments, test_ids)
     """
     window_size = int(sample_rate * segment_duration)
     half_window = window_size // 2
@@ -169,7 +167,7 @@ def segment_and_transform(
     
     # Instead of yield, we'll collect all data and return it at once
     all_raw_segments = []
-    all_descriptor_segments = []
+    all_mask_segments = []
     all_test_ids = []
     
     # Dictionary to count segments per test ID for debugging
@@ -179,17 +177,17 @@ def segment_and_transform(
         chunk_ids = test_ids[i:i + chunk_size]
         
         for test_id in chunk_ids:
-            if test_id not in descriptor_dict:
-                print(f"Warning: Test ID {test_id} not found in descriptor_dict; skipping.")
+            if test_id not in mask_dict:
+                print(f"Warning: Test ID {test_id} not found in mask_dict; skipping.")
                 continue
 
-            # Debug: print out the shape (or length) of the descriptor for this test
-            desc_val = descriptor_dict[test_id]
+            # Debug: print out the shape of the mask for this test
+            mask_val = mask_dict[test_id]
             try:
-                desc_shape = np.array(desc_val).shape
+                mask_shape = np.array(mask_val).shape
             except Exception:
-                desc_shape = "unknown"
-            print(f"Processing Test ID {test_id}: descriptor shape = {desc_shape}")
+                mask_shape = "unknown"
+            print(f"Processing Test ID {test_id}: mask shape = {mask_shape}")
             
             all_ts = accel_dict[test_id]
             
@@ -213,7 +211,7 @@ def segment_and_transform(
                     segment_raw = ts_raw[start:end, :]
                     
                     all_raw_segments.append(segment_raw)
-                    all_descriptor_segments.append(descriptor_dict[test_id])
+                    all_mask_segments.append(mask_dict[test_id])
                     all_test_ids.append(int(test_id))
                     
                     seg_counts[test_id] = seg_counts.get(test_id, 0) + 1
@@ -225,13 +223,13 @@ def segment_and_transform(
     
     # Convert lists to numpy arrays
     raw_segments = np.array(all_raw_segments, dtype=np.float32)
-    descriptor_segments = np.array(all_descriptor_segments, dtype=np.float32)
+    mask_segments = np.array(all_mask_segments, dtype=np.float32)
     test_ids = np.array(all_test_ids, dtype=np.int32)
     
     print(f"Extracted {len(raw_segments)} segments, each with a corresponding test ID.")
     print(f"Number of unique test IDs in segmentation: {len(unique_test_ids)}")
     
-    return raw_segments, descriptor_segments, test_ids
+    return raw_segments, mask_segments, test_ids
 
 def compute_and_cache_spectrograms(raw_segments, fs=200, nperseg=256, noverlap=192, cache_path="cached_spectrograms.npy"):
     """
@@ -260,7 +258,7 @@ def compute_complex_spectrogram(
     fs=200,
     nperseg=128,   # Adjusted window size (was 256)
     noverlap=64     # Adjusted overlap (was 192)
-):
+    ):
     """
     Compute STFT-based spectrograms with debugging.
     
@@ -520,70 +518,29 @@ class SpectrogramEncoder(tf.keras.Model):
         return mu, logvar
     
 # ----- Keep DescriptorEncoder from original implementation -----
-class DescriptorEncoder(tf.keras.Model):
-    """
-    Encoder for crack descriptor data.
-    Input shape: (batch_size, max_num_cracks=770, desc_length=42)
-    Output: Mean and logvariance for latent distribution.
-    """
+class MaskEncoder(tf.keras.Model):
     def __init__(self, latent_dim):
         super().__init__()
-        
-        # First 1D convolutional layer
-        self.conv1 = layers.Conv1D(64, 3, padding='same', activation='relu')
-        self.bn1 = layers.BatchNormalization()
-        self.drop1 = layers.Dropout(0.3)
-        
-        # Second 1D convolutional layer
-        self.conv2 = layers.Conv1D(128, 3, padding='same', activation='relu')
-        self.bn2 = layers.BatchNormalization()
-        self.drop2 = layers.Dropout(0.3)
-        
-        # Global pooling for variable input lengths
-        self.global_pool = layers.GlobalMaxPooling1D()
-        
-        # Dense layers for encoding
-        self.dense1 = layers.Dense(256, activation='relu')
-        self.drop3 = layers.Dropout(0.3)
-        
-        # Latent projections
+        # Use 2D convolution layers to progressively downsample the mask
+        self.conv1 = layers.Conv2D(16, 3, strides=2, padding='same', activation='relu')
+        self.conv2 = layers.Conv2D(32, 3, strides=2, padding='same', activation='relu')
+        self.conv3 = layers.Conv2D(64, 3, strides=2, padding='same', activation='relu')
+        self.flatten = layers.Flatten()
+        self.dense = layers.Dense(256, activation='relu')
         self.mu_layer = layers.Dense(latent_dim)
         self.logvar_layer = layers.Dense(latent_dim)
-
+    
     def call(self, x, training=False):
-        """
-        x shape: (batch, max_num_cracks, desc_length)
-        """
-        # Create a mask for valid descriptors (non-zero entries)
-        # This assumes zeros indicate padding
-        input_mask = tf.reduce_any(tf.not_equal(x, 0), axis=-1)
-        input_mask = tf.cast(input_mask, dtype=tf.float32)
-        input_mask = tf.expand_dims(input_mask, axis=-1)
-        
-        # Apply convolutions with masking to ignore padded entries
+        # x shape: (batch, height, width, channels), e.g., (batch, 256, 768, 1)
         x = self.conv1(x)
-        x = self.bn1(x, training=training)
-        x = x * input_mask  # Apply mask
-        x = self.drop1(x, training=training)
-        
         x = self.conv2(x)
-        x = self.bn2(x, training=training)
-        x = x * input_mask  # Apply mask
-        x = self.drop2(x, training=training)
-        
-        # Global pooling across crack descriptors
-        x = self.global_pool(x)
-        
-        # Dense encoding
-        x = self.dense1(x)
-        x = self.drop3(x, training=training)
-        
-        # Output distribution parameters
+        x = self.conv3(x)
+        x = self.flatten(x)
+        x = self.dense(x)
         mu = self.mu_layer(x)
         logvar = self.logvar_layer(x)
-        
         return mu, logvar
-
+    
 # ----- Decoders -----
 class SpectrogramDecoder(tf.keras.Model):
     """
@@ -679,100 +636,39 @@ class SpectrogramDecoder(tf.keras.Model):
         
         return x
        
-class DescriptorDecoder(tf.keras.Model):
-    """
-    Decoder for crack descriptor data.
-    Input: latent vector z
-    Output shape: (batch_size, max_num_cracks=770, desc_length=42)
-    """
-    def __init__(self, max_num_cracks=770, desc_length=42):
+class MaskDecoder(tf.keras.Model):
+    def __init__(self, latent_dim, output_shape):
         super().__init__()
-        self.max_num_cracks = max_num_cracks
-        self.desc_length = desc_length
-        
-        # Project latent to initial dense representation
-        self.fc1 = layers.Dense(256, activation='relu')
-        self.bn1 = layers.BatchNormalization()
-        self.drop1 = layers.Dropout(0.3)
-        
-        # Project to shape that can be reshaped to (batch, max_cracks/10, 10*hidden_dim)
-        # We'll reshape and then use Conv1DTranspose to expand
-        hidden_dim = 64
-        self.reshaped_cracks = max_num_cracks // 10  # Compress by factor of 10
-        self.fc2 = layers.Dense(self.reshaped_cracks * hidden_dim * 10, activation='relu')
-        self.bn2 = layers.BatchNormalization()
-        self.drop2 = layers.Dropout(0.3)
-        
-        # Reshape layer
-        self.reshape = layers.Reshape((self.reshaped_cracks, hidden_dim * 10))
-        
-        # Upsampling with Conv1DTranspose
-        self.conv_t1 = layers.Conv1DTranspose(128, 3, strides=2, padding='same', activation='relu')
-        self.bn3 = layers.BatchNormalization()
-        self.drop3 = layers.Dropout(0.3)
-        
-        self.conv_t2 = layers.Conv1DTranspose(64, 3, strides=2, padding='same', activation='relu')
-        self.bn4 = layers.BatchNormalization()
-        self.drop4 = layers.Dropout(0.3)
-        
-        # Final projection to descriptor space
-        self.conv_t3 = layers.Conv1DTranspose(32, 3, strides=2, padding='same', activation='relu')
-        self.bn5 = layers.BatchNormalization()
-        self.drop5 = layers.Dropout(0.3)
-        
-        # Output layer - no activation as descriptors can have any range of values
-        self.output_layer = layers.Conv1D(desc_length, 1, padding='same')
-
+        self.latent_dim = latent_dim
+        self.out_shape = output_shape  # e.g., (256, 768, 1)
+        # Calculate spatial dimensions after 3 downsampling steps (assuming factor of 2 each)
+        self.down_height = output_shape[0] // 8
+        self.down_width  = output_shape[1] // 8
+        self.fc = layers.Dense(self.down_height * self.down_width * 128, activation='relu')
+        self.reshape_layer = layers.Reshape((self.down_height, self.down_width, 128))
+        self.conv_t1 = layers.Conv2DTranspose(64, 3, strides=2, padding='same', activation='relu')
+        self.conv_t2 = layers.Conv2DTranspose(32, 3, strides=2, padding='same', activation='relu')
+        self.conv_t3 = layers.Conv2DTranspose(16, 3, strides=2, padding='same', activation='relu')
+        self.output_layer = layers.Conv2D(1, 3, padding='same', activation='sigmoid')
+    
     def call(self, z, training=False):
-        # Initial dense projection
-        x = self.fc1(z)
-        x = self.bn1(x, training=training)
-        x = self.drop1(x, training=training)
-        
-        # Project to reshapable dimension
-        x = self.fc2(x)
-        x = self.bn2(x, training=training)
-        x = self.drop2(x, training=training)
-        
-        # Reshape to begin 1D convolution sequence
-        x = self.reshape(x)
-        
-        # Upsample with transposed convolutions
+        x = self.fc(z)
+        x = self.reshape_layer(x)
         x = self.conv_t1(x)
-        x = self.bn3(x, training=training)
-        x = self.drop3(x, training=training)
-        
         x = self.conv_t2(x)
-        x = self.bn4(x, training=training)
-        x = self.drop4(x, training=training)
-        
         x = self.conv_t3(x)
-        x = self.bn5(x, training=training)
-        x = self.drop5(x, training=training)
-        
-        # Final output projection to descriptor space
         x = self.output_layer(x)
-        
-        # Apply padding and truncation to match expected output shape
-        current_shape = tf.shape(x)[1]
-        if current_shape < self.max_num_cracks:
-            # Pad with zeros if we have fewer than max_num_cracks
-            paddings = [[0, 0], [0, self.max_num_cracks - current_shape], [0, 0]]
-            x = tf.pad(x, paddings)
-        elif current_shape > self.max_num_cracks:
-            # Truncate if we have more than max_num_cracks
-            x = x[:, :self.max_num_cracks, :]
-        
+        # x shape will be (batch, 256, 768, 1)
         return x
-
+    
 # ----- Loss Functions -----
 def weighted_descriptor_mse_loss(y_true, y_pred):
     """
     MSE loss for descriptor reconstruction that only considers non-zero (valid) elements.
     
     Args:
-        y_true: Ground truth descriptor array [batch, max_cracks, desc_length]
-        y_pred: Predicted descriptor array [batch, max_cracks, desc_length]
+        y_true: Ground truth descriptor array [batch, max_cracks, mask_length]
+        y_pred: Predicted descriptor array [batch, max_cracks, mask_length]
         
     Returns:
         Weighted MSE loss
@@ -875,7 +771,7 @@ def complex_spectrogram_loss(y_true, y_pred):
 
 def dynamic_weighting(epoch, max_epochs, min_weight=0.3, max_weight=0.7):
     """
-    Gradually adjusts the weight between spectrogram and descriptor losses.
+    Gradually adjusts the weight between spectrogram and mask losses.
     
     Args:
         epoch: Current epoch
@@ -943,6 +839,210 @@ def get_beta_schedule(epoch, max_epochs, schedule_type='cyclical'):
     else:
         raise ValueError(f"Unknown schedule_type: {schedule_type}")
 
+def binary_mask_loss_fixed(y_true, y_pred):
+    """
+    Robust binary crossentropy that guarantees positive values.
+    Provides detailed debugging information when issues occur.
+    
+    Args:
+        y_true: Ground truth mask [batch, height, width, 1]
+        y_pred: Predicted mask [batch, height, width, 1]
+        
+    Returns:
+        Positive BCE loss scalar
+    """
+    # Ensure predictions are in valid range
+    epsilon = tf.keras.backend.epsilon()
+    y_pred = tf.clip_by_value(y_pred, epsilon, 1.0 - epsilon)
+    
+    # Implement BCE manually to have more control
+    bce = -(y_true * tf.math.log(y_pred) + (1.0 - y_true) * tf.math.log(1.0 - y_pred))
+    
+    # Calculate mean and check for validity
+    mean_bce = tf.reduce_mean(bce)
+    
+    # Add assertion to catch problems
+    with tf.control_dependencies([
+        tf.debugging.assert_non_negative(
+            mean_bce,
+            message="BCE loss became negative, check your inputs and model"
+        )
+    ]):
+        # Force positive - just to be absolutely sure
+        return tf.abs(mean_bce)
+
+def binary_dice_loss(y_true, y_pred):
+    """
+    Dice loss for binary segmentation, great for sparse masks.
+    Always returns a positive value between 0 and 1.
+    
+    Args:
+        y_true: Ground truth mask [batch, height, width, 1]
+        y_pred: Predicted mask [batch, height, width, 1]
+        
+    Returns:
+        Dice loss (1 - Dice coefficient)
+    """
+    # Flatten the tensors
+    y_true_f = tf.reshape(y_true, [-1])
+    y_pred_f = tf.reshape(y_pred, [-1])
+    
+    # Ensure predictions are in valid range
+    epsilon = tf.keras.backend.epsilon()
+    y_pred_f = tf.clip_by_value(y_pred_f, epsilon, 1.0 - epsilon)
+    
+    # Calculate intersection and union
+    intersection = tf.reduce_sum(y_true_f * y_pred_f)
+    union = tf.reduce_sum(y_true_f) + tf.reduce_sum(y_pred_f)
+    
+    # Add smoothing term to avoid division by zero
+    smooth = 1.0
+    dice_coefficient = (2.0 * intersection + smooth) / (union + smooth)
+    
+    # Dice loss (ranges from 0 to 1)
+    dice_loss = 1.0 - dice_coefficient
+    
+    return dice_loss
+
+def robust_mask_loss(y_true, y_pred):
+    """
+    Ultra-robust mask loss function that handles extreme values and invalid outputs.
+    This is designed to be extremely defensive against all possible issues.
+    
+    Args:
+        y_true: Ground truth mask [batch, height, width, 1]
+        y_pred: Predicted mask probabilities [batch, height, width, 1]
+        
+    Returns:
+        Guaranteed positive loss value
+    """
+    try:
+        # 1. First, aggressively clip predictions to valid probability range
+        epsilon = 1e-7
+        y_pred_safe = tf.clip_by_value(y_pred, epsilon, 1.0 - epsilon)
+        
+        # 2. Check for NaNs or Infs in predictions
+        if tf.reduce_any(tf.math.is_nan(y_pred)) or tf.reduce_any(tf.math.is_inf(y_pred)):
+            tf.print("⚠️ WARNING: NaN or Inf detected in predictions, using safe defaults")
+            # Create a safe default prediction (all 0.5)
+            y_pred_safe = tf.ones_like(y_true) * 0.5
+        
+        # 3. Implement BCE manually with extreme care
+        bce = -(y_true * tf.math.log(y_pred_safe) + (1.0 - y_true) * tf.math.log(1.0 - y_pred_safe))
+        
+        # 4. Check each value and replace any problematic ones
+        bce_clean = tf.where(
+            tf.math.is_finite(bce),  # Keep only finite values
+            bce,                      # Use original where valid
+            tf.ones_like(bce) * 0.5   # Replace bad values with moderate constant
+        )
+        
+        # 5. Calculate Dice loss as alternative
+        y_true_f = tf.reshape(y_true, [-1])
+        y_pred_f = tf.reshape(y_pred_safe, [-1])
+        
+        intersection = tf.reduce_sum(y_true_f * y_pred_f)
+        smooth = 1.0  # Larger smoothing factor for stability
+        dice_coef = (2.0 * intersection + smooth) / (tf.reduce_sum(y_true_f) + tf.reduce_sum(y_pred_f) + smooth)
+        dice_loss = 1.0 - dice_coef
+        
+        # 6. Ensure dice loss is valid
+        dice_loss = tf.where(
+            tf.math.is_finite(dice_loss),
+            dice_loss,
+            tf.constant(0.5, dtype=tf.float32)
+        )
+        
+        # 7. Take mean of BCE (carefully)
+        bce_mean = tf.reduce_mean(bce_clean)
+        
+        # 8. Calculate final combined loss
+        combined_loss = 0.5 * bce_mean + 0.5 * dice_loss
+        
+        # 9. Final safety check - ensure the result is positive
+        combined_loss = tf.maximum(combined_loss, epsilon)
+        
+        # 10. Print diagnostics
+        tf.print("BCE:", bce_mean, "Dice:", dice_loss, "Combined:", combined_loss,
+                 "Min pred:", tf.reduce_min(y_pred), "Max pred:", tf.reduce_max(y_pred),
+                 output_stream=sys.stdout)
+        
+        return combined_loss
+        
+    except Exception as e:
+        # Absolute last resort - return a constant loss to keep training going
+        tf.print("❌ CRITICAL ERROR in loss calculation:", e, output_stream=sys.stderr)
+        return tf.constant(1.0, dtype=tf.float32)
+
+def get_model_stats(model):
+    """
+    Function to check model weights for potential issues.
+    
+    Args:
+        model: Keras model
+        
+    Returns:
+        Text summary of weight statistics
+    """
+    stats = []
+    for i, layer in enumerate(model.layers):
+        if len(layer.weights) > 0:
+            for j, w in enumerate(layer.weights):
+                w_np = w.numpy()
+                w_min = np.min(w_np)
+                w_max = np.max(w_np)
+                w_mean = np.mean(w_np)
+                w_std = np.std(w_np)
+                
+                # Check for extreme values
+                if w_max > 100 or w_min < -100 or w_std > 10:
+                    status = "⚠️ EXTREME"
+                else:
+                    status = "✓ OK"
+                
+                stats.append(f"Layer {i} ({layer.name}) Weight {j}: min={w_min:.4f}, max={w_max:.4f}, mean={w_mean:.4f}, std={w_std:.4f} {status}")
+    
+    return "\n".join(stats)
+
+def sparse_focal_loss(y_true, y_pred, gamma=2.0, alpha=0.25):
+    """
+    Focal loss for highly imbalanced masks (very few positive pixels).
+    
+    Args:
+        y_true: Ground truth mask [batch, height, width, 1]
+        y_pred: Predicted mask [batch, height, width, 1]
+        gamma: Focusing parameter (higher means more focus on hard examples)
+        alpha: Balancing parameter (higher means more weight on positive class)
+        
+    Returns:
+        Focal loss (always positive)
+    """
+    # Ensure predictions are in valid range
+    epsilon = tf.keras.backend.epsilon()
+    y_pred = tf.clip_by_value(y_pred, epsilon, 1.0 - epsilon)
+    
+    # Convert to logits if not already (TF's built-in BCE with logits is more stable)
+    if not tf.is_tensor(y_pred) or y_pred.dtype != tf.float32:
+        y_pred = tf.convert_to_tensor(y_pred, dtype=tf.float32)
+    
+    # Calculate pt (probability of true class)
+    pt = tf.where(tf.equal(y_true, 1), y_pred, 1 - y_pred)
+    
+    # Calculate focal weight
+    focal_weight = tf.pow(1.0 - pt, gamma)
+    
+    # Calculate alpha weight (class balancing)
+    alpha_weight = tf.where(tf.equal(y_true, 1), alpha, 1 - alpha)
+    
+    # Calculate crossentropy
+    bce = -tf.math.log(pt)
+    
+    # Apply weights
+    loss = alpha_weight * focal_weight * bce
+    
+    # Return mean
+    return tf.reduce_mean(loss)
+
 # ----- Spectral MMVAE Model -----
 class SpectralMMVAE(tf.keras.Model):
     """
@@ -951,60 +1051,61 @@ class SpectralMMVAE(tf.keras.Model):
     
     Modalities:
     1. Complex spectrograms (from time series)
-    2. Crack descriptors
+    2. binary Mask
     """
-    def __init__(self, latent_dim, spec_shape, max_num_cracks=770, desc_length=42):
+    def __init__(self, latent_dim, spec_shape, mask_dim):
         super().__init__()
         
         # Store shapes and latent dimension
         self.latent_dim = latent_dim
         self.spec_shape = spec_shape
-        self.max_num_cracks = max_num_cracks
-        self.desc_length = desc_length
+        self.mask_dim = mask_dim
         
         # Encoders
         self.spec_encoder = SpectrogramEncoder(latent_dim)
-        self.desc_encoder = DescriptorEncoder(latent_dim)
+        self.mask_encoder = MaskEncoder(latent_dim)
         
         # Decoders
-        # spec_shape = (freq_bins, time_bins, channels*2)
-        # So each "original channel" is actually spec_shape[2]//2
         self.spec_decoder = SpectrogramDecoder(
             freq_bins=spec_shape[0],
             time_bins=spec_shape[1],
             channels=spec_shape[2] // 2
         )
-        self.desc_decoder = DescriptorDecoder(
-            max_num_cracks=max_num_cracks,
-            desc_length=desc_length
-        )
+        self.mask_decoder = MaskDecoder(latent_dim, mask_dim)
 
-    def call(self, spec_in, desc_in, test_id=None, training=False, missing_modality=None):
+    def call(self, spec_in, mask_in, test_id=None, training=False, missing_modality=None):
         """
         Forward pass for the Mixture-of-Experts MMVAE approach:
-         1) Encode each modality -> mu, logvar
-         2) Compute MoE prior as mixture of unimodal posteriors
-         3) Compute JS divergence between unimodal posteriors and mixture prior
-         4) Sample from each unimodal posterior
-         5) Decode each modality from its own sample
-         6) Return reconstructions + JS divergence and mixture prior
-        
+        1) Encode each modality to obtain μ (mu) and log-variance (logvar)
+        2) Compute the Mixture-of-Experts (MoE) prior as a mixture of the unimodal posteriors
+        3) Compute the JS divergence between the unimodal posteriors and the mixture prior
+        4) Sample from each unimodal posterior (or from the mixture if a modality is missing)
+        5) Decode each modality from its corresponding latent sample
+        6) Return the reconstructed spectrogram and mask, along with the distribution parameters and JS divergence
+
         Args:
-            spec_in: Input spectrogram
-            desc_in: Input descriptor
-            test_id: Test ID (optional)
-            training: Whether in training mode
-            missing_modality: Optional string indicating which modality is missing ('spec' or 'desc')
-            
+            spec_in: Input spectrogram.
+            mask_in: Input binary mask (crack mask) with shape (height, width, channels).
+            test_id: Optional test identifier.
+            training: Boolean indicating whether the model is in training mode.
+            missing_modality: Optional string indicating which modality is missing ('spec' or 'mask').
+
         Returns:
-            Tuple of (recon_spec, recon_desc, (mus, logvars, mixture_prior, js_div))
+            A tuple of:
+                - recon_spec: Reconstructed spectrogram.
+                - recon_mask: Reconstructed binary mask.
+                - (all_mus, all_logvars, mixture_prior, js_div): A tuple containing:
+                    * all_mus: List of latent means.
+                    * all_logvars: List of latent log-variances.
+                    * mixture_prior: The computed MoE prior as a tuple (mixture_mu, mixture_logvar).
+                    * js_div: The computed JS divergence loss term.
         """
         # Track available modalities
         available_modalities = []
         if missing_modality != 'spec':
             available_modalities.append('spec')
-        if missing_modality != 'desc':
-            available_modalities.append('desc')
+        if missing_modality != 'mask':
+            available_modalities.append('mask')
         
         # 1) Encode available modalities
         mus = []
@@ -1015,10 +1116,10 @@ class SpectralMMVAE(tf.keras.Model):
             mus.append(mu_spec)
             logvars.append(logvar_spec)
         
-        if 'desc' in available_modalities:
-            mu_desc, logvar_desc = self.desc_encoder(desc_in, training=training)
-            mus.append(mu_desc)
-            logvars.append(logvar_desc)
+        if 'mask' in available_modalities:
+            mu_mask, logvar_mask = self.mask_encoder(mask_in, training=training)
+            mus.append(mu_mask)
+            logvars.append(logvar_mask)
         
         # 2) Compute MoE prior parameters
         mixture_mu, mixture_logvar = compute_mixture_prior(mus, logvars)
@@ -1032,7 +1133,7 @@ class SpectralMMVAE(tf.keras.Model):
         
         # Handle missing modalities by imputing from the mixture
         if missing_modality == 'spec':
-            # Impute spectrogram modality from the descriptor modality
+            # Impute spectrogram modality from the mixture
             z_spec = reparameterize(mixture_mu, mixture_logvar)
             # Add placeholders to keep indices consistent
             all_mus.insert(0, mixture_mu)
@@ -1041,23 +1142,23 @@ class SpectralMMVAE(tf.keras.Model):
             # Sample spectrogram latent from its posterior
             z_spec = reparameterize(mu_spec, logvar_spec)
         
-        if missing_modality == 'desc':
-            # Impute descriptor modality from the spectrogram modality
-            z_desc = reparameterize(mixture_mu, mixture_logvar)
+        if missing_modality == 'mask':
+            # Impute mask modality from the mixture
+            z_mask = reparameterize(mixture_mu, mixture_logvar)
             # Add placeholders to keep indices consistent
             all_mus.append(mixture_mu)
             all_logvars.append(mixture_logvar)
         else:
-            # Sample descriptor latent from its posterior
-            z_desc = reparameterize(mu_desc, logvar_desc)
+            # Sample mask latent from its posterior
+            z_mask = reparameterize(mu_mask, logvar_mask)
         
         # 4) Decode
         recon_spec = self.spec_decoder(z_spec, training=training)
-        recon_desc = self.desc_decoder(z_desc, training=training)
+        recon_mask = self.mask_decoder(z_mask, training=training)
         
         # 5) Return outputs
         mixture_prior = (mixture_mu, mixture_logvar)
-        return recon_spec, recon_desc, (all_mus, all_logvars, mixture_prior, js_div)
+        return recon_spec, recon_mask, (all_mus, all_logvars, mixture_prior, js_div)
 
     def generate(
         self, 
@@ -1065,78 +1166,78 @@ class SpectralMMVAE(tf.keras.Model):
         conditioning_modality=None, 
         conditioning_input=None,
         conditioning_latent=None
-    ):
+        ):
         """
         Generate samples using the Mixture-of-Experts approach.
         
         Args:
-            modality: Which modality to generate ('spec', 'desc', or 'both')
-            conditioning_modality: Optional modality to condition on ('spec' or 'desc')
+            modality: Which modality to generate ('spec', 'mask', or 'both')
+            conditioning_modality: Optional modality to condition on ('spec' or 'mask')
             conditioning_input: Input for the conditioning modality
             conditioning_latent: Optional latent vector to use directly
+            
+        Returns:
+            If modality == 'both': returns a tuple (recon_spec, recon_mask)
+            If modality == 'spec': returns recon_spec
+            If modality == 'mask': returns recon_mask
         """
-        # 1. If `conditioning_latent` is passed, use it. 
-        #    Otherwise, sample or encode from `conditioning_modality`.
+        # 1. Use the provided latent if available; otherwise, sample or encode.
         if conditioning_latent is not None:
             z = conditioning_latent
         else:
-            # Sample or encode from the given modality
             if conditioning_modality is None:
-                # Sample from a standard Gaussian prior
                 z = tf.random.normal(shape=(1, self.latent_dim))
             else:
-                # Encode conditioning modality
                 if conditioning_modality == 'spec':
                     mu, logvar = self.spec_encoder(conditioning_input)
-                elif conditioning_modality == 'desc':
-                    mu, logvar = self.desc_encoder(conditioning_input)
+                elif conditioning_modality == 'mask':
+                    mu, logvar = self.mask_encoder(conditioning_input)
                 else:
                     raise ValueError(f"Unknown conditioning modality: {conditioning_modality}")
-                # Sample from the posterior
                 z = reparameterize(mu, logvar)
 
-        # 2. Generate requested modality
+        # 2. Generate the requested modality.
         if modality == 'spec' or modality == 'both':
             recon_spec = self.spec_decoder(z)
         else:
             recon_spec = None
 
-        if modality == 'desc' or modality == 'both':
-            recon_desc = self.desc_decoder(z)
+        if modality == 'mask' or modality == 'both':
+            recon_mask = self.mask_decoder(z)
         else:
-            recon_desc = None
+            recon_mask = None
 
-        # 3. Return appropriately
+        # 3. Return the generated output.
         if modality == 'both':
-            return recon_spec, recon_desc
+            return recon_spec, recon_mask
         elif modality == 'spec':
             return recon_spec
-        elif modality == 'desc':
-            return recon_desc
- 
-    def encode_all_modalities(self, spec_in, desc_in, training=False):
+        elif modality == 'mask':
+            return recon_mask
+
+    def encode_all_modalities(self, spec_in, mask_in, training=False):
         """
         Encode all modalities and compute the mixture prior.
         
         Args:
-            spec_in: Input spectrogram
-            desc_in: Input descriptor
-            training: Whether in training mode
+            spec_in: Input spectrogram.
+            mask_in: Input binary mask.
+            training: Whether in training mode.
             
         Returns:
             Tuple of (mus, logvars, mixture_mu, mixture_logvar)
         """
         # Encode each modality
         mu_spec, logvar_spec = self.spec_encoder(spec_in, training=training)
-        mu_desc, logvar_desc = self.desc_encoder(desc_in, training=training)
+        mu_mask, logvar_mask = self.mask_encoder(mask_in, training=training)
         
-        # Compute mixture prior
-        mus = [mu_spec, mu_desc]
-        logvars = [logvar_spec, logvar_desc]
+        # Compute mixture prior from the two modalities
+        mus = [mu_spec, mu_mask]
+        logvars = [logvar_spec, logvar_mask]
         mixture_mu, mixture_logvar = compute_mixture_prior(mus, logvars)
         
         return mus, logvars, mixture_mu, mixture_logvar
-    
+
     def reconstruct_time_series(self, spec_features, fs=200, nperseg=256, noverlap=128, time_length=1000):
         """
         Reconstruct time series from spectrogram features by:
@@ -1176,38 +1277,49 @@ class SpectralMMVAE(tf.keras.Model):
     
 # ----- Data Processing and Dataset Creation -----
 def create_tf_dataset(
-    spectrograms, descriptor_array, test_id_array,
+    spectrograms, mask_array, test_id_array,
     batch_size=32, shuffle=True, debug_mode=False, debug_samples=500
-):
+    ):
     """
     Create a TensorFlow Dataset that loads data from memory.
+    
+    Args:
+        spectrograms: Array or path to file containing spectrograms.
+        mask_array: Array or path to file containing binary masks.
+        test_id_array: Array of test IDs.
+        batch_size: Batch size for the dataset.
+        shuffle: Whether to shuffle the dataset.
+        debug_mode: If True, only a limited number of samples are used.
+        debug_samples: Number of samples to use in debug mode.
+        
+    Returns:
+        A tf.data.Dataset yielding tuples (spectrogram, mask, test_id).
     """
-    # Convert file path to memory-mapped array if string is provided
+    # Convert file path to memory-mapped array if a string is provided
     if isinstance(spectrograms, str):
         spectrograms = np.load(spectrograms)
+    if isinstance(mask_array, str):
+        mask_array = np.load(mask_array)
     
     # Apply debug mode limit
     if debug_mode:
         print(f"⚠️ Debug Mode ON: Using only {debug_samples} samples for quick testing!")
         spectrograms = spectrograms[:debug_samples]
-        descriptor_array = descriptor_array[:debug_samples]
+        mask_array = mask_array[:debug_samples]
         test_id_array = test_id_array[:debug_samples]
     else:
-        print(f"✅ Full dataset loaded: {len(descriptor_array)} samples.")
+        print(f"✅ Full dataset loaded: {len(mask_array)} samples.")
 
-    # Ensure all inputs have appropriate ranks (at least 1)
+    # Ensure inputs have at least rank 1
     test_id_array = np.atleast_1d(test_id_array)
-    descriptor_array = np.atleast_1d(descriptor_array)
+    mask_array = np.atleast_1d(mask_array)
     
-    # Create a dataset from the arrays
-    dataset = tf.data.Dataset.from_tensor_slices((spectrograms, descriptor_array, test_id_array))
-
+    dataset = tf.data.Dataset.from_tensor_slices((spectrograms, mask_array, test_id_array))
+    
     if shuffle:
-        dataset = dataset.shuffle(buffer_size=len(descriptor_array))
-
-    # Batch the dataset
+        dataset = dataset.shuffle(buffer_size=len(mask_array))
+    
     dataset = dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
-
     return dataset
 
 # ----- Training Function -----
@@ -1220,18 +1332,12 @@ def train_spectral_mmvae(
     patience=10,
     beta_schedule='cyclical',
     modality_dropout_prob=0.1
-):
-    import gc
-
+    ):
     metrics = {
-        'train_total': [], 'train_spec': [], 'train_desc': [], 
+        'train_total': [], 'train_spec': [], 'train_mask': [], 
         'train_js': [], 'train_mode': [],
-        'val_total': [], 'val_spec': [], 'val_desc': [], 'val_js': []
+        'val_total': [], 'val_spec': [], 'val_mask': [], 'val_js': []
     }
-
-    print("Trainable Variables:")
-    for var in model.trainable_variables:
-        print(f"  - {var.name}: {var.shape}")
 
     best_val_loss = float('inf')
     no_improvement_count = 0
@@ -1244,29 +1350,30 @@ def train_spectral_mmvae(
 
     for epoch in range(num_epochs):
         epoch_metrics = {
-            'train_total': 0.0, 'train_spec': 0.0, 'train_desc': 0.0, 
+            'train_total': 0.0, 'train_spec': 0.0, 'train_mask': 0.0, 
             'train_js': 0.0, 'train_full': 0.0, 
-            'train_spec_only': 0.0, 'train_desc_only': 0.0,
-            'n_full': 0, 'n_spec_only': 0, 'n_desc_only': 0,
+            'train_spec_only': 0.0, 'train_mask_only': 0.0,
+            'n_full': 0, 'n_spec_only': 0, 'n_mask_only': 0,
             'train_steps': 0
         }
 
         beta = get_beta_schedule(epoch, num_epochs, beta_schedule)
-        desc_weight = dynamic_weighting(epoch, num_epochs)
-        spec_weight = 1.0 - desc_weight
+        # Use dynamic_weighting to get weight for mask loss
+        mask_weight = dynamic_weighting(epoch, num_epochs)
+        spec_weight = 1.0 - mask_weight
 
-        print(f"📌 Epoch {epoch+1}/{num_epochs} | Beta: {beta:.6f} | Descriptor Weight: {desc_weight:.2f}")
+        print(f"📌 Epoch {epoch+1}/{num_epochs} | Beta: {beta:.6f} | Mask Weight: {mask_weight:.2f}")
 
-        for step, (spec_in, desc_in, test_id_in) in enumerate(train_dataset):
+        for step, (spec_in, mask_in, test_id_in) in enumerate(train_dataset):
             missing_modality = None
             random_value = tf.random.uniform(shape=[], minval=0, maxval=1)
             if random_value < modality_dropout_prob * 2:
-                missing_modality = 'spec' if random_value < modality_dropout_prob else 'desc'
+                missing_modality = 'spec' if random_value < modality_dropout_prob else 'mask'
 
             with tf.GradientTape(persistent=True) as tape:
                 try:
-                    recon_spec, recon_desc, (all_mus, all_logvars, mixture_prior, js_div) = model(
-                        spec_in, desc_in, test_id_in,
+                    recon_spec, recon_mask, (all_mus, all_logvars, mixture_prior, js_div) = model(
+                        spec_in, mask_in, test_id_in,
                         training=True,
                         missing_modality=missing_modality
                     )
@@ -1276,19 +1383,19 @@ def train_spectral_mmvae(
 
                 try:
                     spec_loss = complex_spectrogram_loss(spec_in, recon_spec) if missing_modality != 'spec' else 0.0
-                    desc_loss = weighted_descriptor_mse_loss(desc_in, recon_desc) if missing_modality != 'desc' else 0.0
+                    mask_loss = robust_mask_loss(mask_in, recon_mask) if missing_modality != 'mask' else 0.0
                 except Exception as e:
                     print(f"❌ Loss computation error: {e}")
                     continue
 
                 if missing_modality is None:
-                    recon_loss = spec_weight * spec_loss + desc_weight * desc_loss
+                    recon_loss = spec_weight * spec_loss + mask_weight * mask_loss
                     epoch_metrics['n_full'] += 1
                     epoch_metrics['train_full'] += float(recon_loss)
                 elif missing_modality == 'spec':
-                    recon_loss = desc_loss
-                    epoch_metrics['n_desc_only'] += 1
-                    epoch_metrics['train_desc_only'] += float(recon_loss)
+                    recon_loss = mask_loss
+                    epoch_metrics['n_mask_only'] += 1
+                    epoch_metrics['train_mask_only'] += float(recon_loss)
                 else:
                     recon_loss = spec_loss
                     epoch_metrics['n_spec_only'] += 1
@@ -1310,52 +1417,55 @@ def train_spectral_mmvae(
 
             epoch_metrics['train_total'] += float(total_loss)
             epoch_metrics['train_spec'] += float(spec_loss) if missing_modality != 'spec' else 0.0
-            epoch_metrics['train_desc'] += float(desc_loss) if missing_modality != 'desc' else 0.0
+            epoch_metrics['train_mask'] += float(mask_loss) if missing_modality != 'mask' else 0.0
             epoch_metrics['train_js'] += float(js_div)
             epoch_metrics['train_steps'] += 1
 
         if epoch_metrics['train_steps'] > 0:
             metrics['train_total'].append(epoch_metrics['train_total'] / epoch_metrics['train_steps'])
-            metrics['train_spec'].append(epoch_metrics['train_spec'] / max(epoch_metrics['train_steps'] - epoch_metrics['n_desc_only'], 1))
-            metrics['train_desc'].append(epoch_metrics['train_desc'] / max(epoch_metrics['train_steps'] - epoch_metrics['n_spec_only'], 1))
+            metrics['train_spec'].append(epoch_metrics['train_spec'] / max(epoch_metrics['train_steps'] - epoch_metrics['n_mask_only'], 1))
+            metrics['train_mask'].append(epoch_metrics['train_mask'] / max(epoch_metrics['train_steps'] - epoch_metrics['n_spec_only'], 1))
             metrics['train_js'].append(epoch_metrics['train_js'] / epoch_metrics['train_steps'])
             metrics['train_mode'].append({
                 'full': epoch_metrics['train_full'] / max(epoch_metrics['n_full'], 1),
                 'spec_only': epoch_metrics['train_spec_only'] / max(epoch_metrics['n_spec_only'], 1),
-                'desc_only': epoch_metrics['train_desc_only'] / max(epoch_metrics['n_desc_only'], 1)
+                'mask_only': epoch_metrics['train_mask_only'] / max(epoch_metrics['n_mask_only'], 1)
             })
 
             print(f"✅ Train Loss: {metrics['train_total'][-1]:.4f} | "
                   f"Spec: {metrics['train_spec'][-1]:.4f} | "
-                  f"Desc: {metrics['train_desc'][-1]:.4f} | "
+                  f"Mask: {metrics['train_mask'][-1]:.4f} | "
                   f"JS: {metrics['train_js'][-1]:.4f}")
 
         # Validation loop
-        epoch_val_metrics = {'total': 0.0, 'spec': 0.0, 'desc': 0.0, 'js': 0.0, 'steps': 0}
-        for step, (spec_in, desc_in, test_id_in) in enumerate(val_dataset):
-            recon_spec, recon_desc, (all_mus, all_logvars, mixture_prior, js_div) = model(
-                spec_in, desc_in, test_id_in, training=False, missing_modality=None)
+        epoch_val_metrics = {'total': 0.0, 'spec': 0.0, 'mask': 0.0, 'js': 0.0, 'steps': 0}
+        for step, (spec_in, mask_in, test_id_in) in enumerate(val_dataset):
+            recon_spec, recon_mask, (all_mus, all_logvars, mixture_prior, js_div) = model(
+                spec_in, mask_in, test_id_in, training=False, missing_modality=None)
 
             spec_loss = complex_spectrogram_loss(spec_in, recon_spec)
-            desc_loss = weighted_descriptor_mse_loss(desc_in, recon_desc)
-            recon_loss = spec_weight * spec_loss + desc_weight * desc_loss
+            mask_loss = robust_mask_loss(mask_in, recon_mask)
+            recon_loss = spec_weight * spec_loss + mask_weight * mask_loss
             total_loss = recon_loss + beta * js_div
 
             epoch_val_metrics['total'] += float(total_loss)
             epoch_val_metrics['spec'] += float(spec_loss)
-            epoch_val_metrics['desc'] += float(desc_loss)
+            epoch_val_metrics['mask'] += float(mask_loss)
             epoch_val_metrics['js'] += float(js_div)
             epoch_val_metrics['steps'] += 1
 
         if epoch_val_metrics['steps'] > 0:
             metrics['val_total'].append(epoch_val_metrics['total'] / epoch_val_metrics['steps'])
             metrics['val_spec'].append(epoch_val_metrics['spec'] / epoch_val_metrics['steps'])
-            metrics['val_desc'].append(epoch_val_metrics['desc'] / epoch_val_metrics['steps'])
+            metrics['val_mask'].append(epoch_val_metrics['mask'] / epoch_val_metrics['steps'])
             metrics['val_js'].append(epoch_val_metrics['js'] / epoch_val_metrics['steps'])
             print(f"  🔵 Val => Total: {metrics['val_total'][-1]:.4f} | "
                   f"Spec: {metrics['val_spec'][-1]:.4f} | "
-                  f"Desc: {metrics['val_desc'][-1]:.4f} | "
+                  f"Mask: {metrics['val_mask'][-1]:.4f} | "
                   f"JS: {metrics['val_js'][-1]:.4f}")
+        
+        tf.keras.backend.clear_session()
+        gc.collect()
 
         current_val_loss = metrics['val_total'][-1]
         if current_val_loss < best_val_loss:
@@ -1434,11 +1544,11 @@ def plot_training_curves(metrics):
         fig = go.Figure()
         full_losses = [mode_loss['full'] for mode_loss in metrics['train_mode']]
         spec_only_losses = [mode_loss['spec_only'] for mode_loss in metrics['train_mode']]
-        desc_only_losses = [mode_loss['desc_only'] for mode_loss in metrics['train_mode']]
+        mask_only_losses = [mode_loss['mask_only'] for mode_loss in metrics['train_mode']]
         
         fig.add_trace(go.Scatter(x=epochs, y=full_losses, mode='lines+markers', name="Both Modalities", line=dict(color='blue')))
         fig.add_trace(go.Scatter(x=epochs, y=spec_only_losses, mode='lines+markers', name="Spec Only", line=dict(color='green')))
-        fig.add_trace(go.Scatter(x=epochs, y=desc_only_losses, mode='lines+markers', name="Desc Only", line=dict(color='red')))
+        fig.add_trace(go.Scatter(x=epochs, y=mask_only_losses, mode='lines+markers', name="Desc Only", line=dict(color='red')))
         
         fig.update_layout(
             title="Reconstruction Loss by Modality Combination", 
@@ -1462,15 +1572,15 @@ def visualize_reconstructions(model, val_dataset, data_loader, num_samples=5, fs
     os.makedirs("results/visualizations", exist_ok=True)
     
     # Select samples from validation dataset
-    for i, (spec_batch, desc_batch, _) in enumerate(val_dataset.take(1)):
+    for i, (spec_batch, mask_batch, _) in enumerate(val_dataset.take(1)):
         for j in range(min(num_samples, spec_batch.shape[0])):
             # Get sample
             spec_sample = tf.expand_dims(spec_batch[j], 0)
-            desc_sample = tf.expand_dims(desc_batch[j], 0)
+            mask_sample = tf.expand_dims(mask_batch[j], 0)
             
             # Get reconstructions
             recon_spec, recon_desc, _ = model(
-                spec_sample, desc_sample, 
+                spec_sample, mask_sample, 
                 tf.constant([[0]]), training=False
             )
             
@@ -1523,13 +1633,13 @@ def visualize_reconstructions(model, val_dataset, data_loader, num_samples=5, fs
             # Convert descriptors to masks for visualization using data_loader function
             try:
                 # Find valid descriptors (non-zero rows)
-                desc_np = desc_sample.numpy()[0]
-                valid_mask = np.any(desc_np != 0, axis=1)
-                valid_descriptors = desc_np[valid_mask]
+                mask_np = mask_sample.numpy()[0]
+                valid_mask = np.any(mask_np != 0, axis=1)
+                valid_descriptors = mask_np[valid_mask]
                 
-                recon_desc_np = recon_desc.numpy()[0]
-                valid_recon_mask = np.any(recon_desc_np != 0, axis=1)
-                valid_recon_descriptors = recon_desc_np[valid_recon_mask]
+                recon_mask_np = recon_desc.numpy()[0]
+                valid_recon_mask = np.any(recon_mask_np != 0, axis=1)
+                valid_recon_descriptors = recon_mask_np[valid_recon_mask]
                 
                 # Use the data_loader function to reconstruct masks
                 orig_mask = data_loader.reconstruct_mask_from_descriptors(
@@ -1571,7 +1681,7 @@ def extract_latent_representations(model, dataset):
     latent_vectors = []
     test_ids = []
 
-    for spec_in, desc_in, test_id_in in dataset:
+    for spec_in, mask_in, test_id_in in dataset:
         # Convert test_id_in to proper format
         if isinstance(test_id_in, tf.Tensor):
             test_id_in = test_id_in.numpy()
@@ -1695,9 +1805,9 @@ def generate_samples(model, data_loader, num_samples=5, fs=200, nperseg=256, nov
         # Convert descriptors to mask for visualization
         try:
             # Find valid descriptors (non-zero rows)
-            gen_desc_np = gen_desc.numpy()[0]
-            valid_mask = np.any(gen_desc_np != 0, axis=1)
-            valid_descriptors = gen_desc_np[valid_mask]
+            gen_mask_np = gen_desc.numpy()[0]
+            valid_mask = np.any(gen_mask_np != 0, axis=1)
+            valid_descriptors = gen_mask_np[valid_mask]
             
             # Use the data_loader function to reconstruct mask
             if len(valid_descriptors) > 0:
@@ -1737,22 +1847,22 @@ def visualize_latent_structure(model, dataset, n_samples=500):
     
     # Collect latent encodings
     spec_mus = []
-    desc_mus = []
+    mask_mus = []
     mixture_mus = []
     test_ids = []
     
     # Limit to n_samples
     sample_count = 0
-    for spec_in, desc_in, test_id_in in dataset:
+    for spec_in, mask_in, test_id_in in dataset:
         if sample_count >= n_samples:
             break
             
         # Encode all modalities
-        mus, logvars, mixture_mu, mixture_logvar = model.encode_all_modalities(spec_in, desc_in, training=False)
+        mus, logvars, mixture_mu, mixture_logvar = model.encode_all_modalities(spec_in, mask_in, training=False)
         
         # Store means
         spec_mus.append(mus[0].numpy())
-        desc_mus.append(mus[1].numpy())
+        mask_mus.append(mus[1].numpy())
         mixture_mus.append(mixture_mu.numpy())
         
         # Store test IDs
@@ -1764,7 +1874,7 @@ def visualize_latent_structure(model, dataset, n_samples=500):
     
     # Concatenate results
     spec_mus = np.concatenate(spec_mus, axis=0)
-    desc_mus = np.concatenate(desc_mus, axis=0)
+    mask_mus = np.concatenate(mask_mus, axis=0)
     mixture_mus = np.concatenate(mixture_mus, axis=0)
     test_ids = np.concatenate(test_ids, axis=0).flatten()
     
@@ -1772,13 +1882,13 @@ def visualize_latent_structure(model, dataset, n_samples=500):
     reducer = umap.UMAP(n_components=2, random_state=42, n_neighbors=15, min_dist=0.1)
     
     # Combine all encodings for a single UMAP embedding
-    all_mus = np.concatenate([spec_mus, desc_mus, mixture_mus], axis=0)
+    all_mus = np.concatenate([spec_mus, mask_mus, mixture_mus], axis=0)
     all_embeddings = reducer.fit_transform(all_mus)
     
     # Split back into modality-specific embeddings
     n_points = spec_mus.shape[0]
     spec_embeddings = all_embeddings[:n_points]
-    desc_embeddings = all_embeddings[n_points:2*n_points]
+    mask_embeddings = all_embeddings[n_points:2*n_points]
     mixture_embeddings = all_embeddings[2*n_points:]
     
     # Visualize the latent space
@@ -1802,8 +1912,8 @@ def visualize_latent_structure(model, dataset, n_samples=500):
     
     # Add descriptor embeddings
     fig.add_trace(go.Scatter(
-        x=desc_embeddings[:, 0], 
-        y=desc_embeddings[:, 1],
+        x=mask_embeddings[:, 0], 
+        y=mask_embeddings[:, 1],
         mode='markers',
         marker=dict(
             color=test_ids,
@@ -1844,7 +1954,7 @@ def visualize_latent_structure(model, dataset, n_samples=500):
     
     return {
         'spec_mus': spec_mus,
-        'desc_mus': desc_mus,
+        'mask_mus': mask_mus,
         'mixture_mus': mixture_mus,
         'test_ids': test_ids
     }
@@ -1864,7 +1974,7 @@ def evaluate_cross_modal_generation(model, dataset, data_loader, n_samples=10):
     
     # Get a batch of samples
     sample_count = 0
-    for spec_in, desc_in, test_id_in in dataset:
+    for spec_in, mask_in, test_id_in in dataset:
         if sample_count >= n_samples:
             break
             
@@ -1872,7 +1982,7 @@ def evaluate_cross_modal_generation(model, dataset, data_loader, n_samples=10):
         for i in range(min(n_samples - sample_count, spec_in.shape[0])):
             # Extract single sample
             spec_sample = tf.expand_dims(spec_in[i], 0)
-            desc_sample = tf.expand_dims(desc_in[i], 0)
+            mask_sample = tf.expand_dims(mask_in[i], 0)
             test_id = test_id_in[i].numpy() if isinstance(test_id_in, tf.Tensor) else test_id_in[i]
             
             # 1. Encode using spectrogram only
@@ -1880,22 +1990,22 @@ def evaluate_cross_modal_generation(model, dataset, data_loader, n_samples=10):
             z_spec = reparameterize(mu_spec, logvar_spec)
             
             # Generate descriptor from spectrogram encoding
-            gen_desc_from_spec = model.desc_decoder(z_spec, training=False)
+            gen_mask_from_spec = model.mask_decoder(z_spec, training=False)
             
             # 2. Encode using descriptor only
-            mu_desc, logvar_desc = model.desc_encoder(desc_sample, training=False)
+            mu_desc, logvar_desc = model.mask_encoder(mask_sample, training=False)
             z_desc = reparameterize(mu_desc, logvar_desc)
             
             # Generate spectrogram from descriptor encoding
             gen_spec_from_desc = model.spec_decoder(z_desc, training=False)
             
             # 3. Encode using both to get mixture prior
-            mus, logvars, mixture_mu, mixture_logvar = model.encode_all_modalities(spec_sample, desc_sample, training=False)
+            mus, logvars, mixture_mu, mixture_logvar = model.encode_all_modalities(spec_sample, mask_sample, training=False)
             z_mixture = reparameterize(mixture_mu, mixture_logvar)
             
             # Generate from mixture encoding
             gen_spec_from_mixture = model.spec_decoder(z_mixture, training=False)
-            gen_desc_from_mixture = model.desc_decoder(z_mixture, training=False)
+            gen_mask_from_mixture = model.mask_decoder(z_mixture, training=False)
             
             # Visualize original and cross-modal reconstructions
             # A. Original spectrogram vs generated from descriptor/mixture
@@ -1931,19 +2041,19 @@ def evaluate_cross_modal_generation(model, dataset, data_loader, n_samples=10):
             # B. Compare crack descriptors
             try:
                 # Original descriptor
-                desc_np = desc_sample.numpy()[0]
-                valid_mask = np.any(desc_np != 0, axis=1)
-                valid_descriptors = desc_np[valid_mask]
+                mask_np = mask_sample.numpy()[0]
+                valid_mask = np.any(mask_np != 0, axis=1)
+                valid_descriptors = mask_np[valid_mask]
                 
                 # Generated from spectrogram
-                gen_desc_from_spec_np = gen_desc_from_spec.numpy()[0]
-                valid_gen_mask = np.any(gen_desc_from_spec_np != 0, axis=1)
-                valid_gen_descriptors = gen_desc_from_spec_np[valid_gen_mask]
+                gen_mask_from_spec_np = gen_mask_from_spec.numpy()[0]
+                valid_gen_mask = np.any(gen_mask_from_spec_np != 0, axis=1)
+                valid_gen_descriptors = gen_mask_from_spec_np[valid_gen_mask]
                 
                 # Generated from mixture
-                gen_desc_from_mixture_np = gen_desc_from_mixture.numpy()[0]
-                valid_mix_mask = np.any(gen_desc_from_mixture_np != 0, axis=1)
-                valid_mix_descriptors = gen_desc_from_mixture_np[valid_mix_mask]
+                gen_mask_from_mixture_np = gen_mask_from_mixture.numpy()[0]
+                valid_mix_mask = np.any(gen_mask_from_mixture_np != 0, axis=1)
+                valid_mix_descriptors = gen_mask_from_mixture_np[valid_mix_mask]
                 
                 # Use data_loader to visualize masks
                 orig_mask = data_loader.reconstruct_mask_from_descriptors(
@@ -2014,32 +2124,32 @@ def evaluate_missing_modality(model, dataset, n_samples=10):
     # Metrics to track
     spec_full_losses = []
     spec_miss_losses = []
-    desc_full_losses = []
-    desc_miss_losses = []
+    mask_full_losses = []
+    mask_miss_losses = []
     
     # Get samples
     sample_count = 0
-    for spec_in, desc_in, _ in dataset:
+    for spec_in, mask_in, _ in dataset:
         if sample_count >= n_samples:
             break
             
         # Get full reconstructions
-        recon_spec_full, recon_desc_full, _ = model(
-            spec_in, desc_in,
+        recon_spec_full, recon_mask_full, _ = model(
+            spec_in, mask_in,
             training=False,
             missing_modality=None  # No missing modality
         )
         
         # Get reconstructions with missing spectrogram
-        recon_spec_miss_spec, recon_desc_miss_spec, _ = model(
-            spec_in, desc_in,
+        recon_spec_miss_spec, recon_mask_miss_spec, _ = model(
+            spec_in, mask_in,
             training=False,
             missing_modality='spec'  # Missing spectrogram
         )
         
         # Get reconstructions with missing descriptor
-        recon_spec_miss_desc, recon_desc_miss_desc, _ = model(
-            spec_in, desc_in,
+        recon_spec_miss_desc, recon_mask_miss_desc, _ = model(
+            spec_in, mask_in,
             training=False,
             missing_modality='desc'  # Missing descriptor
         )
@@ -2048,31 +2158,31 @@ def evaluate_missing_modality(model, dataset, n_samples=10):
         spec_full_loss = complex_spectrogram_loss(spec_in, recon_spec_full).numpy()
         spec_miss_loss = complex_spectrogram_loss(spec_in, recon_spec_miss_spec).numpy()
         
-        desc_full_loss = weighted_descriptor_mse_loss(desc_in, recon_desc_full).numpy()
-        desc_miss_loss = weighted_descriptor_mse_loss(desc_in, recon_desc_miss_desc).numpy()
+        mask_full_loss = weighted_descriptor_mse_loss(mask_in, recon_mask_full).numpy()
+        mask_miss_loss = weighted_descriptor_mse_loss(mask_in, recon_mask_miss_desc).numpy()
         
         # Track metrics
         spec_full_losses.append(spec_full_loss)
         spec_miss_losses.append(spec_miss_loss)
-        desc_full_losses.append(desc_full_loss)
-        desc_miss_losses.append(desc_miss_loss)
+        mask_full_losses.append(mask_full_loss)
+        mask_miss_losses.append(mask_miss_loss)
         
         sample_count += spec_in.shape[0]
     
     # Compute averages
     avg_spec_full = np.mean(spec_full_losses)
     avg_spec_miss = np.mean(spec_miss_losses)
-    avg_desc_full = np.mean(desc_full_losses)
-    avg_desc_miss = np.mean(desc_miss_losses)
+    avg_mask_full = np.mean(mask_full_losses)
+    avg_mask_miss = np.mean(mask_miss_losses)
     
     # Create summary table
     data = {
         'Modality': ['Spectrogram', 'Descriptor'],
-        'Full Model': [avg_spec_full, avg_desc_full],
-        'Missing Other Modality': [avg_spec_miss, avg_desc_miss],
+        'Full Model': [avg_spec_full, avg_mask_full],
+        'Missing Other Modality': [avg_spec_miss, avg_mask_miss],
         'Performance Drop (%)': [
             (avg_spec_miss - avg_spec_full) / avg_spec_full * 100,
-            (avg_desc_miss - avg_desc_full) / avg_desc_full * 100
+            (avg_mask_miss - avg_mask_full) / avg_mask_full * 100
         ]
     }
     df = pd.DataFrame(data)
@@ -2084,12 +2194,12 @@ def evaluate_missing_modality(model, dataset, n_samples=10):
     fig = go.Figure()
     fig.add_trace(go.Bar(
         x=['Spectrogram', 'Descriptor'],
-        y=[avg_spec_full, avg_desc_full],
+        y=[avg_spec_full, avg_mask_full],
         name='Full Model'
     ))
     fig.add_trace(go.Bar(
         x=['Spectrogram', 'Descriptor'],
-        y=[avg_spec_miss, avg_desc_miss],
+        y=[avg_spec_miss, avg_mask_miss],
         name='Missing Other Modality'
     ))
     
@@ -2106,8 +2216,8 @@ def evaluate_missing_modality(model, dataset, n_samples=10):
     return {
         'spec_full': avg_spec_full,
         'spec_miss': avg_spec_miss,
-        'desc_full': avg_desc_full,
-        'desc_miss': avg_desc_miss
+        'mask_full': avg_mask_full,
+        'mask_miss': avg_mask_miss
     }
 
 def evaluate_modality_alignment(latent_data):
@@ -2125,7 +2235,7 @@ def evaluate_modality_alignment(latent_data):
     
     # Extract data
     spec_mus = latent_data['spec_mus']
-    desc_mus = latent_data['desc_mus']
+    mask_mus = latent_data['mask_mus']
     mixture_mus = latent_data['mixture_mus']
     
     # 1. Compute average cosine distance between modality encodings
@@ -2133,29 +2243,29 @@ def evaluate_modality_alignment(latent_data):
     
     # Normalize vectors for cosine similarity
     spec_norm = spec_mus / np.linalg.norm(spec_mus, axis=1, keepdims=True)
-    desc_norm = desc_mus / np.linalg.norm(desc_mus, axis=1, keepdims=True)
+    mask_norm = mask_mus / np.linalg.norm(mask_mus, axis=1, keepdims=True)
     
     # Compute batch-wise cosine similarity
-    cosine_similarities = np.sum(spec_norm * desc_norm, axis=1)
+    cosine_similarities = np.sum(spec_norm * mask_norm, axis=1)
     avg_cosine_sim = np.mean(cosine_similarities)
     
     # 2. Compute Euclidean distances between modality encodings
-    euclidean_distances = np.sqrt(np.sum(np.square(spec_mus - desc_mus), axis=1))
+    euclidean_distances = np.sqrt(np.sum(np.square(spec_mus - mask_mus), axis=1))
     avg_euclidean_dist = np.mean(euclidean_distances)
     
     # 3. Compute distances between each modality and the mixture
     spec_to_mixture_dist = np.sqrt(np.sum(np.square(spec_mus - mixture_mus), axis=1))
-    desc_to_mixture_dist = np.sqrt(np.sum(np.square(desc_mus - mixture_mus), axis=1))
+    mask_to_mixture_dist = np.sqrt(np.sum(np.square(mask_mus - mixture_mus), axis=1))
     
     avg_spec_to_mixture = np.mean(spec_to_mixture_dist)
-    avg_desc_to_mixture = np.mean(desc_to_mixture_dist)
+    avg_mask_to_mixture = np.mean(mask_to_mixture_dist)
     
     # Create summary of results
     alignment_metrics = {
         'avg_cosine_similarity': avg_cosine_sim,
         'avg_euclidean_distance': avg_euclidean_dist,
         'avg_spec_to_mixture_distance': avg_spec_to_mixture,
-        'avg_desc_to_mixture_distance': avg_desc_to_mixture
+        'avg_mask_to_mixture_distance': avg_mask_to_mixture
     }
     
     # Save metrics
@@ -2195,7 +2305,7 @@ def evaluate_modality_alignment(latent_data):
     ))
     
     fig.add_trace(go.Histogram(
-        x=desc_to_mixture_dist,
+        x=mask_to_mixture_dist,
         name='Descriptor to Mixture',
         histnorm='probability density',
         marker_color='green',
@@ -2257,21 +2367,21 @@ def test_latent_interpolation(model, val_dataset, output_dir="results/interpolat
     os.makedirs(output_dir, exist_ok=True)
     
     # Get two samples from validation dataset
-    for spec_batch, desc_batch, _ in val_dataset.take(1):
+    for spec_batch, mask_batch, _ in val_dataset.take(1):
         # Use first two samples in batch
         if spec_batch.shape[0] < 2:
             print("❌ Need at least 2 samples for interpolation")
             return
             
         source_spec = tf.expand_dims(spec_batch[0], 0)
-        source_desc = tf.expand_dims(desc_batch[0], 0)
+        source_mask = tf.expand_dims(mask_batch[0], 0)
         
         target_spec = tf.expand_dims(spec_batch[1], 0)
-        target_desc = tf.expand_dims(desc_batch[1], 0)
+        target_mask = tf.expand_dims(mask_batch[1], 0)
         
         # Encode samples to get latent vectors
-        _, _, source_mixture = model(source_spec, source_desc, training=False)
-        _, _, target_mixture = model(target_spec, target_desc, training=False)
+        _, _, source_mixture = model(source_spec, source_mask, training=False)
+        _, _, target_mixture = model(target_spec, target_mask, training=False)
         
         # Get mixture means
         source_mus, source_logvars, _, _ = source_mixture
@@ -2326,21 +2436,21 @@ def main():
     nperseg = 256  # STFT segment length
     noverlap = 224 # STFT overlap
     
-    latent_dim = 128 
-    batch_size = 64  
-    num_epochs = 800 
-    patience = 300  
+    latent_dim = 64 
+    batch_size = 32  
+    num_epochs = 500 
+    patience = 150  
 
     # Cached file paths
     stft_path  = "scripts/cached_stft.npy"
     final_path = "scripts/cached_spectral_features.npy"
-    desc_path  = "scripts/cached_descriptors.npy"
+    mask_path  = "scripts/cached_masks.npy"
     ids_path   = "scripts/cached_test_ids.npy"
 
     # ------------------------ 3) Single Check: Are ALL caches present? ------------------------
     all_cached = (
         os.path.exists(final_path)
-        and os.path.exists(desc_path)
+        and os.path.exists(mask_path)
         and os.path.exists(ids_path)
     )
 
@@ -2349,17 +2459,12 @@ def main():
         print("✅ All cached files found! Loading from disk...")
 
         spectral_features   = np.load(final_path)
-        descriptor_segments = np.load(desc_path)
+        mask_segments       = np.load(mask_path)
         test_ids            = np.load(ids_path)
 
         print(f"✅ spectral_features: {spectral_features.shape}")
-        print(f"✅ descriptor_segments: {descriptor_segments.shape}")
+        print(f"✅ mask_segments: {mask_segments.shape}")
         print(f"✅ test_ids: {test_ids.shape}")
-
-        # Hard-coded shapes (adjust if needed). 
-        # Or if you prefer, read from descriptor_segments shape:
-        max_num_cracks = 770
-        desc_length    = 42
 
     else:
         # ------------------------ B) Missing Any Cache: Re-run entire pipeline ------------------------
@@ -2378,20 +2483,22 @@ def main():
         print("📥 Loading raw data...")
         accel_dict, crack_dict, binary_masks, skeletons, padded_dict = data_loader.load_data(params)
 
-        sample_desc = next(iter(padded_dict.values()))
-        max_num_cracks, desc_length = sample_desc.shape
-        print(f"Loaded data for {len(accel_dict)} tests")
-        print(f"Descriptor shape: {max_num_cracks} cracks x {desc_length} features")
+        mask_segments = np.array([np.expand_dims(binary_masks[k], -1) for k in sorted(binary_masks.keys())])
+        test_ids = np.array(sorted(binary_masks.keys()))
 
-        # (2) Segment time series -> get raw_segments, descriptors, test_ids
+
+        print(f"Loaded data for {len(accel_dict)} tests")
+
+        # (2) Segment time series -> get raw_segments, masks, test_ids
         print("✂️ Segmenting data...")
-        raw_segments, descriptor_segments, test_ids = segment_and_transform(accel_dict, padded_dict)
+        raw_segments, mask_segments, test_ids = segment_and_transform(accel_dict, binary_masks)
+        mask_segments = np.expand_dims(mask_segments, axis=-1)
         print(f"✅ Extracted {len(raw_segments)} segments")
 
-        # Save descriptors & test IDs for future use
-        np.save(desc_path, descriptor_segments)
+        # Save masks & test IDs for future use
+        np.save(mask_path, mask_segments)
         np.save(ids_path, test_ids)
-        print(f"✅ Saved descriptors to {desc_path}")
+        print(f"✅ Saved masks to {mask_path}")
         print(f"✅ Saved test IDs to {ids_path}")
 
         # (3) Compute STFT -> complex spectrograms
@@ -2411,36 +2518,44 @@ def main():
     # Slice the cached arrays (they are NumPy arrays now)
     train_spec = spectral_features[train_idx]
     val_spec = spectral_features[val_idx]
-    train_desc = descriptor_segments[train_idx]
+    train_mask = mask_segments[train_idx]
     train_ids  = test_ids[train_idx]
-    val_desc   = descriptor_segments[val_idx]
+    val_mask   = mask_segments[val_idx]
     val_ids    = test_ids[val_idx]
 
     print(f"Training set: {train_spec.shape[0]} samples")
     print(f"Validation set: {val_spec.shape[0]} samples")
 
     # ------------------------ 8) Create TensorFlow Datasets ------------------------
-    train_dataset = create_tf_dataset(train_spec, train_desc, train_ids, batch_size, debug_mode=debug_mode)
-    val_dataset   = create_tf_dataset(val_spec, val_desc, val_ids, batch_size, debug_mode=debug_mode)
+    train_dataset = create_tf_dataset(train_spec, train_mask, train_ids, batch_size, debug_mode=debug_mode)
+    val_dataset   = create_tf_dataset(val_spec, val_mask, val_ids, batch_size, debug_mode=debug_mode)
 
     print(f"✅ Train batches: {sum(1 for _ in train_dataset)}")
     print(f"✅ Val batches: {sum(1 for _ in val_dataset)}")
 
 
     # ------------------------ 9) Build Model ------------------------
-    spec_shape = spectral_features.shape[1:]  
+    spec_shape = spectral_features.shape[1:]
+    mask_shape = (256, 768, 1)
     print(f"📐 Building model with:")
     print(f"  - Latent dimension: {latent_dim}")
     print(f"  - Spectrogram shape: {spec_shape}")
-    print(f"  - Descriptor shape: ({max_num_cracks}, {desc_length})")
+    print(f"  - Mask shape: ({mask_shape}")
 
-    model = SpectralMMVAE(latent_dim, spec_shape, max_num_cracks, desc_length)
+    model = SpectralMMVAE(latent_dim, spec_shape, mask_shape)
 
     # Build with a dummy forward pass
     dummy_spec = tf.zeros((1, *spec_shape))
-    dummy_desc = tf.zeros((1, max_num_cracks, desc_length))
-    _ = model(dummy_spec, dummy_desc, training=True)
+    dummy_mask = tf.zeros((1, *mask_shape))
+    _ = model(dummy_spec, dummy_mask, training=True)
     print("✅ Model built successfully with dummy inputs")
+    #get architecture overview
+    model.summary()
+    model.spec_encoder.summary()
+    model.mask_encoder.summary()
+    model.spec_decoder.summary()
+    model.mask_decoder.summary()
+
 
     # ------------------------ 10) Set Up Optimizer ------------------------
     lr_schedule = ExponentialDecay(
@@ -2449,6 +2564,15 @@ def main():
         decay_rate=0.9,
         staircase=True
     )
+
+    # lr_schedule = CosineDecayRestarts(
+    #     initial_learning_rate=5e-5,
+    #     first_decay_steps=10000,
+    #     t_mul=2.0,         # increase period each time
+    #     m_mul=1.0,         # keep same max LR on restart
+    #     alpha=0.1          # min LR = 10% of max
+    # )
+
     optimizer = keras.optimizers.AdamW(
         learning_rate=lr_schedule,
         weight_decay=1e-4,
@@ -2505,9 +2629,9 @@ def main():
     missing_modality_metrics = evaluate_missing_modality(model, val_dataset, n_samples=10)
     print("Missing Modality Performance:")
     print(f"  - Spectrogram (full): {missing_modality_metrics['spec_full']:.4f}")
-    print(f"  - Spectrogram (missing desc): {missing_modality_metrics['spec_miss']:.4f}")
-    print(f"  - Descriptor (full): {missing_modality_metrics['desc_full']:.4f}")
-    print(f"  - Descriptor (missing spec): {missing_modality_metrics['desc_miss']:.4f}")
+    print(f"  - Spectrogram (missing mask): {missing_modality_metrics['spec_miss']:.4f}")
+    print(f"  - Mask (full): {missing_modality_metrics['mask_full']:.4f}")
+    print(f"  - Mask (missing mask): {missing_modality_metrics['mask_miss']:.4f}")
 
     # ------------------------ 16) Generate New Samples ------------------------
     generate_samples(model, data_loader, num_samples=5, fs=fs, nperseg=nperseg, noverlap=noverlap)

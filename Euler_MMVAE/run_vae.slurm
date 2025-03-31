@@ -3,8 +3,7 @@
 #SBATCH --output=vae_run.out
 #SBATCH --error=vae_run.err
 #SBATCH -A es_chatzi
-#SBATCH --gpus=v100:1     
-#SBATCH --gres=gpumem:32g  
+#SBATCH --gpus=a100_80gb:1
 #SBATCH --cpus-per-task=6
 #SBATCH --mem-per-cpu=16G
 #SBATCH --time=18:00:00
@@ -24,6 +23,9 @@ export CUDA_DIR=$CUDA_EULER_ROOT
 
 # ✅ (Optional) Confirm GPU availability from within job
 python -c "import tensorflow as tf; print('🟢 TF sees GPU:', tf.config.list_physical_devices('GPU'))"
+
+echo "🔍 Checking GPU device..."
+nvidia-smi
 
 # ✅ Run your model
 python -u scripts/vae_generator.py
