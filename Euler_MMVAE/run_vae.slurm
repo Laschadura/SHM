@@ -3,11 +3,11 @@
 #SBATCH --output=vae_run.out
 #SBATCH --error=vae_run.err
 #SBATCH -A es_chatzi
-#SBATCH --gpus=v100:1     
+#SBATCH --gpus=v100:2     
 #SBATCH --gres=gpumem:32g  
 #SBATCH --cpus-per-task=6
 #SBATCH --mem-per-cpu=16G
-#SBATCH --time=18:00:00
+#SBATCH --time=24:00:00
 #SBATCH --mail-type=END,FAIL
 
 echo "🔄 Job started on $(hostname) at $(date)"
