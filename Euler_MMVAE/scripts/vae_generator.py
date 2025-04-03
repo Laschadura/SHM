@@ -75,8 +75,6 @@ def clear_gpu_memory():
     gc.collect()
 
 def print_detailed_memory():
-    import psutil
-    import GPUtil
     process = psutil.Process()
     
     # RAM details
@@ -146,7 +144,7 @@ def segment_and_transform(
     sample_rate=200, 
     segment_duration=5.0, 
     percentile=99
-):
+    ):
     """
     Extracts segments from time series data centered around peak RMS values.
     Returns raw segments and their corresponding descriptors.
@@ -260,7 +258,7 @@ def compute_complex_spectrogram(
     fs=200,
     nperseg=128,   # Adjusted window size (was 256)
     noverlap=64     # Adjusted overlap (was 192)
-):
+    ):
     """
     Compute STFT-based spectrograms with debugging.
     
@@ -801,76 +799,67 @@ def weighted_descriptor_mse_loss(y_true, y_pred):
 
 def complex_spectrogram_loss(y_true, y_pred):
     """
-    Custom loss for spectrogram reconstruction that separately handles magnitude and phase.
-    Includes additional shape checking and debugging.
-    
-    Args:
-        y_true: Ground truth spectrogram features [batch, freq, time, channels*2]
-        y_pred: Predicted spectrogram features [batch, freq, time, channels*2]
-        
-    Returns:
-        Combined loss with higher weight on magnitude
+    Custom loss with dynamic shape handling.
+    Only crops if shapes mismatch.
     """
-    # # Print shapes for debugging
-    # print(f"y_true shape: {y_true.shape}, y_pred shape: {y_pred.shape}")
-    
-    # Ensure shapes match exactly
-    if y_true.shape != y_pred.shape:
-        print(f"WARNING: Shape mismatch - y_true: {y_true.shape}, y_pred: {y_pred.shape}")
-        # Make the shapes consistent by cropping to the smaller size
-        min_freq = min(y_true.shape[1], y_pred.shape[1])
-        min_time = min(y_true.shape[2], y_pred.shape[2])
-        min_ch = min(y_true.shape[3], y_pred.shape[3])
-        
-        y_true = y_true[:, :min_freq, :min_time, :min_ch]
-        y_pred = y_pred[:, :min_freq, :min_time, :min_ch]
-        print(f"After adjustment - y_true: {y_true.shape}, y_pred: {y_pred.shape}")
-    
-    # Ensure tensor has even number of channels (for magnitude/phase pairs)
-    if y_true.shape[-1] % 2 != 0:
-        print(f"WARNING: Channel dimension {y_true.shape[-1]} is not even")
-        # Truncate to even number of channels if needed
-        y_true = y_true[..., :-1]
-        y_pred = y_pred[..., :-1]
-    
-    # Get total number of channels
-    total_channels = tf.shape(y_true)[-1]
-    
-    # Separate magnitude and phase components
-    # Create indices for even and odd positions
-    mag_indices = tf.range(0, total_channels, delta=2)
+    y_true_dyn_shape = tf.shape(y_true)
+    y_pred_dyn_shape = tf.shape(y_pred)
+
+    # Check if any dimension mismatches
+    shape_mismatch = tf.logical_or(
+        tf.reduce_any(tf.not_equal(y_true_dyn_shape[1:4], y_pred_dyn_shape[1:4])),
+        tf.not_equal(y_true_dyn_shape[-1] % 2, 0)
+    )
+
+    def crop_to_min_dims():
+        # Crop frequency, time, channel to shared min
+        min_freq = tf.minimum(y_true_dyn_shape[1], y_pred_dyn_shape[1])
+        min_time = tf.minimum(y_true_dyn_shape[2], y_pred_dyn_shape[2])
+        min_ch   = tf.minimum(y_true_dyn_shape[3], y_pred_dyn_shape[3])
+
+        y_true_cropped = y_true[:, :min_freq, :min_time, :min_ch]
+        y_pred_cropped = y_pred[:, :min_freq, :min_time, :min_ch]
+
+        # Ensure even channels
+        ch_mod = tf.math.floormod(tf.shape(y_true_cropped)[-1], 2)
+
+        y_true_final = tf.cond(
+            tf.equal(ch_mod, 1),
+            lambda: y_true_cropped[..., :-1],
+            lambda: y_true_cropped
+        )
+        y_pred_final = tf.cond(
+            tf.equal(ch_mod, 1),
+            lambda: y_pred_cropped[..., :-1],
+            lambda: y_pred_cropped
+        )
+        return y_true_final, y_pred_final
+
+    def no_crop_needed():
+        return y_true, y_pred
+
+    # Apply shape fixing only if needed
+    y_true_fixed, y_pred_fixed = tf.cond(shape_mismatch, crop_to_min_dims, no_crop_needed)
+
+    # Get total channels
+    total_channels = tf.shape(y_true_fixed)[-1]
+    mag_indices   = tf.range(0, total_channels, delta=2)
     phase_indices = tf.range(1, total_channels, delta=2)
-    
-    # Gather the magnitude and phase components
-    mag_true = tf.gather(y_true, mag_indices, axis=-1)
-    mag_pred = tf.gather(y_pred, mag_indices, axis=-1)
-    
-    phase_true = tf.gather(y_true, phase_indices, axis=-1)
-    phase_pred = tf.gather(y_pred, phase_indices, axis=-1)
-    
-    # MSE for magnitude (more important)
+
+    mag_true = tf.gather(y_true_fixed, mag_indices, axis=-1)
+    mag_pred = tf.gather(y_pred_fixed, mag_indices, axis=-1)
+    phase_true = tf.gather(y_true_fixed, phase_indices, axis=-1)
+    phase_pred = tf.gather(y_pred_fixed, phase_indices, axis=-1)
+
+    # Magnitude loss: MSE
     mag_loss = tf.reduce_mean(tf.square(mag_true - mag_pred))
-    
-    # For phase, we need a circular distance metric
-    # Convert to complex numbers on the unit circle
-    phase_true_complex = tf.complex(
-        tf.cos(phase_true), 
-        tf.sin(phase_true)
-    )
-    phase_pred_complex = tf.complex(
-        tf.cos(phase_pred), 
-        tf.sin(phase_pred)
-    )
-    
-    # Compute cosine of angle difference
-    # z1·conj(z2) gives |z1|·|z2|·cos(θ1-θ2) + i·|z1|·|z2|·sin(θ1-θ2)
-    # We just want the real part (cosine of angle difference)
+
+    # Phase loss: angular distance via cosine similarity
+    phase_true_complex = tf.complex(tf.cos(phase_true), tf.sin(phase_true))
+    phase_pred_complex = tf.complex(tf.cos(phase_pred), tf.sin(phase_pred))
     phase_diff_cos = tf.math.real(phase_true_complex * tf.math.conj(phase_pred_complex))
-    
-    # 1 - cos(diff) is a good metric for angular distance (0 when identical, 2 when opposite)
     phase_loss = tf.reduce_mean(1.0 - phase_diff_cos)
-    
-    # Combine losses with higher weight on magnitude
+
     return 0.8 * mag_loss + 0.2 * phase_loss
 
 def dynamic_weighting(epoch, max_epochs, min_weight=0.3, max_weight=0.7):
@@ -904,7 +893,7 @@ def get_beta_schedule(epoch, max_epochs, schedule_type='cyclical'):
     """
     # Define beta limits
     BETA_MIN = 1e-8   # Start with very small value
-    BETA_MAX = 0.1   # Maximum value
+    BETA_MAX = 0.3   # Maximum value
     
     # Define warmup phase length (in epochs)
     WARMUP_EPOCHS = 150
@@ -1178,7 +1167,7 @@ class SpectralMMVAE(tf.keras.Model):
 def create_tf_dataset(
     spectrograms, descriptor_array, test_id_array,
     batch_size=32, shuffle=True, debug_mode=False, debug_samples=500
-):
+    ):
     """
     Create a TensorFlow Dataset that loads data from memory.
     """
@@ -1211,6 +1200,64 @@ def create_tf_dataset(
     return dataset
 
 # ----- Training Function -----
+
+def train_step(model, optimizer, spec_in, desc_in, test_id_in, missing_modality, beta, spec_weight, desc_weight):
+    """
+    Performs one training step.
+    
+    Args:
+        spec_in: Batch of spectrogram inputs.
+        desc_in: Batch of descriptor inputs.
+        test_id_in: Batch of test IDs.
+        missing_modality: tf.constant string indicating missing modality ('' if none, 'spec' or 'desc').
+        beta: Scalar weighting for the JS divergence term.
+        spec_weight: Weight for spectrogram loss.
+        desc_weight: Weight for descriptor loss.
+        
+    Returns:
+        A tuple of (total_loss, spec_loss, desc_loss, js_div, recon_loss).
+    """
+    with tf.GradientTape() as tape:
+        # Forward pass
+        recon_spec, recon_desc, (all_mus, all_logvars, mixture_prior, js_div) = model(
+            spec_in, desc_in, test_id_in,
+            training=True,
+            missing_modality=missing_modality
+        )
+        
+        # Compute losses only if the modality is present.
+        spec_loss = tf.cond(
+            tf.logical_not(tf.equal(missing_modality, 'spec')),
+            lambda: complex_spectrogram_loss(spec_in, recon_spec),
+            lambda: tf.constant(0.0, dtype=tf.float32)
+        )
+        desc_loss = tf.cond(
+            tf.logical_not(tf.equal(missing_modality, 'desc')),
+            lambda: weighted_descriptor_mse_loss(desc_in, recon_desc),
+            lambda: tf.constant(0.0, dtype=tf.float32)
+        )
+        
+        # Compute reconstruction loss based on missing modality.
+        # If no modality is missing (missing_modality == ''), combine both losses.
+        recon_loss = tf.cond(
+            tf.equal(missing_modality, ''),
+            lambda: spec_weight * spec_loss + desc_weight * desc_loss,
+            lambda: tf.cond(
+                tf.equal(missing_modality, 'spec'),
+                lambda: desc_loss,  # Only descriptor loss is computed.
+                lambda: spec_loss   # Only spectrogram loss is computed.
+            )
+        )
+        
+        total_loss = recon_loss + beta * js_div
+
+    # Compute gradients and update parameters.
+    grads = tape.gradient(total_loss, model.trainable_variables)
+    clipped_grads, _ = tf.clip_by_global_norm(grads, 5.0)
+    optimizer.apply_gradients(zip(clipped_grads, model.trainable_variables))
+    
+    return total_loss, spec_loss, desc_loss, js_div, recon_loss
+
 def train_spectral_mmvae(
     model, 
     train_dataset, 
@@ -1219,10 +1266,9 @@ def train_spectral_mmvae(
     num_epochs=100, 
     patience=10,
     beta_schedule='cyclical',
-    modality_dropout_prob=0.1
-):
-    import gc
-
+    modality_dropout_prob=0.1,
+    strategy=None 
+    ):
     metrics = {
         'train_total': [], 'train_spec': [], 'train_desc': [], 
         'train_js': [], 'train_mode': [],
@@ -1243,6 +1289,7 @@ def train_spectral_mmvae(
     print(f"Training on {train_batches_count} batches, validating on {val_batches_count} batches")
 
     for epoch in range(num_epochs):
+        # Initialize metrics for this epoch.
         epoch_metrics = {
             'train_total': 0.0, 'train_spec': 0.0, 'train_desc': 0.0, 
             'train_js': 0.0, 'train_full': 0.0, 
@@ -1258,61 +1305,50 @@ def train_spectral_mmvae(
         print(f"📌 Epoch {epoch+1}/{num_epochs} | Beta: {beta:.6f} | Descriptor Weight: {desc_weight:.2f}")
 
         for step, (spec_in, desc_in, test_id_in) in enumerate(train_dataset):
-            missing_modality = None
-            random_value = tf.random.uniform(shape=[], minval=0, maxval=1)
+            # Determine missing modality. Use an empty string ('') if no modality is dropped.
+            random_value = tf.random.uniform([], minval=0, maxval=1)
             if random_value < modality_dropout_prob * 2:
-                missing_modality = 'spec' if random_value < modality_dropout_prob else 'desc'
-
-            with tf.GradientTape(persistent=True) as tape:
-                try:
-                    recon_spec, recon_desc, (all_mus, all_logvars, mixture_prior, js_div) = model(
-                        spec_in, desc_in, test_id_in,
-                        training=True,
-                        missing_modality=missing_modality
-                    )
-                except Exception as e:
-                    print(f"❌ Forward pass error: {e}")
-                    continue
-
-                try:
-                    spec_loss = complex_spectrogram_loss(spec_in, recon_spec) if missing_modality != 'spec' else 0.0
-                    desc_loss = weighted_descriptor_mse_loss(desc_in, recon_desc) if missing_modality != 'desc' else 0.0
-                except Exception as e:
-                    print(f"❌ Loss computation error: {e}")
-                    continue
-
-                if missing_modality is None:
-                    recon_loss = spec_weight * spec_loss + desc_weight * desc_loss
-                    epoch_metrics['n_full'] += 1
-                    epoch_metrics['train_full'] += float(recon_loss)
-                elif missing_modality == 'spec':
-                    recon_loss = desc_loss
-                    epoch_metrics['n_desc_only'] += 1
-                    epoch_metrics['train_desc_only'] += float(recon_loss)
+                if random_value < modality_dropout_prob:
+                    missing_modality_str = 'spec'
                 else:
-                    recon_loss = spec_loss
-                    epoch_metrics['n_spec_only'] += 1
-                    epoch_metrics['train_spec_only'] += float(recon_loss)
+                    missing_modality_str = 'desc'
+            else:
+                missing_modality_str = ''
 
-                total_loss = recon_loss + beta * js_div
+            # Run the train_step function within the strategy context
+            def step_fn(spec_in, desc_in, test_id_in):
+                return train_step(
+                    model, optimizer, spec_in, desc_in, test_id_in, 
+                    tf.constant(missing_modality_str), beta, spec_weight, desc_weight
+                )
 
-                if tf.math.is_nan(total_loss) or tf.math.is_inf(total_loss):
-                    print("❌ WARNING: Invalid loss detected! Skipping gradient update.")
-                    continue
+            total_loss, spec_loss, desc_loss, js_div, recon_loss = strategy.run(
+                step_fn, args=(spec_in, desc_in, test_id_in)
+            )
 
-            try:
-                grads = tape.gradient(total_loss, model.trainable_variables)
-                clipped_grads, grad_norm = tf.clip_by_global_norm(grads, 5.0)
-                optimizer.apply_gradients(zip(clipped_grads, model.trainable_variables))
-            except Exception as e:
-                print(f"❌ Gradient computation error: {e}")
-                continue
+            #combine the losses computed on different GPUs
+            total_loss = strategy.reduce(tf.distribute.ReduceOp.MEAN, total_loss, axis=None)
+            spec_loss  = strategy.reduce(tf.distribute.ReduceOp.MEAN, spec_loss, axis=None)
+            desc_loss  = strategy.reduce(tf.distribute.ReduceOp.MEAN, desc_loss, axis=None)
+            js_div     = strategy.reduce(tf.distribute.ReduceOp.MEAN, js_div, axis=None)
+            recon_loss = strategy.reduce(tf.distribute.ReduceOp.MEAN, recon_loss, axis=None)
 
-            epoch_metrics['train_total'] += float(total_loss)
-            epoch_metrics['train_spec'] += float(spec_loss) if missing_modality != 'spec' else 0.0
-            epoch_metrics['train_desc'] += float(desc_loss) if missing_modality != 'desc' else 0.0
-            epoch_metrics['train_js'] += float(js_div)
+            # Update epoch metrics (using .numpy() to extract scalar values).
+            epoch_metrics['train_total'] += total_loss.numpy()
+            epoch_metrics['train_spec'] += spec_loss.numpy() if missing_modality_str != 'spec' else 0.0
+            epoch_metrics['train_desc'] += desc_loss.numpy() if missing_modality_str != 'desc' else 0.0
+            epoch_metrics['train_js'] += js_div.numpy()
             epoch_metrics['train_steps'] += 1
+
+            if missing_modality_str == '':
+                epoch_metrics['n_full'] += 1
+                epoch_metrics['train_full'] += recon_loss.numpy()
+            elif missing_modality_str == 'spec':
+                epoch_metrics['n_desc_only'] += 1
+                epoch_metrics['train_desc_only'] += recon_loss.numpy()
+            else:  # missing_modality_str == 'desc'
+                epoch_metrics['n_spec_only'] += 1
+                epoch_metrics['train_spec_only'] += recon_loss.numpy()
 
         if epoch_metrics['train_steps'] > 0:
             metrics['train_total'].append(epoch_metrics['train_total'] / epoch_metrics['train_steps'])
@@ -1330,21 +1366,22 @@ def train_spectral_mmvae(
                   f"Desc: {metrics['train_desc'][-1]:.4f} | "
                   f"JS: {metrics['train_js'][-1]:.4f}")
 
-        # Validation loop
+        # Validation loop (without modality dropout).
         epoch_val_metrics = {'total': 0.0, 'spec': 0.0, 'desc': 0.0, 'js': 0.0, 'steps': 0}
         for step, (spec_in, desc_in, test_id_in) in enumerate(val_dataset):
             recon_spec, recon_desc, (all_mus, all_logvars, mixture_prior, js_div) = model(
-                spec_in, desc_in, test_id_in, training=False, missing_modality=None)
+                spec_in, desc_in, test_id_in, training=False, missing_modality=''
+            )
 
             spec_loss = complex_spectrogram_loss(spec_in, recon_spec)
             desc_loss = weighted_descriptor_mse_loss(desc_in, recon_desc)
             recon_loss = spec_weight * spec_loss + desc_weight * desc_loss
             total_loss = recon_loss + beta * js_div
 
-            epoch_val_metrics['total'] += float(total_loss)
-            epoch_val_metrics['spec'] += float(spec_loss)
-            epoch_val_metrics['desc'] += float(desc_loss)
-            epoch_val_metrics['js'] += float(js_div)
+            epoch_val_metrics['total'] += total_loss.numpy()
+            epoch_val_metrics['spec'] += spec_loss.numpy()
+            epoch_val_metrics['desc'] += desc_loss.numpy()
+            epoch_val_metrics['js'] += js_div.numpy()
             epoch_val_metrics['steps'] += 1
 
         if epoch_val_metrics['steps'] > 0:
@@ -2327,8 +2364,8 @@ def main():
     noverlap = 224 # STFT overlap
     
     latent_dim = 128 
-    batch_size = 64  
-    num_epochs = 800 
+    batch_size = 128  
+    num_epochs = 600 
     patience = 300  
 
     # Cached file paths
@@ -2421,7 +2458,9 @@ def main():
 
     # ------------------------ 8) Create TensorFlow Datasets ------------------------
     train_dataset = create_tf_dataset(train_spec, train_desc, train_ids, batch_size, debug_mode=debug_mode)
+    train_dataset = train_dataset.cache().shuffle(buffer_size=1024).prefetch(tf.data.AUTOTUNE)
     val_dataset   = create_tf_dataset(val_spec, val_desc, val_ids, batch_size, debug_mode=debug_mode)
+    val_dataset = val_dataset.cache().shuffle(buffer_size=1024).prefetch(tf.data.AUTOTUNE)
 
     print(f"✅ Train batches: {sum(1 for _ in train_dataset)}")
     print(f"✅ Val batches: {sum(1 for _ in val_dataset)}")
@@ -2434,41 +2473,47 @@ def main():
     print(f"  - Spectrogram shape: {spec_shape}")
     print(f"  - Descriptor shape: ({max_num_cracks}, {desc_length})")
 
-    model = SpectralMMVAE(latent_dim, spec_shape, max_num_cracks, desc_length)
+    strategy = tf.distribute.MirroredStrategy()
+    print(f"Number of devices: {strategy.num_replicas_in_sync}")
 
-    # Build with a dummy forward pass
-    dummy_spec = tf.zeros((1, *spec_shape))
-    dummy_desc = tf.zeros((1, max_num_cracks, desc_length))
-    _ = model(dummy_spec, dummy_desc, training=True)
-    print("✅ Model built successfully with dummy inputs")
+    with strategy.scope():
 
-    # ------------------------ 10) Set Up Optimizer ------------------------
-    lr_schedule = ExponentialDecay(
-        initial_learning_rate=5e-5,
-        decay_steps=10000,
-        decay_rate=0.9,
-        staircase=True
-    )
-    optimizer = keras.optimizers.AdamW(
-        learning_rate=lr_schedule,
-        weight_decay=1e-4,
-        beta_1=0.9,
-        beta_2=0.999,
-        epsilon=1e-6
-    )
+        model = SpectralMMVAE(latent_dim, spec_shape, max_num_cracks, desc_length)
 
-    # ------------------------ 11) Train Model ------------------------
-    print("🚀 Starting training...")
-    training_metrics = train_spectral_mmvae(
-        model, 
-        train_dataset, 
-        val_dataset, 
-        optimizer, 
-        num_epochs=num_epochs, 
-        patience=patience,
-        beta_schedule='cyclical',
-        modality_dropout_prob=0.05
-    )
+        # Build with a dummy forward pass
+        dummy_spec = tf.zeros((1, *spec_shape))
+        dummy_desc = tf.zeros((1, max_num_cracks, desc_length))
+        _ = model(dummy_spec, dummy_desc, training=True)
+        print("✅ Model built successfully with dummy inputs")
+
+        # ------------------------ 10) Set Up Optimizer ------------------------
+        lr_schedule = ExponentialDecay(
+            initial_learning_rate=1e-4,
+            decay_steps=10000,
+            decay_rate=0.9,
+            staircase=True
+        )
+        optimizer = keras.optimizers.AdamW(
+            learning_rate=lr_schedule,
+            weight_decay=1e-4,
+            beta_1=0.9,
+            beta_2=0.999,
+            epsilon=1e-6
+        )
+
+        # ------------------------ 11) Train Model ------------------------
+        print("🚀 Starting training...")
+        training_metrics = train_spectral_mmvae(
+            model, 
+            train_dataset, 
+            val_dataset, 
+            optimizer, 
+            num_epochs=num_epochs, 
+            patience=patience,
+            beta_schedule='cyclical',
+            modality_dropout_prob=0.05,
+            strategy=strategy
+        )
 
     # ------------------------ 12) Save & Visualize Training Results ------------------------
     np.save("results/training_metrics.npy", training_metrics)
