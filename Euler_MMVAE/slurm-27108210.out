@@ -1,6 +1,0 @@
-import: unable to open X server `localhost:11.0' @ error/import.c/ImportImageCommand/348.
-import: unable to open X server `localhost:11.0' @ error/import.c/ImportImageCommand/348.
-import: unable to open X server `localhost:11.0' @ error/import.c/ImportImageCommand/348.
-import: unable to open X server `localhost:11.0' @ error/import.c/ImportImageCommand/348.
-scripts/vae_generator.py: 5: : not found
-scripts/vae_generator.py: 6: Syntax error: "(" unexpected
