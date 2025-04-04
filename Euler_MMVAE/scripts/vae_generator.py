@@ -23,7 +23,7 @@ import GPUtil
 import tensorflow as tf
 
 # Multithreading
-tf.config.threading.set_intra_op_parallelism_threads(3)
+tf.config.threading.set_intra_op_parallelism_threads(2)
 tf.config.threading.set_inter_op_parallelism_threads(1)
 
 # Set working directory
@@ -1137,6 +1137,55 @@ def create_tf_dataset(
     return dataset
 
 # ----- Training Function -----
+def train_step(
+    model, 
+    optimizer, 
+    spec_in, 
+    mask_in, 
+    test_id_in,
+    missing_modality_str,  # <-- now a normal Python string
+    beta, 
+    spec_weight, 
+    mask_weight
+    ):
+    """
+    Perform one training step (forward pass + backprop) on a single replica.
+    missing_modality_str is a Python string in {'spec', 'mask', ''}.
+    """
+    with tf.GradientTape() as tape:
+        # Forward pass
+        recon_spec, recon_mask, (all_mus, all_logvars, mixture_prior, js_div) = model(
+            spec_in, mask_in, test_id_in,
+            training=True,
+            missing_modality=missing_modality_str
+        )
+
+        # Always produce Tensors (not Python floats)
+        spec_loss = complex_spectrogram_loss(spec_in, recon_spec)
+        mask_loss = custom_mask_loss(mask_in, recon_mask)
+
+        # Decide recon_loss with simple Python if-else
+        if missing_modality_str == 'spec':
+            # 'spec' is missing => only do mask_loss
+            recon_loss = mask_loss
+        elif missing_modality_str == 'mask':
+            # 'mask' is missing => only do spec_loss
+            recon_loss = spec_loss
+        else:
+            # no modality missing => combine with weights
+            recon_loss = (tf.constant(spec_weight, tf.float32) * spec_loss
+                         + tf.constant(mask_weight,  tf.float32) * mask_loss)
+
+        total_loss = recon_loss + beta * js_div
+
+    # Backprop
+    grads = tape.gradient(total_loss, model.trainable_variables)
+    clipped_grads, _ = tf.clip_by_global_norm(grads, 5.0)
+    optimizer.apply_gradients(zip(clipped_grads, model.trainable_variables))
+
+    # Return Tensors, not Python floats
+    return total_loss, spec_loss, mask_loss, js_div, recon_loss
+
 def train_spectral_mmvae(
     model, 
     train_dataset, 
@@ -1145,8 +1194,10 @@ def train_spectral_mmvae(
     num_epochs=100, 
     patience=10,
     beta_schedule='cyclical',
-    modality_dropout_prob=0.1
+    modality_dropout_prob=0.1,
+    strategy=None
     ):
+    # Storage for metrics
     metrics = {
         'train_total': [], 'train_spec': [], 'train_mask': [], 
         'train_js': [], 'train_mode': [],
@@ -1156,89 +1207,91 @@ def train_spectral_mmvae(
     best_val_loss = float('inf')
     no_improvement_count = 0
 
-    print("🔄 Starting Training for Spectral MMVAE with Mixture-of-Experts...")
-
     train_batches_count = sum(1 for _ in train_dataset)
     val_batches_count = sum(1 for _ in val_dataset)
-    print(f"Training on {train_batches_count} batches, validating on {val_batches_count} batches")
+    print(f"🔄 Starting Training: {train_batches_count} train batches, {val_batches_count} val batches")
 
     for epoch in range(num_epochs):
         epoch_metrics = {
-            'train_total': 0.0, 'train_spec': 0.0, 'train_mask': 0.0, 
-            'train_js': 0.0, 'train_full': 0.0, 
-            'train_spec_only': 0.0, 'train_mask_only': 0.0,
-            'n_full': 0, 'n_spec_only': 0, 'n_mask_only': 0,
+            'train_total': 0.0, 
+            'train_spec': 0.0, 
+            'train_mask': 0.0, 
+            'train_js': 0.0,
+            'train_full': 0.0, 
+            'train_spec_only': 0.0, 
+            'train_mask_only': 0.0,
+            'n_full': 0, 
+            'n_spec_only': 0, 
+            'n_mask_only': 0,
             'train_steps': 0
         }
 
         beta = get_beta_schedule(epoch, num_epochs, beta_schedule)
-        # Use dynamic_weighting to get weight for mask loss
         mask_weight = dynamic_weighting(epoch, num_epochs)
         spec_weight = 1.0 - mask_weight
+        print(f"📌 Epoch {epoch+1}/{num_epochs} | Beta={beta:.5f} | MaskW={mask_weight:.2f}")
 
-        print(f"📌 Epoch {epoch+1}/{num_epochs} | Beta: {beta:.6f} | Mask Weight: {mask_weight:.2f}")
-
+        # ---------------- TRAIN LOOP ----------------
         for step, (spec_in, mask_in, test_id_in) in enumerate(train_dataset):
-            missing_modality = None
-            random_value = tf.random.uniform(shape=[], minval=0, maxval=1)
-            if random_value < modality_dropout_prob * 2:
-                missing_modality = 'spec' if random_value < modality_dropout_prob else 'mask'
+            # Use a Python random decision per batch
+            # => same decision on both replicas (they see the same "random_value")
+            rv = random.random()
+            if rv < modality_dropout_prob:
+                missing_modality_str = 'spec'
+            elif rv < 2.0 * modality_dropout_prob:
+                missing_modality_str = 'mask'
+            else:
+                missing_modality_str = ''
 
-            with tf.GradientTape(persistent=True) as tape:
-                try:
-                    recon_spec, recon_mask, (all_mus, all_logvars, mixture_prior, js_div) = model(
-                        spec_in, mask_in, test_id_in,
-                        training=True,
-                        missing_modality=missing_modality
-                    )
-                except Exception as e:
-                    print(f"❌ Forward pass error: {e}")
-                    continue
+            def step_fn(spec_mb, mask_mb, test_id_mb):
+                return train_step(
+                    model, optimizer, spec_mb, mask_mb, test_id_mb,
+                    missing_modality_str,  # a Python string
+                    tf.constant(beta, tf.float32),
+                    spec_weight,
+                    mask_weight
+                )
 
-                try:
-                    spec_loss = complex_spectrogram_loss(spec_in, recon_spec) if missing_modality != 'spec' else 0.0
-                    mask_loss = custom_mask_loss(mask_in, recon_mask) if missing_modality != 'mask' else 0.0
-                except Exception as e:
-                    print(f"❌ Loss computation error: {e}")
-                    continue
+            # Distributed step across replicas
+            total_loss, spec_loss_val, mask_loss_val, js_div_val, recon_loss_val = strategy.run(
+                step_fn, 
+                args=(spec_in, mask_in, test_id_in)
+            )
 
-                if missing_modality is None:
-                    recon_loss = spec_weight * spec_loss + mask_weight * mask_loss
-                    epoch_metrics['n_full'] += 1
-                    epoch_metrics['train_full'] += float(recon_loss)
-                elif missing_modality == 'spec':
-                    recon_loss = mask_loss
-                    epoch_metrics['n_mask_only'] += 1
-                    epoch_metrics['train_mask_only'] += float(recon_loss)
-                else:
-                    recon_loss = spec_loss
-                    epoch_metrics['n_spec_only'] += 1
-                    epoch_metrics['train_spec_only'] += float(recon_loss)
+            # Combine across replicas
+            total_loss     = strategy.reduce(tf.distribute.ReduceOp.MEAN, total_loss,     axis=None)
+            spec_loss_val  = strategy.reduce(tf.distribute.ReduceOp.MEAN, spec_loss_val,  axis=None)
+            mask_loss_val  = strategy.reduce(tf.distribute.ReduceOp.MEAN, mask_loss_val,  axis=None)
+            js_div_val     = strategy.reduce(tf.distribute.ReduceOp.MEAN, js_div_val,     axis=None)
+            recon_loss_val = strategy.reduce(tf.distribute.ReduceOp.MEAN, recon_loss_val, axis=None)
 
-                total_loss = recon_loss + beta * js_div
-
-                if tf.math.is_nan(total_loss) or tf.math.is_inf(total_loss):
-                    print("❌ WARNING: Invalid loss detected! Skipping gradient update.")
-                    continue
-
-            try:
-                grads = tape.gradient(total_loss, model.trainable_variables)
-                clipped_grads, grad_norm = tf.clip_by_global_norm(grads, 5.0)
-                optimizer.apply_gradients(zip(clipped_grads, model.trainable_variables))
-            except Exception as e:
-                print(f"❌ Gradient computation error: {e}")
-                continue
-
-            epoch_metrics['train_total'] += float(total_loss)
-            epoch_metrics['train_spec'] += float(spec_loss) if missing_modality != 'spec' else 0.0
-            epoch_metrics['train_mask'] += float(mask_loss) if missing_modality != 'mask' else 0.0
-            epoch_metrics['train_js'] += float(js_div)
+            # Convert them to Python floats for logging outside the step function
+            epoch_metrics['train_total'] += float(total_loss.numpy())
+            if missing_modality_str != 'spec':
+                epoch_metrics['train_spec'] += float(spec_loss_val.numpy())
+            if missing_modality_str != 'mask':
+                epoch_metrics['train_mask'] += float(mask_loss_val.numpy())
+            epoch_metrics['train_js'] += float(js_div_val.numpy())
             epoch_metrics['train_steps'] += 1
 
+            # Count how many times each scenario happened
+            if missing_modality_str == '':
+                epoch_metrics['n_full'] += 1
+                epoch_metrics['train_full'] += float(recon_loss_val.numpy())
+            elif missing_modality_str == 'spec':
+                epoch_metrics['n_mask_only'] += 1
+                epoch_metrics['train_mask_only'] += float(recon_loss_val.numpy())
+            else:  # missing_modality_str == 'mask'
+                epoch_metrics['n_spec_only'] += 1
+                epoch_metrics['train_spec_only'] += float(recon_loss_val.numpy())
+
+        # Averages
         if epoch_metrics['train_steps'] > 0:
             metrics['train_total'].append(epoch_metrics['train_total'] / epoch_metrics['train_steps'])
-            metrics['train_spec'].append(epoch_metrics['train_spec'] / max(epoch_metrics['train_steps'] - epoch_metrics['n_mask_only'], 1))
-            metrics['train_mask'].append(epoch_metrics['train_mask'] / max(epoch_metrics['train_steps'] - epoch_metrics['n_spec_only'], 1))
+            full_steps_for_spec = epoch_metrics['train_steps'] - epoch_metrics['n_mask_only']
+            full_steps_for_mask = epoch_metrics['train_steps'] - epoch_metrics['n_spec_only']
+            metrics['train_spec'].append(epoch_metrics['train_spec'] / max(full_steps_for_spec, 1))
+            metrics['train_mask'].append(epoch_metrics['train_mask'] / max(full_steps_for_mask, 1))
             metrics['train_js'].append(epoch_metrics['train_js'] / epoch_metrics['train_steps'])
             metrics['train_mode'].append({
                 'full': epoch_metrics['train_full'] / max(epoch_metrics['n_full'], 1),
@@ -1246,59 +1299,56 @@ def train_spectral_mmvae(
                 'mask_only': epoch_metrics['train_mask_only'] / max(epoch_metrics['n_mask_only'], 1)
             })
 
-            print(f"✅ Train Loss: {metrics['train_total'][-1]:.4f} | "
-                  f"Spec: {metrics['train_spec'][-1]:.4f} | "
-                  f"Mask: {metrics['train_mask'][-1]:.4f} | "
-                  f"JS: {metrics['train_js'][-1]:.4f}")
+            print(f"✅ [Train] Loss={metrics['train_total'][-1]:.4f} | "
+                  f"Spec={metrics['train_spec'][-1]:.4f} | "
+                  f"Mask={metrics['train_mask'][-1]:.4f} | "
+                  f"JS={metrics['train_js'][-1]:.4f}")
 
-        # Validation loop
-        epoch_val_metrics = {'total': 0.0, 'spec': 0.0, 'mask': 0.0, 'js': 0.0, 'steps': 0}
+        # ---------------- VAL LOOP ----------------
+        val_dict = {'total': 0.0, 'spec': 0.0, 'mask': 0.0, 'js': 0.0, 'steps': 0}
         for step, (spec_in, mask_in, test_id_in) in enumerate(val_dataset):
-            recon_spec, recon_mask, (all_mus, all_logvars, mixture_prior, js_div) = model(
-                spec_in, mask_in, test_id_in, training=False, missing_modality=None)
+            # No missing modality for validation
+            recon_spec, recon_mask, (all_mus, all_logvars, mixture_prior, js_div_val) = model(
+                spec_in, mask_in, test_id_in, training=False, missing_modality=None
+            )
 
-            spec_loss = complex_spectrogram_loss(spec_in, recon_spec)
-            mask_loss = custom_mask_loss(mask_in, recon_mask)
-            recon_loss = spec_weight * spec_loss + mask_weight * mask_loss
-            total_loss = recon_loss + beta * js_div
+            spec_loss_val = complex_spectrogram_loss(spec_in, recon_spec)
+            mask_loss_val = custom_mask_loss(mask_in, recon_mask)
+            recon_loss_val = spec_weight * spec_loss_val + mask_weight * mask_loss_val
+            total_loss_val = recon_loss_val + tf.constant(beta, tf.float32) * js_div_val
 
-            epoch_val_metrics['total'] += float(total_loss)
-            epoch_val_metrics['spec'] += float(spec_loss)
-            epoch_val_metrics['mask'] += float(mask_loss)
-            epoch_val_metrics['js'] += float(js_div)
-            epoch_val_metrics['steps'] += 1
+            val_dict['total'] += float(total_loss_val.numpy())
+            val_dict['spec']  += float(spec_loss_val.numpy())
+            val_dict['mask']  += float(mask_loss_val.numpy())
+            val_dict['js']    += float(js_div_val.numpy())
+            val_dict['steps'] += 1
 
-        if epoch_val_metrics['steps'] > 0:
-            metrics['val_total'].append(epoch_val_metrics['total'] / epoch_val_metrics['steps'])
-            metrics['val_spec'].append(epoch_val_metrics['spec'] / epoch_val_metrics['steps'])
-            metrics['val_mask'].append(epoch_val_metrics['mask'] / epoch_val_metrics['steps'])
-            metrics['val_js'].append(epoch_val_metrics['js'] / epoch_val_metrics['steps'])
-            print(f"  🔵 Val => Total: {metrics['val_total'][-1]:.4f} | "
-                  f"Spec: {metrics['val_spec'][-1]:.4f} | "
-                  f"Mask: {metrics['val_mask'][-1]:.4f} | "
-                  f"JS: {metrics['val_js'][-1]:.4f}")
-        
-        tf.keras.backend.clear_session()
-        gc.collect()
+        if val_dict['steps'] > 0:
+            metrics['val_total'].append(val_dict['total']/val_dict['steps'])
+            metrics['val_spec'].append(val_dict['spec']/val_dict['steps'])
+            metrics['val_mask'].append(val_dict['mask']/val_dict['steps'])
+            metrics['val_js'].append(val_dict['js']/val_dict['steps'])
 
-        current_val_loss = metrics['val_total'][-1]
+            print(f"  🔵 [Val] => Total={metrics['val_total'][-1]:.4f} | "
+                  f"Spec={metrics['val_spec'][-1]:.4f} | "
+                  f"Mask={metrics['val_mask'][-1]:.4f} | "
+                  f"JS={metrics['val_js'][-1]:.4f}")
+
+        # Early stopping
+        current_val_loss = metrics['val_total'][-1] if val_dict['steps'] > 0 else float('inf')
         if current_val_loss < best_val_loss:
             best_val_loss = current_val_loss
             no_improvement_count = 0
             model.save_weights("results/best_spectral_mmvae.weights.h5")
-            print("✅ Saved best model weights")
+            print("✅ Saved best weights")
         else:
             no_improvement_count += 1
-            print(f"🚨 No improvement for {no_improvement_count}/{patience} epochs.")
+            print(f"🚨 No improvement for {no_improvement_count}/{patience}")
 
         if no_improvement_count >= patience:
-            print(f"🛑 Early stopping triggered at epoch {epoch+1}. No improvement for {patience} epochs.")
+            print(f"🛑 Early stopping at epoch {epoch+1}.")
             model.save_weights("results/final_spectral_mmvae.weights.h5")
-            print("✅ Saved final model weights")
             break
-
-    tf.keras.backend.clear_session()
-    gc.collect()
 
     return metrics
 
@@ -1555,7 +1605,7 @@ def main():
     noverlap = 224 # STFT overlap
     
     latent_dim = 128 
-    batch_size = 64  
+    batch_size = 32  
     num_epochs = 600 
     patience = 150  
 
@@ -1639,58 +1689,54 @@ def main():
 
 
     # ------------------------ 9) Build Model ------------------------
-    spec_shape = spectral_features.shape[1:]
-    mask_shape = (32, 96, 1)
-    print(f"📐 Building model with:")
-    print(f"  - Latent dimension: {latent_dim}")
-    print(f"  - Spectrogram shape: {spec_shape}")
-    print(f"  - Mask shape: ({mask_shape}")
+    strategy = tf.distribute.MirroredStrategy()
+    print(f"Number of devices: {strategy.num_replicas_in_sync}")
 
-    model = SpectralMMVAE(latent_dim, spec_shape, mask_shape)
+    with strategy.scope():
+        spec_shape = spectral_features.shape[1:]
+        mask_shape = (32, 96, 1)
+        print(f"📐 Building model with:")
+        print(f"  - Latent dimension: {latent_dim}")
+        print(f"  - Spectrogram shape: {spec_shape}")
+        print(f"  - Mask shape: {mask_shape}")
 
-    # Build with a dummy forward pass
-    dummy_spec = tf.zeros((1, *spec_shape))
-    dummy_mask = tf.zeros((1, *mask_shape))
-    _ = model(dummy_spec, dummy_mask, training=True)
-    print("✅ Model built successfully with dummy inputs")
-    #get architecture overview
-    model.summary()
-    # ------------------------ 10) Set Up Optimizer ------------------------
-    lr_schedule = ExponentialDecay(
-        initial_learning_rate=5e-5,
-        decay_steps=10000,
-        decay_rate=0.9,
-        staircase=True
-    )
+        model = SpectralMMVAE(latent_dim, spec_shape, mask_shape)
+        # Dummy forward pass
+        dummy_spec = tf.zeros((1, *spec_shape))
+        dummy_mask = tf.zeros((1, *mask_shape))
+        _ = model(dummy_spec, dummy_mask, training=True)
+        model.summary()
 
-    # lr_schedule = CosineDecayRestarts(
-    #     initial_learning_rate=5e-5,
-    #     first_decay_steps=10000,
-    #     t_mul=2.0,         # increase period each time
-    #     m_mul=1.0,         # keep same max LR on restart
-    #     alpha=0.1          # min LR = 10% of max
-    # )
+        # Create optimizer
+        lr_schedule = ExponentialDecay(
+            initial_learning_rate=5e-5,
+            decay_steps=10000,
+            decay_rate=0.9,
+            staircase=True
+        )
 
-    optimizer = keras.optimizers.AdamW(
-        learning_rate=lr_schedule,
-        weight_decay=1e-4,
-        beta_1=0.9,
-        beta_2=0.999,
-        epsilon=1e-6
-    )
+        optimizer = keras.optimizers.AdamW(
+            learning_rate=lr_schedule,
+            weight_decay=1e-4,
+            beta_1=0.9,
+            beta_2=0.999,
+            epsilon=1e-6
+        )
 
-    # ------------------------ 11) Train Model ------------------------
-    print("🚀 Starting training...")
-    training_metrics = train_spectral_mmvae(
-        model, 
-        train_dataset, 
-        val_dataset, 
-        optimizer, 
-        num_epochs=num_epochs, 
-        patience=patience,
-        beta_schedule='cyclical',
-        modality_dropout_prob=0.05
-    )
+        # 10) Train Model (Multi-GPU)
+        print("🚀 Starting training...")
+        training_metrics = train_spectral_mmvae(
+            model, 
+            train_dataset, 
+            val_dataset, 
+            optimizer, 
+            num_epochs=num_epochs, 
+            patience=patience,
+            beta_schedule='cyclical',
+            modality_dropout_prob=0.05,
+            strategy=strategy
+        )
+
 
     # ------------------------- 11.5) Synthesize Examples ------------------------
     synthesize_examples(model, val_dataset, num_examples=5, fs=200, nperseg=256, noverlap=128)

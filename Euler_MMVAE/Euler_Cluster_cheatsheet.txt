@@ -1,0 +1,98 @@
+===============================================================================
+💻 ETH Euler Cluster – Job Monitoring & Debugging Cheat Sheet
+===============================================================================
+
+start job over slurm script:
+sbatch <slurm_script_name>.slurm
+
+📌 BASIC JOB MONITORING
+-------------------------------------------------------------------------------
+squeue -u $USER
+    # Show all jobs for your user
+
+squeue -j <job_id>
+    # Show status of a specific job
+
+scontrol show job <job_id>
+    # Detailed info about a job (nodes, resources, paths, etc.)
+
+scancel <job_id>
+    # Cancel a running or pending job
+
+sinfo -s
+    # Summary of available partitions
+
+sinfon -p <partition_name>
+    # Node status and GPU availability for specific partition (e.g., gpuhe.4h)
+
+===============================================================================
+
+📊 RESOURCE USAGE
+-------------------------------------------------------------------------------
+sstat --format=JobID,MaxRSS,AveRSS,MaxVMSize,Elapsed -j <job_id>
+    # Live resource stats for a running job (memory, time, etc.)
+
+seff <job_id>
+    # Efficiency report after the job has completed
+
+===============================================================================
+
+📁 JOB OUTPUT MONITORING
+-------------------------------------------------------------------------------
+tail -f vae_run.out
+    # Live output log of your job (append mode)
+
+tail -n 100 -f vae_run.out
+    # Show last 100 lines and follow the output
+
+cat vae_run.out
+    # Print the entire output file
+
+less vae_run.out
+    # Open file for scrolling (use 'q' to quit)
+
+grep "loss" vae_run.out
+    # Find specific keyword in output
+
+===============================================================================
+
+📬 EMAIL NOTIFICATIONS (in your sbatch script)
+-------------------------------------------------------------------------------
+#SBATCH --mail-user=your.email@domain.com
+#SBATCH --mail-type=END,FAIL        # options: BEGIN, END, FAIL, ALL
+
+===============================================================================
+
+🧠 HELPFUL EXTRAS
+-------------------------------------------------------------------------------
+hostname
+    # Print name of node (useful in job scripts)
+
+nvidia-smi
+    # Check GPU usage (run inside GPU job)
+
+htop
+    # Monitor CPU/memory live (use inside interactive shell)
+
+watch -n 2 nvidia-smi
+    # Live GPU monitor every 2 seconds
+
+===============================================================================
+
+
+Sync folder (done over local terminal -> not in ssh euler)
+
+Upload: 
+rsync -av --progress "/drives/c/SP-Master-Local/SP_DamageLocalization-MasonryArchBridge_SimonScandella/ProbabilisticApproach/Euler_MMVAE/" scansimo@euler.ethz.ch:/cluster/scratch/scansimo/Euler_MMVAE/
+
+Donwload:
+rsync -av --progress scansimo@euler.ethz.ch:/cluster/scratch/scansimo/Euler_MMVAE/ "/drives/c/SP-Master-Local/SP_DamageLocalization-MasonryArchBridge_SimonScandella/ProbabilisticApproach/Euler_MMVAE/"
+
+
+==============================================================================
+Delete all cached files:
+rm cached_*.npy
+
+
+
+
