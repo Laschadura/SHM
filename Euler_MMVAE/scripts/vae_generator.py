@@ -1089,6 +1089,7 @@ class SpectralMMVAE(tf.keras.Model):
         return time_series
     
 # ----- Data Processing and Dataset Creation -----
+
 def create_tf_dataset(
     spectrograms, mask_array, test_id_array,
     batch_size=32, shuffle=True, debug_mode=False, debug_samples=500
@@ -1586,9 +1587,9 @@ def main():
         # ------------------------ B) Missing Any Cache: Re-run entire pipeline ------------------------
         print("⚠️ At least one cache file is missing. Recomputing EVERYTHING from scratch...")
         print("📥 Loading raw data...")
-        accel_dict, heatmaps = data_loader.load_data()
+        accel_dict, binary_masks, heatmaps = data_loader.load_data()
 
-        mask_segments = np.array([np.expand_dims(heatmaps[k], -1) for k in sorted(heatmaps.keys())])
+        mask_segments = np.array([heatmaps[k] for k in sorted(heatmaps.keys())])
         test_ids = np.array(sorted(heatmaps.keys()))
 
         print(f"Loaded data for {len(accel_dict)} tests")
@@ -1596,7 +1597,6 @@ def main():
         # (2) Segment time series -> get raw_segments, masks, test_ids
         print("✂️ Segmenting data...")
         raw_segments, mask_segments, test_ids = segment_and_transform(accel_dict, heatmaps)
-        mask_segments = np.expand_dims(mask_segments, axis=-1)
         print(f"✅ Extracted {len(raw_segments)} segments")
 
         # Save masks & test IDs for future use
