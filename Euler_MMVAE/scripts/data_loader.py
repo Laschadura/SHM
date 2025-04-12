@@ -27,6 +27,36 @@ perspective_map = {
 ######################################
 # Accelerometer Data Loading
 ######################################
+def highpass_filter(data, cutoff=10.0, fs=200.0, order=4):
+    """
+    Apply a Butterworth high-pass filter to data.
+
+    Args:
+        data: 1D NumPy array of shape (N,) or 2D (N, C). 
+              If 2D, we apply filter to each column.
+        cutoff: High-pass cutoff frequency in Hz.
+        fs: Sampling frequency in Hz.
+        order: Order of the Butterworth filter.
+    
+    Returns:
+        Filtered data, same shape as input.
+    """
+    nyquist = 0.5 * fs
+    normal_cutoff = cutoff / nyquist
+
+    # Get filter coefficients
+    b, a = butter(order, normal_cutoff, btype='high', analog=False)
+
+    # If data is 1D, just apply it directly
+    if data.ndim == 1:
+        return filtfilt(b, a, data, axis=0)
+
+    # If data is 2D (N,C), apply filter channel by channel
+    filtered = np.zeros_like(data)
+    for c in range(data.shape[1]):
+        filtered[:, c] = filtfilt(b, a, data[:, c], axis=0)
+    return filtered
+
 def load_accelerometer_data(data_dir=DATA_DIR, skip_tests=SKIP_TESTS):
     test_dirs = [d for d in glob.glob(os.path.join(data_dir, "Test_*")) if os.path.isdir(d)]
     tests_data = {}
@@ -50,13 +80,34 @@ def load_accelerometer_data(data_dir=DATA_DIR, skip_tests=SKIP_TESTS):
                 accel_cols = [col for col in df.columns if "Accel" in col]
                 if not accel_cols:
                     continue
+
                 data_matrix = df[accel_cols].values.astype(np.float32)
 
+                # Truncate to EXPECTED_LENGTH if needed
                 if data_matrix.shape[0] > EXPECTED_LENGTH:
                     data_matrix = data_matrix[:EXPECTED_LENGTH, :]
 
+                # 1) High-pass filter to remove low-frequency drift
+                data_matrix = highpass_filter(data_matrix, 
+                                              cutoff=10.0,
+                                              fs=200.0,
+                                              order=6)
+
+                # 2) File-wide mean & std across all samples & channels
+                file_mean = np.mean(data_matrix)
+                file_std = np.std(data_matrix)
+
+                # Avoid division by zero or extremely small std
+                eps = 1e-8
+                if file_std < eps:
+                    file_std = eps
+
+                # Normalize entire NxC array by the same mean/std
+                data_matrix = (data_matrix - file_mean) / file_std
+
                 samples.append(data_matrix)
-            except Exception:
+            except Exception as e:
+                print(f"Skipping file {csv_file} due to error: {e}")
                 continue
 
         if samples:
@@ -151,6 +202,37 @@ def load_data():
 def main():
     # Load data
     accel_dict, binary_masks, heatmaps = load_data()
+
+    test_ids = sorted(accel_dict.keys())
+    if not test_ids:
+        print("No data loaded, check your data path or skip-tests list.")
+        return
+    
+    first_test_id = test_ids[0]
+    samples_for_first_test = accel_dict[first_test_id]
+
+    if not samples_for_first_test:
+        print(f"No samples found in Test ID {first_test_id}.")
+        return
+
+    # In your CSV data, each "sample" is a (time_steps×channels) np.array
+    # We'll just pick the first sample
+    raw_sample = samples_for_first_test[0]  # shape ~ (12000, 12) if 60 s at 200 Hz
+
+    # Plot amplitude vs. time for each channel
+    fs = 200.0  # or your known sampling rate
+    time_axis = np.arange(raw_sample.shape[0]) / fs  # in seconds
+
+    plt.figure(figsize=(12,6))
+    for ch in range(raw_sample.shape[1]):
+        plt.plot(time_axis, raw_sample[:, ch], label=f"Ch {ch+1}")
+
+    plt.title(f"Test ID {first_test_id}: First 60s sample (12 channels)")
+    plt.xlabel("Time (s)")
+    plt.ylabel("Amplitude")
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
 
     # Choose three test IDs you want to visualize (change these IDs to whatever exist in your dataset)
     test_ids = [8, 18, 25]  # Example IDs - update as needed

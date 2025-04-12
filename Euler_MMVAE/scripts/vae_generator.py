@@ -1,15 +1,16 @@
 import os
 import sys
 import gc
-import time
-import warnings
-import logging
 import psutil
 import numpy as np
+import random
 import cv2
 import keras
 from keras import layers, Model, optimizers
 from keras.optimizers.schedules import ExponentialDecay, CosineDecayRestarts  
+from sklearn.metrics import mean_squared_error, precision_score, recall_score, f1_score
+from scipy.stats import pearsonr
+from skimage.metrics import structural_similarity as ssim
 from scipy import signal
 import matplotlib.pyplot as plt
 import plotly.graph_objects as go
@@ -18,13 +19,17 @@ import plotly.io as pio
 import plotly.express as px
 import pandas as pd
 import umap
-from sklearn.mixture import GaussianMixture
 import GPUtil
 import tensorflow as tf
+from tensorflow.keras import mixed_precision
 
 # Multithreading
 tf.config.threading.set_intra_op_parallelism_threads(2)
 tf.config.threading.set_inter_op_parallelism_threads(1)
+
+#enable mixed precision
+mixed_precision.set_global_policy('mixed_float16')
+print(f"Mixed precision policy: {mixed_precision.global_policy()}")
 
 # Set working directory
 os.chdir("/cluster/scratch/scansimo/Euler_MMVAE")
@@ -106,7 +111,22 @@ def monitor_resources():
     for gpu in gpus:
         print(f"🚀 GPU {gpu.id} ({gpu.name}): {gpu.memoryUsed:.1f}MB / {gpu.memoryTotal:.1f}MB "
               f"| Load: {gpu.load * 100:.1f}%")
-        
+
+def vram_cleanup_if_needed(threshold_mb=31000):
+    gpus = GPUtil.getGPUs()
+    for gpu in gpus:
+        # Check if usage exceeds threshold
+        if gpu.memoryUsed > threshold_mb:
+            print(f"\n⚠️ VRAM usage is {gpu.memoryUsed}MB — clearing session to prevent OOM.")
+            tf.keras.backend.clear_session()
+            gc.collect()
+            break
+
+def log_vram_usage():
+    """Simple utility to print VRAM usage for all GPUs."""
+    for gpu in GPUtil.getGPUs():
+        print(f"🔍 GPU {gpu.id} => {gpu.memoryUsed}/{gpu.memoryTotal} MB used")
+
 # ----- Utility -----
 def segment_and_transform(
     accel_dict, 
@@ -221,8 +241,8 @@ def compute_and_spectrograms(raw_segments, fs=200, nperseg=256, noverlap=192):
 def compute_complex_spectrogram(
     time_series,
     fs=200,
-    nperseg=128,   # Adjusted window size (was 256)
-    noverlap=64     # Adjusted overlap (was 192)
+    nperseg=128,
+    noverlap=64
     ):
     """
     Compute STFT-based spectrograms with debugging.
@@ -247,7 +267,8 @@ def compute_complex_spectrogram(
         time_series[0, :, 0],
         frame_length=nperseg,
         frame_step=frame_step,
-        fft_length=nperseg
+        fft_length=nperseg,
+        window_fn=tf.signal.hann_window
     ).numpy()
 
     print(f"📏 Expected STFT shape: (time_bins={test_stft.shape[0]}, freq_bins={test_stft.shape[1]})")
@@ -264,7 +285,8 @@ def compute_complex_spectrogram(
                 time_series[i, :, c],
                 frame_length=nperseg,
                 frame_step=frame_step,
-                fft_length=nperseg
+                fft_length=nperseg,
+                window_fn=tf.signal.hann_window
             ).numpy()
 
             if stft.shape[0] == 0:
@@ -296,6 +318,7 @@ def inverse_spectrogram(complex_spectrograms, time_length, fs=200, nperseg=256, 
     Returns:
         Reconstructed time series (batch, time_length, channels)
     """
+    frame_step = nperseg - noverlap
     batch_size, freq_bins, time_bins, channels = complex_spectrograms.shape
     num_orig_channels = channels // 2  # Since we have magnitude and phase for each channel
     
@@ -304,6 +327,12 @@ def inverse_spectrogram(complex_spectrograms, time_length, fs=200, nperseg=256, 
     
     # Process in batches
     total_batches = (batch_size + batch_processing_size - 1) // batch_processing_size
+
+    # Define matching inverse window
+    inv_window_fn = tf.signal.inverse_stft_window_fn(
+        frame_step,
+        forward_window_fn=lambda length, dtype: tf.signal.hann_window(length, dtype=dtype)
+    )
     
     for batch_idx in range(total_batches):
         print(f"Reconstructing batch {batch_idx+1}/{total_batches}")
@@ -338,7 +367,8 @@ def inverse_spectrogram(complex_spectrograms, time_length, fs=200, nperseg=256, 
                     stft_tensor,
                     frame_length=nperseg,
                     frame_step=nperseg-noverlap,
-                    fft_length=nperseg
+                    fft_length=nperseg,
+                    window_fn=inv_window_fn
                 )
                 
                 actual_length = min(inverse_stft.shape[0], time_length)
@@ -553,7 +583,7 @@ class SpectrogramDecoder(tf.keras.Model):
         self.drop3 = layers.Dropout(0.3)
         
         # Output projection 
-        self.conv_out = layers.Conv2D(channels * 2, 3, padding='same')
+        self.conv_out = layers.Conv2D(channels * 2, 3, padding='same', dtype='float32')
 
     def call(self, z, training=False):
         # Initial projection and reshape
@@ -613,7 +643,7 @@ class MaskDecoder(tf.keras.Model):
         self.conv_t1 = layers.Conv2DTranspose(64, 3, strides=2, padding='same', activation='relu')
         self.conv_t2 = layers.Conv2DTranspose(32, 3, strides=2, padding='same', activation='relu')
         self.conv_t3 = layers.Conv2DTranspose(16, 3, strides=2, padding='same', activation='relu')
-        self.output_layer = layers.Conv2D(1, 3, padding='same', activation='sigmoid')
+        self.output_layer = layers.Conv2D(1, 3, padding='same', activation='sigmoid', dtype='float32')
     
     def call(self, z, training=False):
         x = self.fc(z)
@@ -626,39 +656,7 @@ class MaskDecoder(tf.keras.Model):
         return x
     
 # ----- Loss Functions -----
-def weighted_descriptor_mse_loss(y_true, y_pred):
-    """
-    MSE loss for descriptor reconstruction that only considers non-zero (valid) elements.
-    
-    Args:
-        y_true: Ground truth descriptor array [batch, max_cracks, mask_length]
-        y_pred: Predicted descriptor array [batch, max_cracks, mask_length]
-        
-    Returns:
-        Weighted MSE loss
-    """
-    # Create mask for valid (non-zero) descriptors
-    # A descriptor is considered valid if any of its elements are non-zero
-    valid_mask = tf.reduce_any(tf.not_equal(y_true, 0), axis=-1)
-    valid_mask = tf.cast(valid_mask, dtype=tf.float32)
-    
-    # Expand mask to match descriptor dimensions
-    valid_mask = tf.expand_dims(valid_mask, axis=-1)
-    
-    # Calculate squared error
-    squared_error = tf.square(y_true - y_pred)
-    
-    # Apply mask to error
-    masked_error = squared_error * valid_mask
-    
-    # Get number of valid elements for averaging
-    num_valid = tf.maximum(tf.reduce_sum(valid_mask), 1.0)
-    
-    # Compute mean over valid elements only
-    loss = tf.reduce_sum(masked_error) / num_valid
-    
-    return loss
-
+@tf.function
 def complex_spectrogram_loss(y_true, y_pred):
     """
     Custom loss for spectrogram reconstruction that separately handles magnitude and phase.
@@ -671,28 +669,6 @@ def complex_spectrogram_loss(y_true, y_pred):
     Returns:
         Combined loss with higher weight on magnitude
     """
-    # # Print shapes for debugging
-    # print(f"y_true shape: {y_true.shape}, y_pred shape: {y_pred.shape}")
-    
-    # Ensure shapes match exactly
-    if y_true.shape != y_pred.shape:
-        print(f"WARNING: Shape mismatch - y_true: {y_true.shape}, y_pred: {y_pred.shape}")
-        # Make the shapes consistent by cropping to the smaller size
-        min_freq = min(y_true.shape[1], y_pred.shape[1])
-        min_time = min(y_true.shape[2], y_pred.shape[2])
-        min_ch = min(y_true.shape[3], y_pred.shape[3])
-        
-        y_true = y_true[:, :min_freq, :min_time, :min_ch]
-        y_pred = y_pred[:, :min_freq, :min_time, :min_ch]
-        print(f"After adjustment - y_true: {y_true.shape}, y_pred: {y_pred.shape}")
-    
-    # Ensure tensor has even number of channels (for magnitude/phase pairs)
-    if y_true.shape[-1] % 2 != 0:
-        print(f"WARNING: Channel dimension {y_true.shape[-1]} is not even")
-        # Truncate to even number of channels if needed
-        y_true = y_true[..., :-1]
-        y_pred = y_pred[..., :-1]
-    
     # Get total number of channels
     total_channels = tf.shape(y_true)[-1]
     
@@ -731,84 +707,16 @@ def complex_spectrogram_loss(y_true, y_pred):
     phase_loss = tf.reduce_mean(1.0 - phase_diff_cos)
     
     # Combine losses with higher weight on magnitude
-    return 0.8 * mag_loss + 0.2 * phase_loss
+    return tf.cast(0.6 * mag_loss + 0.4 * phase_loss, tf.float32)
 
-def dynamic_weighting(epoch, max_epochs, min_weight=0.3, max_weight=1.0):
-    """
-    Gradually adjusts the weight between spectrogram and mask losses.
-    
-    Args:
-        epoch: Current epoch
-        max_epochs: Total epochs
-        min_weight: Starting weight
-        max_weight: Maximum weight
-        
-    Returns:
-        Current weight
-    """
-    # Linear increase over time
-    progress = min(1.0, epoch / (max_epochs * 0.5))  # Reach max_weight halfway through training
-    return min_weight + progress * (max_weight - min_weight)
-
-def get_beta_schedule(epoch, max_epochs, schedule_type='cyclical'):
-    """
-    Compute the beta coefficient for the JS divergence loss term.
-    
-    Args:
-        epoch: Current epoch number (0-indexed)
-        max_epochs: Total number of epochs
-        schedule_type: Type of schedule ('linear', 'exponential', 'cyclical')
-    
-    Returns:
-        beta: Beta coefficient for current epoch
-    """
-    # Define beta limits
-    BETA_MIN = 1e-8   # Start with very small value
-    BETA_MAX = 0.1   # Maximum value
-    
-    # Define warmup phase length (in epochs)
-    WARMUP_EPOCHS = 150
-    
-    # Define schedule based on type
-    if schedule_type == 'linear':
-        # Linear ramp-up during warmup, then constant
-        if epoch < WARMUP_EPOCHS:
-            return BETA_MIN + (BETA_MAX - BETA_MIN) * (epoch / WARMUP_EPOCHS)
-        else:
-            return BETA_MAX
-            
-    elif schedule_type == 'exponential':
-        # Exponential ramp-up (slower at start, faster later)
-        if epoch < WARMUP_EPOCHS:
-            # Normalized epoch in [0, 1]
-            t = epoch / WARMUP_EPOCHS
-            # Exponential curve that starts at BETA_MIN and ends at BETA_MAX
-            return BETA_MIN + (BETA_MAX - BETA_MIN) * (np.exp(3 * t) - 1) / (np.exp(3) - 1)
-        else:
-            return BETA_MAX
-            
-    elif schedule_type == 'cyclical':
-        # Cyclical schedule that peaks at BETA_MAX and falls to BETA_MAX/5
-        if epoch < WARMUP_EPOCHS:
-            # Linear warmup
-            return BETA_MIN + (BETA_MAX - BETA_MIN) * (epoch / WARMUP_EPOCHS)
-        else:
-            # Cycle with period of 50 epochs
-            cycle_period = 50
-            cycle_position = ((epoch - WARMUP_EPOCHS) % cycle_period) / cycle_period
-            # Cosine cycle between BETA_MAX and BETA_MAX/5
-            beta_min_cycle = BETA_MAX / 5
-            return beta_min_cycle + (BETA_MAX - beta_min_cycle) * 0.5 * (1 + np.cos(2 * np.pi * cycle_position))
-    
-    else:
-        raise ValueError(f"Unknown schedule_type: {schedule_type}")
-
+@tf.function
 def custom_mask_loss(y_true, y_pred, 
-                       weight_bce=0.33, 
-                       weight_dice=0.33, 
-                       weight_focal=0.34, 
-                       gamma=2.0, 
-                       alpha=0.25):
+                       weight_bce=0.2, 
+                       weight_dice=0.3, 
+                       weight_focal=0.5, 
+                       gamma=2.0, # Focal loss focusing parameter
+                       alpha=0.3 # Focal loss balancing parameter
+                       ):
     """
     Computes a weighted combination of Binary Cross-Entropy (BCE), Dice, and Focal losses.
     
@@ -854,7 +762,77 @@ def custom_mask_loss(y_true, y_pred,
     
     # --- Combined Loss ---
     combined = weight_bce * bce_loss + weight_dice * dice_loss + weight_focal * focal_loss
-    return combined
+    return tf.cast(combined, tf.float32)
+
+def dynamic_weighting(epoch, max_epochs, min_weight=0.3, max_weight=0.5):
+    """
+    Gradually adjusts the weight between spectrogram and mask losses.
+    
+    Args:
+        epoch: Current epoch
+        max_epochs: Total epochs
+        min_weight: Starting weight
+        max_weight: Maximum weight
+        
+    Returns:
+        Current weight
+    """
+    # Linear increase over time
+    progress = min(1.0, epoch / (max_epochs * 0.2))  # Reach max_weight halfway through training
+    return min_weight + progress * (max_weight - min_weight)
+
+def get_beta_schedule(epoch, max_epochs, schedule_type='cyclical'):
+    """
+    Compute the beta coefficient for the JS divergence loss term.
+    
+    Args:
+        epoch: Current epoch number (0-indexed)
+        max_epochs: Total number of epochs
+        schedule_type: Type of schedule ('linear', 'exponential', 'cyclical')
+    
+    Returns:
+        beta: Beta coefficient for current epoch
+    """
+    # Define beta limits
+    BETA_MIN = 1e-8   # Start with very small value
+    BETA_MAX = 0.15   # Maximum value
+    
+    # Define warmup phase length (in epochs)
+    WARMUP_EPOCHS = 50
+    
+    # Define schedule based on type
+    if schedule_type == 'linear':
+        # Linear ramp-up during warmup, then constant
+        if epoch < WARMUP_EPOCHS:
+            return BETA_MIN + (BETA_MAX - BETA_MIN) * (epoch / WARMUP_EPOCHS)
+        else:
+            return BETA_MAX
+            
+    elif schedule_type == 'exponential':
+        # Exponential ramp-up (slower at start, faster later)
+        if epoch < WARMUP_EPOCHS:
+            # Normalized epoch in [0, 1]
+            t = epoch / WARMUP_EPOCHS
+            # Exponential curve that starts at BETA_MIN and ends at BETA_MAX
+            return BETA_MIN + (BETA_MAX - BETA_MIN) * (np.exp(3 * t) - 1) / (np.exp(3) - 1)
+        else:
+            return BETA_MAX
+            
+    elif schedule_type == 'cyclical':
+        # Cyclical schedule that peaks at BETA_MAX and falls to BETA_MAX/5
+        if epoch < WARMUP_EPOCHS:
+            # Linear warmup
+            return BETA_MIN + (BETA_MAX - BETA_MIN) * (epoch / WARMUP_EPOCHS)
+        else:
+            # Cycle with period of 50 epochs
+            cycle_period = 50
+            cycle_position = ((epoch - WARMUP_EPOCHS) % cycle_period) / cycle_period
+            # Cosine cycle between BETA_MAX and BETA_MAX/5
+            beta_min_cycle = BETA_MAX / 5
+            return beta_min_cycle + (BETA_MAX - beta_min_cycle) * 0.5 * (1 + np.cos(2 * np.pi * cycle_position))
+    
+    else:
+        raise ValueError(f"Unknown schedule_type: {schedule_type}")
 
 # ----- Spectral MMVAE Model -----
 class SpectralMMVAE(tf.keras.Model):
@@ -1129,11 +1107,16 @@ def create_tf_dataset(
     mask_array = np.atleast_1d(mask_array)
     
     dataset = tf.data.Dataset.from_tensor_slices((spectrograms, mask_array, test_id_array))
-    
+
     if shuffle:
         dataset = dataset.shuffle(buffer_size=len(mask_array))
-    
-    dataset = dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+
+    dataset = (
+        dataset
+        .cache()
+        .batch(batch_size)
+        .prefetch(tf.data.AUTOTUNE)
+    )
     return dataset
 
 # ----- Training Function -----
@@ -1197,6 +1180,7 @@ def train_spectral_mmvae(
     modality_dropout_prob=0.1,
     strategy=None
     ):
+
     # Storage for metrics
     metrics = {
         'train_total': [], 'train_spec': [], 'train_mask': [], 
@@ -1208,10 +1192,32 @@ def train_spectral_mmvae(
     no_improvement_count = 0
 
     train_batches_count = sum(1 for _ in train_dataset)
-    val_batches_count = sum(1 for _ in val_dataset)
+    val_batches_count   = sum(1 for _ in val_dataset)
     print(f"🔄 Starting Training: {train_batches_count} train batches, {val_batches_count} val batches")
 
     for epoch in range(num_epochs):
+        # # ---------------- SAFETY CLEARING EVERY 150 EPOCHS ----------------
+        # # For large training runs, helps ensure you never get too fragmented.
+        # if (epoch + 1) % 150 == 0:
+        #     print(f"\n♻️ Safety clearing TensorFlow session at epoch {epoch+1}")
+        #     tf.keras.backend.clear_session()
+        #     gc.collect()
+
+        # # ---------------- DYNAMIC CLEARING (OPTIONAL) ----------------
+        # # Check VRAM usage before starting this epoch
+        # vram_cleanup_if_needed(threshold_mb=31000)
+
+        # ---------------- OPTIONAL: LOG VRAM USAGE ----------------
+        print(f"\n🔍 VRAM usage at start of epoch {epoch+1}:")
+        log_vram_usage()
+
+        # ---------------- START EPOCH ----------------
+        beta = get_beta_schedule(epoch, num_epochs, beta_schedule)
+        mask_weight = dynamic_weighting(epoch, num_epochs)
+        spec_weight = 1.0 - mask_weight
+
+        print(f"📌 Epoch {epoch+1}/{num_epochs} | Beta={beta:.5f} | MaskW={mask_weight:.2f}")
+
         epoch_metrics = {
             'train_total': 0.0, 
             'train_spec': 0.0, 
@@ -1226,15 +1232,9 @@ def train_spectral_mmvae(
             'train_steps': 0
         }
 
-        beta = get_beta_schedule(epoch, num_epochs, beta_schedule)
-        mask_weight = dynamic_weighting(epoch, num_epochs)
-        spec_weight = 1.0 - mask_weight
-        print(f"📌 Epoch {epoch+1}/{num_epochs} | Beta={beta:.5f} | MaskW={mask_weight:.2f}")
-
         # ---------------- TRAIN LOOP ----------------
         for step, (spec_in, mask_in, test_id_in) in enumerate(train_dataset):
-            # Use a Python random decision per batch
-            # => same decision on both replicas (they see the same "random_value")
+            # Randomly choose which modality to drop:
             rv = random.random()
             if rv < modality_dropout_prob:
                 missing_modality_str = 'spec'
@@ -1246,17 +1246,25 @@ def train_spectral_mmvae(
             def step_fn(spec_mb, mask_mb, test_id_mb):
                 return train_step(
                     model, optimizer, spec_mb, mask_mb, test_id_mb,
-                    missing_modality_str,  # a Python string
+                    missing_modality_str,
                     tf.constant(beta, tf.float32),
                     spec_weight,
                     mask_weight
                 )
 
-            # Distributed step across replicas
-            total_loss, spec_loss_val, mask_loss_val, js_div_val, recon_loss_val = strategy.run(
-                step_fn, 
-                args=(spec_in, mask_in, test_id_in)
-            )
+            try:
+                # Distributed step across replicas
+                total_loss, spec_loss_val, mask_loss_val, js_div_val, recon_loss_val = strategy.run(
+                    step_fn, 
+                    args=(spec_in, mask_in, test_id_in)
+                )
+            except tf.errors.ResourceExhaustedError as e:
+                print("❌ OOM caught in train step!")
+                # Log usage to see what's going on
+                log_vram_usage()
+                print(f"OOM at epoch {epoch+1}, step {step}") 
+                print(e)                            
+                break     
 
             # Combine across replicas
             total_loss     = strategy.reduce(tf.distribute.ReduceOp.MEAN, total_loss,     axis=None)
@@ -1265,13 +1273,13 @@ def train_spectral_mmvae(
             js_div_val     = strategy.reduce(tf.distribute.ReduceOp.MEAN, js_div_val,     axis=None)
             recon_loss_val = strategy.reduce(tf.distribute.ReduceOp.MEAN, recon_loss_val, axis=None)
 
-            # Convert them to Python floats for logging outside the step function
+            # Convert them to Python floats for logging
             epoch_metrics['train_total'] += float(total_loss.numpy())
             if missing_modality_str != 'spec':
                 epoch_metrics['train_spec'] += float(spec_loss_val.numpy())
             if missing_modality_str != 'mask':
                 epoch_metrics['train_mask'] += float(mask_loss_val.numpy())
-            epoch_metrics['train_js'] += float(js_div_val.numpy())
+            epoch_metrics['train_js']    += float(js_div_val.numpy())
             epoch_metrics['train_steps'] += 1
 
             # Count how many times each scenario happened
@@ -1334,12 +1342,12 @@ def train_spectral_mmvae(
                   f"Mask={metrics['val_mask'][-1]:.4f} | "
                   f"JS={metrics['val_js'][-1]:.4f}")
 
-        # Early stopping
+        # ---------------- EARLY STOPPING ----------------
         current_val_loss = metrics['val_total'][-1] if val_dict['steps'] > 0 else float('inf')
         if current_val_loss < best_val_loss:
             best_val_loss = current_val_loss
             no_improvement_count = 0
-            model.save_weights("results/best_spectral_mmvae.weights.h5")
+            model.save_weights("../results_mmvae/best_spectral_mmvae.weights.h5")
             print("✅ Saved best weights")
         else:
             no_improvement_count += 1
@@ -1347,13 +1355,13 @@ def train_spectral_mmvae(
 
         if no_improvement_count >= patience:
             print(f"🛑 Early stopping at epoch {epoch+1}.")
-            model.save_weights("results/final_spectral_mmvae.weights.h5")
+            model.save_weights("../results_mmvae/final_spectral_mmvae.weights.h5")
             break
 
     return metrics
 
 # ----- Visualization Functions and tests -----
-def save_visualizations_and_metrics(model, train_dataset, val_dataset, training_metrics, output_dir="results"):
+def save_visualizations_and_metrics(model, train_dataset, val_dataset, training_metrics, output_dir="results_mmvae"):
     """
     Aggregates and saves key graphs and model statistics:
       1. Training curves (train/val loss)
@@ -1492,99 +1500,118 @@ def save_visualizations_and_metrics(model, train_dataset, val_dataset, training_
             f.write(stats_str)
         print(f"Saved model weight statistics to {stats_path}")
     save_model_weights_stats()
-    
+
+    # 6. evaluate reconstructions
+    recon_metrics = evaluate_reconstructions(model, val_dataset)
+    print("Reconstruction quality metrics:", recon_metrics)
+
     # Optionally, you can return all gathered metrics:
     return {
         "latent_metrics": latent_metrics,
         "latent_space_3d": latent_3d,
     }
 
-def synthesize_examples(model, val_dataset, num_examples=5, fs=200, nperseg=256, noverlap=128):
+def evaluate_reconstructions(model, dataset, fs=200):
+    ts_rmse, ts_corrs = [], []
+    spec_mse, spec_ssims = [], []
+    mask_dice, mask_iou = [], []
+
+    for spec, mask, _ in dataset.take(1):  # one batch
+        recon_spec, recon_mask, _ = model(spec, mask, tf.constant([[0]] * spec.shape[0]), training=False)
+
+        # --- Time Series ---
+        orig_ts = model.reconstruct_time_series(spec.numpy(), fs=fs)
+        recon_ts = model.reconstruct_time_series(recon_spec.numpy(), fs=fs)
+        ts_rmse.append(np.sqrt(np.mean((orig_ts - recon_ts)**2)))
+        ts_corrs.append(np.mean([pearsonr(orig_ts[0, :, ch], recon_ts[0, :, ch])[0] for ch in range(orig_ts.shape[2])]))
+
+        # --- Spectrograms ---
+        spec_mse.append(np.mean((spec.numpy() - recon_spec.numpy())**2))
+        for i in range(spec.shape[0]):
+            spec_ssims.append(ssim(spec[i, :, :, 0], recon_spec[i, :, :, 0], data_range=1.0))
+
+        # --- Masks ---
+        y_true = mask.numpy().round().astype(np.int32)
+        y_pred = recon_mask.numpy().round().astype(np.int32)
+        intersection = np.sum(y_true * y_pred)
+        union = np.sum(np.clip(y_true + y_pred, 0, 1))
+        dice = (2. * intersection) / (np.sum(y_true) + np.sum(y_pred) + 1e-8)
+        iou = intersection / (union + 1e-8)
+        mask_dice.append(dice)
+        mask_iou.append(iou)
+
+    return {
+        "ts_rmse": np.mean(ts_rmse),
+        "ts_pearson_corr": np.mean(ts_corrs),
+        "spec_mse": np.mean(spec_mse),
+        "spec_ssim": np.mean(spec_ssims),
+        "mask_dice": np.mean(mask_dice),
+        "mask_iou": np.mean(mask_iou)
+    }
+
+def evaluate_selected_segments(model, test_ids_to_use=["25"], fs=200, nperseg=256, noverlap=224, output_dir="results_mmvae/synthesis"):
     """
-    For a few validation examples:
-      1. Reconstruct time series signals from decoded spectrograms and compare them with the original.
-      2. Upsample the decoded mask and overlay it with the original mask.
-      3. Also perform latent space interpolation between two chosen examples.
-      
-    Args:
-        model (tf.keras.Model): Your trained SpectralMMVAE model.
-        val_dataset (tf.data.Dataset): Validation dataset yielding (spectrogram, mask, test_id).
-        num_examples (int): Number of examples to display.
-        fs (int): Sampling frequency.
-        nperseg (int): STFT window length.
-        noverlap (int): STFT overlap.
+    Evaluate reconstruction quality on handpicked raw segments (not cached) using a trained model.
     """
-    # We'll store a few examples
-    examples = []
-    for spec_batch, mask_batch, test_ids in val_dataset.take(1):
-        for i in range(min(num_examples, spec_batch.shape[0])):
-            examples.append((spec_batch[i], mask_batch[i], test_ids[i]))
-    print(f"Using {len(examples)} examples for reconstruction comparison.")
-    
-    # For each example, reconstruct the time series from the decoded spectrogram,
-    # and upsample the decoded mask (if needed) to compare with the original.
-    for idx, (spec_sample, mask_sample, test_id) in enumerate(examples):
-        spec_sample = tf.expand_dims(spec_sample, 0)  # shape: (1, freq, time, channels*2)
-        mask_sample = tf.expand_dims(mask_sample, 0)  # shape: (1, H, W, 1)
-        
-        # Get reconstructions from the model.
-        # Note: In your model, "recon_spec" comes from decoding a latent sampled from the spectrogram encoder.
-        recon_spec, recon_mask, _ = model(spec_sample, mask_sample, tf.constant([[0]]), training=False)
-        
-        # Reconstruct time series signals using your inverse STFT routine.
-        orig_ts = model.reconstruct_time_series(spec_sample.numpy(), fs=fs, nperseg=nperseg, noverlap=noverlap, time_length=800)
-        recon_ts = model.reconstruct_time_series(recon_spec.numpy(), fs=fs, nperseg=nperseg, noverlap=noverlap, time_length=800)
-        
-        # Plot time series: Overlay all 12 channels in one figure.
-        # You can either plot each channel separately or use transparency to see the overlap.
-        plt.figure(figsize=(10, 6))
-        time_axis = np.linspace(0, 4, orig_ts.shape[1])
-        for ch in range(orig_ts.shape[2]):
-            plt.plot(time_axis, orig_ts[0, :, ch], color='blue', alpha=0.4, label='Original' if ch == 0 else "")
-            plt.plot(time_axis, recon_ts[0, :, ch], color='red', alpha=0.4, label='Reconstructed' if ch == 0 else "")
-        plt.title(f"Time Series Comparison (Test ID: {test_id})")
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Load raw accelerometer data and masks
+    accel_dict, binary_masks, heatmaps = data_loader.load_data()
+
+    all_segments = []
+    all_masks = []
+    all_raw_ts = []
+    for test_id in test_ids_to_use:
+        # Match test_id format to keys (either int or str)
+        key = str(test_id) if str(test_id) in accel_dict else (
+            int(test_id) if int(test_id) in accel_dict else None)
+
+        if key is None or key not in heatmaps:
+            print(f"❌ Test ID {test_id} not found. Skipping.")
+            continue
+
+        for ts_raw in accel_dict[key]:
+            if ts_raw.shape[0] >= 800 and ts_raw.shape[1] == 12:
+                segment = ts_raw[100:900, :]
+                all_raw_ts.append(segment)
+                all_segments.append(segment)
+                all_masks.append(heatmaps[key])
+            else:
+                print(f"⚠️ Skipping sample from {key}: shape={ts_raw.shape}")
+
+    if not all_segments:
+        print("⚠️ No segments found for given test IDs.")
+        return
+
+    raw_segments = np.stack(all_segments)
+    masks = np.stack(all_masks)
+
+    print("✅ Final raw_segments.shape:", np.array(all_segments).shape)
+
+    # Convert to spectrogram
+    spec = compute_complex_spectrogram(raw_segments, fs, nperseg, noverlap)
+
+    # Run model
+    recon_spec, recon_mask, _ = model(spec, masks, tf.constant([[0]] * len(spec)), training=False)
+
+    # Reconstruct time series from output spectrograms
+    recon_ts = model.reconstruct_time_series(recon_spec.numpy(), fs=fs, nperseg=nperseg, noverlap=noverlap, time_length=800)
+
+    # Plot and compare
+    for i in range(len(raw_segments)):
+        time_axis = np.linspace(0, 4, 800)
+        plt.figure(figsize=(10, 5))
+        for ch in range(raw_segments.shape[2]):
+            plt.plot(time_axis, raw_segments[i, :, ch], color='blue', alpha=0.4)
+            plt.plot(time_axis, recon_ts[i, :, ch], color='red', alpha=0.4)
+        plt.title(f"Reconstruction | Test ID {test_ids_to_use[i % len(test_ids_to_use)]}")
         plt.xlabel("Time (s)")
         plt.ylabel("Amplitude")
-        plt.legend()
         plt.tight_layout()
-        plt.show()
-        
-        # For the mask, assume the original mask is at high resolution.
-        # If needed, you can upsample the reconstructed mask to match the original.
-        # Here we assume your reconstructed mask is already the desired resolution.
-        plt.figure(figsize=(8, 4))
-        plt.subplot(1, 2, 1)
-        plt.imshow(mask_sample.numpy()[0, :, :, 0], cmap='gray')
-        plt.title("Original Mask")
-        plt.axis("off")
-        plt.subplot(1, 2, 2)
-        plt.imshow(recon_mask.numpy()[0, :, :, 0], cmap='gray')
-        plt.title("Reconstructed Mask")
-        plt.axis("off")
-        plt.tight_layout()
-        plt.show()
-    
-    # Latent interpolation between two chosen examples (using the spectrogram encoder latents).
-    # Here, we simply take the first two examples in the batch.
-    if len(examples) >= 2:
-        source_spec = tf.expand_dims(examples[0][0], 0)
-        target_spec = tf.expand_dims(examples[1][0], 0)
-        mu_source, _ = model.spec_encoder(source_spec, training=False)
-        mu_target, _ = model.spec_encoder(target_spec, training=False)
-        num_steps = 8
-        alphas = np.linspace(0, 1, num_steps)
-        plt.figure(figsize=(num_steps * 2, 4))
-        for i, alpha in enumerate(alphas):
-            interp_z = (1 - alpha) * mu_source + alpha * mu_target
-            interp_spec = model.spec_decoder(interp_z, training=False)
-            plt.subplot(1, num_steps, i+1)
-            plt.imshow(interp_spec.numpy()[0, :, :, 0], aspect='auto', cmap='viridis')
-            plt.title(f"α={alpha:.1f}")
-            plt.axis('off')
-        plt.suptitle("Latent Space Interpolation (Spectrograms)")
-        plt.tight_layout()
-        plt.show()
+        plt.savefig(f"{output_dir}/recon_testid_{test_ids_to_use[i % len(test_ids_to_use)]}_seg{i}.png", dpi=300)
+        plt.close()
 
+    print(f"✅ Reconstruction plots saved to {output_dir}")
 
 # ----- Main Function -----
 def main():
@@ -1592,10 +1619,10 @@ def main():
     debug_mode = False
     
     # ------------------------ 1) Configure Environment ------------------------
-    os.makedirs("../results", exist_ok=True)
-    os.makedirs("../results/model_checkpoints", exist_ok=True)
-    os.makedirs("../results/latent_analysis", exist_ok=True)
-    os.makedirs("../results/cross_modal", exist_ok=True)
+    os.makedirs("../results_mmvae", exist_ok=True)
+    os.makedirs("../results_mmvae/model_checkpoints", exist_ok=True)
+    os.makedirs("../results_mmvae/latent_analysis", exist_ok=True)
+    os.makedirs("../results_mmvae/cross_modal", exist_ok=True)
 
     sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
     
@@ -1605,9 +1632,12 @@ def main():
     noverlap = 224 # STFT overlap
     
     latent_dim = 128 
-    batch_size = 32  
-    num_epochs = 600 
-    patience = 150  
+    batch_size = 64
+    total_epochs = 500  # We'll chunk these
+    patience = 20
+
+    # If you want to resume from best/final weights in a previous run:
+    resume_training = True
 
     # Cached file paths
     final_path = "scripts/cached_spectral_features.npy"
@@ -1622,9 +1652,7 @@ def main():
     )
 
     if all_cached:
-        # ------------------------ A) ALL Cached: Load everything ------------------------
         print("✅ All cached files found! Loading from disk...")
-
         spectral_features   = np.load(final_path)
         mask_segments       = np.load(heatmaps_path)
         test_ids            = np.load(ids_path)
@@ -1632,34 +1660,28 @@ def main():
         print(f"✅ spectral_features: {spectral_features.shape}")
         print(f"✅ mask_segments: {mask_segments.shape}")
         print(f"✅ test_ids: {test_ids.shape}")
-
     else:
-        # ------------------------ B) Missing Any Cache: Re-run entire pipeline ------------------------
-        print("⚠️ At least one cache file is missing. Recomputing EVERYTHING from scratch...")
-        print("📥 Loading raw data...")
+        # (Same logic as you had to load raw data, do STFT, etc.)
+        print("⚠️ At least one cache file is missing. Recomputing EVERYTHING...")
         accel_dict, binary_masks, heatmaps = data_loader.load_data()
-
         mask_segments = np.array([heatmaps[k] for k in sorted(heatmaps.keys())])
         test_ids = np.array(sorted(heatmaps.keys()))
 
         print(f"Loaded data for {len(accel_dict)} tests")
-
-        # (2) Segment time series -> get raw_segments, masks, test_ids
         print("✂️ Segmenting data...")
-        raw_segments, mask_segments, test_ids = segment_and_transform(accel_dict, heatmaps)
+        raw_segments, mask_segments, test_ids = segment_and_transform(
+            accel_dict, heatmaps, segment_duration=4.0
+        )
         print(f"✅ Extracted {len(raw_segments)} segments")
 
-        # Save masks & test IDs for future use
         np.save(heatmaps_path, mask_segments)
         np.save(ids_path, test_ids)
         print(f"✅ Saved masks to {heatmaps_path}")
         print(f"✅ Saved test IDs to {ids_path}")
 
-        # (3) Compute STFT -> complex spectrograms
         print("🔄 Computing spectrograms...")
         complex_specs = compute_and_spectrograms(raw_segments, fs, nperseg, noverlap)
 
-        # (4) Convert spectrograms to magnitude/phase features
         print("📝 Converting spectrograms to features...")
         spectral_features = cache_final_features(complex_specs, cache_path=final_path)
 
@@ -1669,7 +1691,7 @@ def main():
     train_size = int(0.8 * N)
     train_idx, val_idx = indices[:train_size], indices[train_size:]
 
-    # Slice the cached arrays (they are NumPy arrays now)
+    # Slice the cached arrays
     train_spec = spectral_features[train_idx]
     val_spec = spectral_features[val_idx]
     train_mask = mask_segments[train_idx]
@@ -1681,92 +1703,165 @@ def main():
     print(f"Validation set: {val_spec.shape[0]} samples")
 
     # ------------------------ 8) Create TensorFlow Datasets ------------------------
-    train_dataset = create_tf_dataset(train_spec, train_mask, train_ids, batch_size, debug_mode=debug_mode)
-    val_dataset   = create_tf_dataset(val_spec, val_mask, val_ids, batch_size, debug_mode=debug_mode)
+    train_dataset = create_tf_dataset(train_spec, train_mask, train_ids,
+                                      batch_size, debug_mode=debug_mode)
+    val_dataset   = create_tf_dataset(val_spec,   val_mask,  val_ids,
+                                      batch_size, debug_mode=debug_mode)
 
     print(f"✅ Train batches: {sum(1 for _ in train_dataset)}")
     print(f"✅ Val batches: {sum(1 for _ in val_dataset)}")
 
+    # Paths for weights
+    best_weights_path  = "results_mmvae/best_spectral_mmvae.weights.h5"
+    final_weights_path = "results_mmvae/final_spectral_mmvae.weights.h5"
 
-    # ------------------------ 9) Build Model ------------------------
+    # ------------------------ 9) Chunked Training Setup ------------------------
+    # We’ll accumulate metrics across chunks in this dictionary.
+    all_metrics = {
+        'train_total': [],
+        'train_spec': [],
+        'train_mask': [],
+        'train_js': [],
+        'train_mode': [],
+        'val_total': [],
+        'val_spec': [],
+        'val_mask': [],
+        'val_js': []
+    }
+
+    CHUNK_SIZE = 100
+    start_epoch = 0
+
+    # We'll keep track if we've triggered an "early stop" in any chunk
+    early_stopped = False
+
+    # ------------------------ 10) Train in Chunks ------------------------
+    while start_epoch < total_epochs and not early_stopped:
+        end_epoch = min(start_epoch + CHUNK_SIZE, total_epochs)
+        epochs_this_chunk = end_epoch - start_epoch
+        print(f"\n=== Starting chunk from epoch {start_epoch+1} to {end_epoch} ===")
+
+        # Build a new strategy each chunk so we can safely clear afterwards.
+        strategy = tf.distribute.MirroredStrategy()
+        print(f"Number of devices: {strategy.num_replicas_in_sync}")
+
+        with strategy.scope():
+            spec_shape = spectral_features.shape[1:]
+            mask_shape = (32, 96, 1)
+            print(f"📐 Building model with: latent_dim={latent_dim}, spec_shape={spec_shape}, mask_shape={mask_shape}")
+
+            model = SpectralMMVAE(latent_dim, spec_shape, mask_shape)
+            
+            # Dummy forward pass so model is built
+            dummy_spec = tf.zeros((1, *spec_shape))
+            dummy_mask = tf.zeros((1, *mask_shape))
+            _ = model(dummy_spec, dummy_mask, training=True)
+            model.summary()
+
+            # Create optimizer
+            lr_schedule = ExponentialDecay(
+                initial_learning_rate=5e-5,
+                decay_steps=10000,
+                decay_rate=0.9,
+                staircase=True
+            )
+            optimizer = keras.optimizers.AdamW(
+                learning_rate=lr_schedule,
+                weight_decay=1e-4,
+                beta_1=0.9,
+                beta_2=0.999,
+                epsilon=1e-6
+            )
+
+            # If resuming and weights exist, load them
+            if resume_training:
+                if os.path.exists(best_weights_path):
+                    model.load_weights(best_weights_path)
+                    print("✅ Loaded best weights for resuming")
+                elif os.path.exists(final_weights_path):
+                    model.load_weights(final_weights_path)
+                    print("✅ Loaded final weights for resuming")
+
+            # Actually train the model for this chunk
+            print(f"🚀 Training for {epochs_this_chunk} epochs in this chunk...")
+            chunk_metrics = train_spectral_mmvae(
+                model,
+                train_dataset,
+                val_dataset,
+                optimizer,
+                num_epochs=epochs_this_chunk,
+                patience=patience,
+                beta_schedule='exponential',
+                modality_dropout_prob=0.0,
+                strategy=strategy
+            )
+
+            # Append chunk's metrics to the global all_metrics
+            # We'll assume chunk_metrics has the same keys as all_metrics
+            for k in all_metrics.keys():
+                # chunk_metrics[k] is a list of length = actual # of epochs run this chunk
+                all_metrics[k].extend(chunk_metrics[k])
+
+            # Check if we stopped early (the train_spectral_mmvae prints that out).
+            # You can detect by seeing if # of epochs in chunk_metrics is < epochs_this_chunk
+            # or we can do it more simply: if 'val_total' is shorter than epochs_this_chunk
+            # there's a good chance we early-stopped. We'll do a check:
+            if len(chunk_metrics['val_total']) < epochs_this_chunk:
+                # We presumably hit early stopping inside train_spectral_mmvae
+                print("⏹ Early stopping triggered during chunk.")
+                early_stopped = True
+
+            # Save final weights if chunk finished normally
+            # (Or you can rely on the train_spectral_mmvae calls that already do it)
+            if not early_stopped:
+                model.save_weights(final_weights_path)
+                print("✅ Saved final weights after chunk")
+
+        # Exit the strategy scope, now safe to clear session if needed
+        tf.keras.backend.clear_session()
+        gc.collect()
+
+        # Advance our "epoch" counter
+        start_epoch = end_epoch
+
+    # End of chunked training loop
+    print("\n✅ Chunked training complete!")
+    
+    # 11) (Optional) Build final model once more for evaluation / example synthesis
     strategy = tf.distribute.MirroredStrategy()
-    print(f"Number of devices: {strategy.num_replicas_in_sync}")
-
     with strategy.scope():
-        spec_shape = spectral_features.shape[1:]
-        mask_shape = (32, 96, 1)
-        print(f"📐 Building model with:")
-        print(f"  - Latent dimension: {latent_dim}")
-        print(f"  - Spectrogram shape: {spec_shape}")
-        print(f"  - Mask shape: {mask_shape}")
-
         model = SpectralMMVAE(latent_dim, spec_shape, mask_shape)
-        # Dummy forward pass
         dummy_spec = tf.zeros((1, *spec_shape))
         dummy_mask = tf.zeros((1, *mask_shape))
-        _ = model(dummy_spec, dummy_mask, training=True)
-        model.summary()
+        _ = model(dummy_spec, dummy_mask, training=False)
 
-        # Create optimizer
-        lr_schedule = ExponentialDecay(
-            initial_learning_rate=5e-5,
-            decay_steps=10000,
-            decay_rate=0.9,
-            staircase=True
-        )
+        if os.path.exists(best_weights_path):
+            model.load_weights(best_weights_path)
+            print("✅ Loaded best model weights (final for evaluation).")
+        elif os.path.exists(final_weights_path):
+            model.load_weights(final_weights_path)
+            print("✅ Loaded final model weights.")
+        else:
+            print("⚠️ No saved weights found, using model from last chunk")
 
-        optimizer = keras.optimizers.AdamW(
-            learning_rate=lr_schedule,
-            weight_decay=1e-4,
-            beta_1=0.9,
-            beta_2=0.999,
-            epsilon=1e-6
-        )
+        evaluate_selected_segments(model, test_ids_to_use=["15", "20", "22", "25"])
 
-        # 10) Train Model (Multi-GPU)
-        print("🚀 Starting training...")
-        training_metrics = train_spectral_mmvae(
-            model, 
-            train_dataset, 
-            val_dataset, 
-            optimizer, 
-            num_epochs=num_epochs, 
-            patience=patience,
-            beta_schedule='cyclical',
-            modality_dropout_prob=0.05,
-            strategy=strategy
-        )
-
-
-    # ------------------------- 11.5) Synthesize Examples ------------------------
-    synthesize_examples(model, val_dataset, num_examples=5, fs=200, nperseg=256, noverlap=128)
 
     # ------------------------ 12) Save Training Metrics ------------------------
-    np.save("results/training_metrics.npy", training_metrics)
-
-    # ------------------------ 13) Load Best Model ------------------------
-    best_weights_path  = "results/best_spectral_mmvae.weights.h5"
-    final_weights_path = "results/final_spectral_mmvae.weights.h5"
-
-    if os.path.exists(best_weights_path):
-        model.load_weights(best_weights_path)
-        print("✅ Loaded best model weights")
-    elif os.path.exists(final_weights_path):
-        model.load_weights(final_weights_path)
-        print("✅ Loaded final model weights")
-    else:
-        print("⚠️ No saved weights found, using model from last epoch")
+    np.save("results_mmvae/training_metrics.npy", all_metrics)
 
     # ------------------------ 14) Visualize & Save Metrics ------------------------
-    # Save plots and metricse:
-    #   - Training curves (train/val loss)
-    #   - 3D latent space visualization (UMAP)
-    #   - Latent analysis (e.g. cosine similarity histogram)
-    #   - Latent space interpolation between two samples
-    #   - Model weight statistics
-    vis_metrics = save_visualizations_and_metrics(model, train_dataset, val_dataset, training_metrics, output_dir="results")
+    # You now have all_metrics containing the entire run’s metrics across all chunks.
+    vis_metrics = save_visualizations_and_metrics(
+        model,
+        train_dataset,
+        val_dataset,
+        all_metrics,        # pass the aggregated metrics
+        output_dir="results_mmvae"
+    )
 
-    print("✅ Training & evaluation complete. Results saved in 'results/' directory.")
+    print("✅ Training & evaluation complete. Results saved in 'results_mmvae/' directory.")
+
 
 
 if __name__ == "__main__":

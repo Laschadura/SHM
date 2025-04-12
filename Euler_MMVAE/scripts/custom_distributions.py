@@ -19,9 +19,10 @@ def reparameterize(mean, logvar):
         Sampled latent vector
     """
     # Clip logvar to avoid numerical issues
-    logvar = tf.clip_by_value(logvar, LOGVAR_MIN, LOGVAR_MAX)
+    logvar = tf.cast(tf.clip_by_value(logvar, LOGVAR_MIN, LOGVAR_MAX), dtype=tf.float32)
+    mean = tf.cast(mean, dtype=tf.float32)
     
-    eps = tf.random.normal(shape=tf.shape(mean))
+    eps = tf.random.normal(shape=tf.shape(mean), dtype=tf.float32)
     std = tf.exp(0.5 * logvar)
     return mean + eps * std
 
@@ -39,8 +40,9 @@ def compute_kl_divergence(mu_q, logvar_q, mu_p=None, logvar_p=None):
     Returns:
         KL divergence
     """
-    # Clip logvar for stability
-    logvar_q = tf.clip_by_value(logvar_q, LOGVAR_MIN, LOGVAR_MAX)
+    # Clip logvar for stability and ensure it's a float32
+    logvar_q = tf.cast(tf.clip_by_value(logvar_q, LOGVAR_MIN, LOGVAR_MAX), dtype=tf.float32)
+    mu_q = tf.cast(mu_q, dtype=tf.float32)
     
     if mu_p is None:
         # KL with standard normal
@@ -49,6 +51,9 @@ def compute_kl_divergence(mu_q, logvar_q, mu_p=None, logvar_p=None):
             axis=-1
         )
     else:
+        # ensure dtype consistency
+        mu_p = tf.cast(mu_p, dtype=tf.float32)
+        logvar_p = tf.cast(logvar_p, dtype=tf.float32)
         # Clip p distribution logvar as well
         logvar_p = tf.clip_by_value(logvar_p, LOGVAR_MIN, LOGVAR_MAX)
         
@@ -88,6 +93,10 @@ def compute_mixture_prior(mus, logvars):
     # Stack means and variances
     all_mus = tf.stack(mus, axis=0)      # [num_modalities, batch_size, latent_dim]
     all_logvars = tf.stack(logvars, axis=0)  # [num_modalities, batch_size, latent_dim]
+
+    # Ensure all_mus and all_logvars are float32
+    all_mus = tf.cast(all_mus, dtype=tf.float32)
+    all_logvars = tf.cast(all_logvars, dtype=tf.float32)
     
     # Compute mixture parameters (average over modalities)
     mixture_mu = tf.reduce_mean(all_mus, axis=0)  # [batch_size, latent_dim]
@@ -123,6 +132,10 @@ def compute_js_divergence(mus, logvars):
     Returns:
         JS divergence (scaled by number of modalities)
     """
+    # ensure all inputs are float32
+    mus = [tf.cast(m, tf.float32) for m in mus]
+    logvars = [tf.cast(lv, tf.float32) for lv in logvars]
+
     # Handle empty or single distributions
     num_modalities = len(mus)
     if num_modalities <= 1:
