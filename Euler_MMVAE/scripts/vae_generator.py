@@ -7,10 +7,10 @@ import random
 import cv2
 import keras
 from keras import layers, Model, optimizers
-from keras.optimizers.schedules import ExponentialDecay, CosineDecayRestarts  
+from keras.optimizers.schedules import ExponentialDecay, CosineDecayRestarts  #type: ignore
 from sklearn.metrics import mean_squared_error, precision_score, recall_score, f1_score
 from scipy.stats import pearsonr
-from skimage.metrics import structural_similarity as ssim
+from skimage.metrics import structural_similarity as ssim #type: ignore
 from scipy import signal
 import matplotlib.pyplot as plt
 import plotly.graph_objects as go
@@ -21,7 +21,7 @@ import pandas as pd
 import umap
 import GPUtil
 import tensorflow as tf
-from tensorflow.keras import mixed_precision
+from tensorflow.keras import mixed_precision #type: ignore
 
 # Multithreading
 tf.config.threading.set_intra_op_parallelism_threads(2)
@@ -222,7 +222,7 @@ def segment_and_transform(
     
     return raw_segments, mask_segments, test_ids
 
-def compute_and_spectrograms(raw_segments, fs=200, nperseg=256, noverlap=192):
+def compute_or_load_spectrograms(raw_segments, fs=200, nperseg=256, noverlap=192):
     """
     Compute or load cached spectrograms.
     
@@ -392,63 +392,11 @@ def cache_final_features(complex_specs, cache_path="cached_spectral_features.npy
         print(f"📂 Loading final spectral features from {cache_path}")
         return np.load(cache_path)
     
-    # Convert to final shape (mag+phase)
-    print("⏳ Converting complex STFT -> final magnitude+phase features...")
-    spectral_features = spectrogram_to_features(complex_specs)
-    
     # Save the final shape
-    np.save(cache_path, spectral_features)
+    np.save(cache_path, complex_specs)
     print(f"✅ Final spectral features saved to {cache_path}")
 
     return np.load(cache_path)
-
-def spectrogram_to_features(complex_spectrograms):
-    """
-    Convert complex spectrograms to feature representation suitable for CNN processing.
-    Now uses batched processing to save memory.
-    
-    Args:
-        complex_spectrograms: Complex spectrograms with shape (batch, freq, time, channels)
-    
-    Returns:
-        Features with shape (batch, freq, time, channels*2) where for each original channel
-        we have magnitude and phase
-    """
-    batch_size, freq_bins, time_bins, channels = complex_spectrograms.shape
-    
-    # Initialize feature array (magnitude and phase for each channel)
-    features = np.zeros((batch_size, freq_bins, time_bins, channels * 2), dtype=np.float32)
-    
-    # Process in batches of 1000 samples to save memory
-    batch_size_proc = 1000
-    
-    for start_idx in range(0, batch_size, batch_size_proc):
-        end_idx = min(start_idx + batch_size_proc, batch_size)
-        print(f"Processing spectrograms {start_idx}-{end_idx-1}/{batch_size}")
-        
-        # Extract a batch of spectrograms
-        batch_specs = complex_spectrograms[start_idx:end_idx]
-        
-        # Extract magnitude and phase
-        for c in range(channels):
-            # Magnitude (log scale for better dynamic range)
-            magnitude = np.abs(batch_specs[:, :, :, c])
-            # Add small constant to avoid log(0)
-            log_magnitude = np.log1p(magnitude)
-            
-            # Phase
-            phase = np.angle(batch_specs[:, :, :, c])
-            
-            # Store in feature array
-            features[start_idx:end_idx, :, :, c*2] = log_magnitude
-            features[start_idx:end_idx, :, :, c*2+1] = phase
-        
-        # Free memory
-        del batch_specs
-        import gc
-        gc.collect()
-    
-    return features
 
 # ----- Encoders -----
 class SpectrogramEncoder(tf.keras.Model):
@@ -1528,7 +1476,8 @@ def evaluate_reconstructions(model, dataset, fs=200):
         # --- Spectrograms ---
         spec_mse.append(np.mean((spec.numpy() - recon_spec.numpy())**2))
         for i in range(spec.shape[0]):
-            spec_ssims.append(ssim(spec[i, :, :, 0], recon_spec[i, :, :, 0], data_range=1.0))
+            spec_ssims.append(ssim(spec[i, :, :, 0].numpy(), recon_spec[i, :, :, 0].numpy(), data_range=1.0)
+    )
 
         # --- Masks ---
         y_true = mask.numpy().round().astype(np.int32)
@@ -1551,42 +1500,44 @@ def evaluate_reconstructions(model, dataset, fs=200):
 
 def evaluate_selected_segments(model, test_ids_to_use=["25"], fs=200, nperseg=256, noverlap=224, output_dir="results_mmvae/synthesis"):
     """
-    Evaluate reconstruction quality on handpicked raw segments (not cached) using a trained model.
+    Evaluate reconstruction quality on selected raw segments using a trained model.
+    For each test ID, one 4s segment is selected (using segment_and_transform).
     """
     os.makedirs(output_dir, exist_ok=True)
 
-    # Load raw accelerometer data and masks
+    # Load full raw accelerometer data and masks
     accel_dict, binary_masks, heatmaps = data_loader.load_data()
 
-    all_segments = []
-    all_masks = []
-    all_raw_ts = []
-    for test_id in test_ids_to_use:
-        # Match test_id format to keys (either int or str)
-        key = str(test_id) if str(test_id) in accel_dict else (
-            int(test_id) if int(test_id) in accel_dict else None)
+    all_segments, all_masks, all_test_ids = [], [], []
 
-        if key is None or key not in heatmaps:
-            print(f"❌ Test ID {test_id} not found. Skipping.")
+    for test_id in test_ids_to_use:
+        key = str(test_id) if str(test_id) in accel_dict else int(test_id)
+        if key not in accel_dict or key not in heatmaps:
+            print(f"❌ Test ID {test_id} not found in data. Skipping.")
             continue
 
-        for ts_raw in accel_dict[key]:
-            if ts_raw.shape[0] >= 800 and ts_raw.shape[1] == 12:
-                segment = ts_raw[100:900, :]
-                all_raw_ts.append(segment)
-                all_segments.append(segment)
-                all_masks.append(heatmaps[key])
-            else:
-                print(f"⚠️ Skipping sample from {key}: shape={ts_raw.shape}")
+        # Segment data using your peak-RMS strategy
+        segs, masks, ids = segment_and_transform(
+            {key: accel_dict[key]}, {key: heatmaps[key]}, segment_duration=4.0
+        )
+        if len(segs) == 0:
+            print(f"⚠️ No segments found for Test ID {test_id}")
+            continue
+
+        # Pick one segment randomly
+        idx = np.random.randint(0, len(segs))
+        all_segments.append(segs[idx])
+        all_masks.append(masks[idx])
+        all_test_ids.append(test_id)
 
     if not all_segments:
-        print("⚠️ No segments found for given test IDs.")
+        print("⚠️ No valid segments found. Exiting.")
         return
 
     raw_segments = np.stack(all_segments)
     masks = np.stack(all_masks)
 
-    print("✅ Final raw_segments.shape:", np.array(all_segments).shape)
+    print("✅ Final raw_segments.shape:", raw_segments.shape)
 
     # Convert to spectrogram
     spec = compute_complex_spectrogram(raw_segments, fs, nperseg, noverlap)
@@ -1601,14 +1552,14 @@ def evaluate_selected_segments(model, test_ids_to_use=["25"], fs=200, nperseg=25
     for i in range(len(raw_segments)):
         time_axis = np.linspace(0, 4, 800)
         plt.figure(figsize=(10, 5))
-        for ch in range(raw_segments.shape[2]):
+        for ch in range(recon_ts.shape[2]):  # Use reconstructed ts shape for safety
             plt.plot(time_axis, raw_segments[i, :, ch], color='blue', alpha=0.4)
             plt.plot(time_axis, recon_ts[i, :, ch], color='red', alpha=0.4)
-        plt.title(f"Reconstruction | Test ID {test_ids_to_use[i % len(test_ids_to_use)]}")
+        plt.title(f"Reconstruction | Test ID {all_test_ids[i]}")
         plt.xlabel("Time (s)")
         plt.ylabel("Amplitude")
         plt.tight_layout()
-        plt.savefig(f"{output_dir}/recon_testid_{test_ids_to_use[i % len(test_ids_to_use)]}_seg{i}.png", dpi=300)
+        plt.savefig(f"{output_dir}/recon_testid_{all_test_ids[i]}_seg{i}.png", dpi=300)
         plt.close()
 
     print(f"✅ Reconstruction plots saved to {output_dir}")
@@ -1633,7 +1584,7 @@ def main():
     
     latent_dim = 128 
     batch_size = 64
-    total_epochs = 500  # We'll chunk these
+    total_epochs = 500
     patience = 20
 
     # If you want to resume from best/final weights in a previous run:
@@ -1661,7 +1612,6 @@ def main():
         print(f"✅ mask_segments: {mask_segments.shape}")
         print(f"✅ test_ids: {test_ids.shape}")
     else:
-        # (Same logic as you had to load raw data, do STFT, etc.)
         print("⚠️ At least one cache file is missing. Recomputing EVERYTHING...")
         accel_dict, binary_masks, heatmaps = data_loader.load_data()
         mask_segments = np.array([heatmaps[k] for k in sorted(heatmaps.keys())])
@@ -1680,7 +1630,7 @@ def main():
         print(f"✅ Saved test IDs to {ids_path}")
 
         print("🔄 Computing spectrograms...")
-        complex_specs = compute_and_spectrograms(raw_segments, fs, nperseg, noverlap)
+        complex_specs = compute_or_load_spectrograms(raw_segments, fs, nperseg, noverlap)
 
         print("📝 Converting spectrograms to features...")
         spectral_features = cache_final_features(complex_specs, cache_path=final_path)
