@@ -27,6 +27,7 @@ from custom_distributions import (
     compute_kl_divergence,
 )
 import data_loader
+from data_loader import mask_recon
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 from vae_generator import (
@@ -324,24 +325,27 @@ def create_interpolation_video(time_series_list, output_path, fps=10, duration=1
 
 def generate_conditional_samples(model, conditioning_data=None, save_dir="conditional_samples"):
     """
-    Generate samples conditioned on real data if available.
+    Generate samples conditioned on real data - one sample for each unique test ID.
+    For each test ID:
+    1. Generate masks from spectrograms
+    2. Generate spectrograms from masks
+    3. Reconstruct time series from generated spectrograms
     
     Args:
         model: Trained SpectralMMVAE model
-        conditioning_data: Optional data for conditioning 
-                          (if None, will load from dataset)
+        conditioning_data: Optional data for conditioning
         save_dir: Directory to save outputs
     """
     os.makedirs(save_dir, exist_ok=True)
     
-    # If no conditioning data provided, try to load from your dataset
+    # If no conditioning data provided, load from dataset
     if conditioning_data is None:
         try:
-            # Load a small subset of real data
+            # Load ALL available data
             accel_dict, binary_masks, heatmaps = data_loader.load_data()
             
-            # Get a few test IDs
-            test_ids = list(accel_dict.keys())[:3]
+            # Get ALL test IDs
+            test_ids = list(accel_dict.keys())
             
             # Process these samples
             from vae_generator import segment_and_transform
@@ -356,10 +360,17 @@ def generate_conditional_samples(model, conditioning_data=None, save_dir="condit
                 raw_segments, fs=200, nperseg=256, noverlap=224
             )
             
+            # Store the binary masks for visualization
+            binary_mask_segments = []
+            for t_id in test_ids:
+                binary_mask_segments.append(binary_masks[t_id])
+            
             conditioning_data = {
                 'specs': spec_features,
                 'masks': mask_segments,
-                'raw': raw_segments
+                'raw': raw_segments,
+                'binary_masks': binary_mask_segments,
+                'test_ids': test_ids
             }
             print(f"✅ Loaded {len(raw_segments)} real samples for conditioning")
             
@@ -369,9 +380,21 @@ def generate_conditional_samples(model, conditioning_data=None, save_dir="condit
             generate_random_samples(model, how_many=3, save_dir=save_dir)
             return
     
-    # Generate conditioned samples
+    # Track processed test IDs to ensure one sample per unique ID
+    processed_test_ids = set()
+    
     for i in range(len(conditioning_data['specs'])):
-        print(f"Generating sample conditioned on real data {i+1}...")
+        # Get current test ID
+        current_test_id = conditioning_data['test_ids'][i]
+        
+        # Skip if already processed
+        if current_test_id in processed_test_ids:
+            continue
+            
+        # Mark this test ID as processed
+        processed_test_ids.add(current_test_id)
+        
+        print(f"Generating sample for test ID {current_test_id}...")
         
         # Extract conditioning inputs
         spec_in = tf.convert_to_tensor(conditioning_data['specs'][i:i+1])
@@ -388,82 +411,303 @@ def generate_conditional_samples(model, conditioning_data=None, save_dir="condit
         # 2. From mask to spectrogram
         recon_spec_from_mask = model.spec_decoder(mu_mask, training=False)
         
-        # Visualize results
-        plt.figure(figsize=(15, 10))
+        # 3. Direct reconstruction of spectrogram
+        recon_spec_direct = model.spec_decoder(mu_spec, training=False)
         
-        # Original spectrogram
-        plt.subplot(3, 2, 1)
-        plt.imshow(spec_in[0, :, :, 0].numpy(), aspect='auto', origin='lower', cmap='viridis')
-        plt.title("Original Spectrogram (Ch 1)")
-        plt.colorbar()
-        
-        # Original mask
-        plt.subplot(3, 2, 2)
+        # Plot masks comparison
+        plt.figure(figsize=(12, 6))
+        plt.subplot(1, 2, 1)
         plt.imshow(mask_in[0, :, :, 0].numpy(), aspect='auto', cmap='gray')
-        plt.title("Original Mask")
-        plt.colorbar()
-        
-        # Mask generated from spectrogram
-        plt.subplot(3, 2, 3)
+        plt.title(f"Original Mask (Test {current_test_id})")
+        plt.subplot(1, 2, 2)
         plt.imshow(recon_mask_from_spec[0, :, :, 0].numpy(), aspect='auto', cmap='gray')
-        plt.title("Mask from Spec")
-        plt.colorbar()
-        
-        # Spectrogram generated from mask
-        plt.subplot(3, 2, 4)
-        plt.imshow(recon_spec_from_mask[0, :, :, 0].numpy(), aspect='auto', origin='lower', cmap='viridis')
-        plt.title("Spec from Mask (Ch 1)")
-        plt.colorbar()
-        
-        # Original time series
-        plt.subplot(3, 2, 5)
-        time_axis = np.linspace(0, 4, conditioning_data['raw'][i].shape[0])
-        
-        # Plot channels
-        num_channels = min(3, conditioning_data['raw'][i].shape[1])
-        colors = ['blue', 'red', 'green']
-        
-        for ch in range(num_channels):
-            plt.plot(time_axis, conditioning_data['raw'][i, :, ch], 
-                     color=colors[ch], alpha=0.8, 
-                     label=f'Ch {ch+1}')
-        
-        plt.title("Original Time Series")
-        plt.xlabel("Time (s)")
-        plt.legend()
-        
-        # Reconstructed time series from mask's latent
-        plt.subplot(3, 2, 6)
-        try:
-            time_series = model.reconstruct_time_series(
-                recon_spec_from_mask.numpy(),
-                fs=200, nperseg=256, noverlap=224,
-                time_length=conditioning_data['raw'][i].shape[0]
-            )
-            
-            for ch in range(num_channels):
-                plt.plot(time_axis, time_series[0, :, ch], 
-                         color=colors[ch], alpha=0.8, 
-                         label=f'Ch {ch+1}')
-            
-            plt.title("Time Series from Mask")
-            plt.xlabel("Time (s)")
-            plt.legend()
-            
-        except Exception as e:
-            plt.text(0.5, 0.5, f"Error: {str(e)[:50]}...", 
-                    ha='center', va='center', transform=plt.gca().transAxes)
-            plt.title("Failed to Reconstruct Time Series")
-        
+        plt.title("Generated Mask (from Spec)")
         plt.tight_layout()
-        plt.savefig(f"{save_dir}/conditional_sample_{i+1}.png", dpi=300)
+        plt.savefig(f"{save_dir}/conditional_sample_{current_test_id}_masks_comparison.png", dpi=300)
         plt.close()
         
-        # Save the numpy arrays
-        np.save(f"{save_dir}/cond_{i+1}_spec_from_mask.npy", recon_spec_from_mask.numpy())
-        np.save(f"{save_dir}/cond_{i+1}_mask_from_spec.npy", recon_mask_from_spec.numpy())
+        # Reconstruct time series from both the original and generated spectrograms
+        try:
+            # Get original time series
+            original_ts = conditioning_data['raw'][i]
+            time_axis = np.linspace(0, 4, original_ts.shape[0])
+            
+            # Reconstructed time series from spectrogram-to-mask-to-spectrogram
+            recon_ts_from_mask = model.reconstruct_time_series(
+                recon_spec_from_mask.numpy(),
+                fs=200, nperseg=256, noverlap=224,
+                time_length=original_ts.shape[0]
+            )
+            
+            # Reconstructed time series directly from spectrogram
+            recon_ts_direct = model.reconstruct_time_series(
+                recon_spec_direct.numpy(),
+                fs=200, nperseg=256, noverlap=224,
+                time_length=original_ts.shape[0]
+            )
+            
+            # Calculate RMS errors
+            num_channels = original_ts.shape[1]
+            rms_errors_from_mask = np.zeros(num_channels)
+            rms_errors_direct = np.zeros(num_channels)
+            
+            for ch in range(num_channels):
+                original = original_ts[:, ch]
+                recon_from_mask = recon_ts_from_mask[0, :, ch]
+                recon_direct = recon_ts_direct[0, :, ch]
+                
+                rms_errors_from_mask[ch] = np.sqrt(np.mean((original - recon_from_mask)**2))
+                rms_errors_direct[ch] = np.sqrt(np.mean((original - recon_direct)**2))
+            
+            mean_rms_error_from_mask = np.mean(rms_errors_from_mask)
+            mean_rms_error_direct = np.mean(rms_errors_direct)
+            
+            # Create separate plots for each channel
+            for ch in range(num_channels):
+                plt.figure(figsize=(15, 6))
+                plt.title(f"Time Series Comparison (Test ID: {current_test_id}, Channel {ch+1})")
+                plt.plot(time_axis, original_ts[:, ch], 'b-', linewidth=1.5, alpha=0.8, label='Original')
+                plt.plot(time_axis, recon_ts_direct[0, :, ch], 'r-', linewidth=1.5, alpha=0.8, 
+                         label=f'Reconstructed (Direct) - RMS Error: {rms_errors_direct[ch]:.4f}')
+                
+                plt.xlabel("Time (s)")
+                plt.ylabel("Amplitude")
+                plt.grid(True, alpha=0.3)
+                plt.legend()
+                plt.tight_layout()
+                plt.savefig(f"{save_dir}/ts_comparison_{current_test_id}_ch{ch+1}.png", dpi=300)
+                plt.close()
+            
+            # Multi-channel overview plot
+            plt.figure(figsize=(20, 15))
+            plt.suptitle(f"Time Series Comparison (Test ID: {current_test_id}) - Mean RMS Error: {mean_rms_error_direct:.4f}", fontsize=16)
+            
+            # Determine grid layout
+            cols = 3  # Number of columns in the grid
+            rows = int(np.ceil(num_channels / cols))
+            
+            for ch in range(num_channels):
+                plt.subplot(rows, cols, ch+1)
+                
+                # Plot original and reconstructed time series
+                plt.plot(time_axis, original_ts[:, ch], 'b-', linewidth=1.5, alpha=0.8, label='Original')
+                plt.plot(time_axis, recon_ts_direct[0, :, ch], 'r-', linewidth=1.5, alpha=0.8, label='Reconstructed')
+                
+                plt.title(f"Channel {ch+1} - RMS Error: {rms_errors_direct[ch]:.4f}")
+                plt.xlabel("Time (s)")
+                plt.ylabel("Amplitude")
+                plt.grid(True, alpha=0.3)
+                
+                # Only add legend to first subplot to save space
+                if ch == 0:
+                    plt.legend()
+            
+            plt.tight_layout(rect=[0, 0, 1, 0.95])  # Add space for suptitle
+            plt.savefig(f"{save_dir}/all_channels_{current_test_id}.png", dpi=300)
+            plt.close()
+            
+            # Save metadata
+            with open(f"{save_dir}/conditional_{current_test_id}_metrics.txt", "w") as f:
+                f.write(f"Test ID: {current_test_id}\n")
+                f.write(f"Direct Reconstruction Mean RMS Error: {mean_rms_error_direct:.6f}\n")
+                f.write(f"From-Mask Reconstruction Mean RMS Error: {mean_rms_error_from_mask:.6f}\n")
+                f.write("\nPer-channel RMS Errors (Direct):\n")
+                for ch in range(num_channels):
+                    f.write(f"Channel {ch+1} RMS Error: {rms_errors_direct[ch]:.6f}\n")
+            
+        except Exception as e:
+            print(f"Error processing test ID {current_test_id}: {e}")
     
-    print(f"✅ Generated conditioned samples in '{save_dir}' directory")
+    print(f"✅ Generated samples for {len(processed_test_ids)} unique test IDs")
+
+def test_reconstruction(model, test_data=None, save_dir="reconstruction_tests"):
+    """
+    Test reconstruction capabilities by feeding one time-series segment per unique test ID
+    (rather than all segments). This ensures we only reconstruct once per ID.
+    """
+
+    os.makedirs(save_dir, exist_ok=True)
+
+    # 1) If no test data, load from dataset
+    if test_data is None:
+        try:
+            accel_dict, binary_masks, heatmaps = data_loader.load_data()
+
+            # Grab a few test IDs
+            chosen_ids = list(accel_dict.keys())[:3]
+
+            from vae_generator import segment_and_transform
+            raw_segments, mask_segments, test_ids = segment_and_transform(
+                {k: accel_dict[k] for k in chosen_ids},
+                {k: heatmaps[k] for k in chosen_ids},
+                segment_duration=4.0
+            )
+            spec_features = compute_complex_spectrogram(
+                raw_segments, fs=200, nperseg=256, noverlap=224
+            )
+            test_data = {
+                'specs': spec_features,
+                'masks': mask_segments,
+                'raw': raw_segments,
+                'test_ids': test_ids
+            }
+            print(f"✅ Loaded {len(raw_segments)} segments for reconstruction testing")
+
+        except Exception as e:
+            print(f"❌ Failed to load test data: {e}")
+            return
+
+    # 2) Identify unique test IDs in test_data
+    unique_ids = np.unique(test_data['test_ids'])
+    print(f"Found {len(unique_ids)} unique IDs in the test data.")
+
+    # 3) For each test ID, pick exactly one segment index
+    processed_count = 0
+    for test_id in unique_ids:
+        # Find all indices for this test_id
+        indices_for_id = np.where(test_data['test_ids'] == test_id)[0]
+        if len(indices_for_id) == 0:
+            continue
+
+        # Just pick the first occurrence
+        idx = indices_for_id[0]
+
+        spec_in = tf.convert_to_tensor(test_data['specs'][idx:idx+1])
+        mask_in = tf.convert_to_tensor(test_data['masks'][idx:idx+1])
+
+        # Reconstruct
+        recon_results = model(spec_in, mask_in, training=False)
+        recon_spec = recon_results[0]
+        recon_mask = recon_results[1]
+
+        # Original time series
+        original_ts = test_data['raw'][idx]
+        time_axis = np.linspace(0, 4, original_ts.shape[0])
+
+        # Reconstruct the time series from the model's spectrogram
+        recon_ts = model.reconstruct_time_series(
+            recon_spec.numpy(),
+            fs=200, nperseg=256, noverlap=224,
+            time_length=original_ts.shape[0]
+        )
+
+        # Calculate errors
+        num_channels = original_ts.shape[1]
+        rms_errors = np.zeros(num_channels)
+        for ch in range(num_channels):
+            original = original_ts[:, ch]
+            reconstructed = recon_ts[0, :, ch]
+            rms_errors[ch] = np.sqrt(np.mean((original - reconstructed)**2))
+        mean_rms_error = np.mean(rms_errors)
+
+        # --- Plot 1: Masks (coarse 32×96) ---
+        plt.figure(figsize=(12, 6))
+        plt.subplot(1, 2, 1)
+        plt.imshow(mask_in[0, :, :, 0].numpy(), aspect='auto', cmap='gray', vmin=0, vmax=1)
+        plt.title(f"Original Mask (Test {test_id})")
+        plt.colorbar()
+
+        plt.subplot(1, 2, 2)
+        plt.imshow(recon_mask[0, :, :, 0].numpy(), aspect='auto', cmap='gray', vmin=0, vmax=1)
+        plt.title("Reconstructed Mask")
+        plt.colorbar()
+
+        plt.tight_layout()
+        plt.savefig(f"{save_dir}/test_{test_id}_masks.png", dpi=300)
+        plt.close()
+
+        # --- NEW: Upsample and plot side-by-side in 'hot' colormap ---
+        orig_coarse_np = mask_in[0, :, :, 0].numpy()[None, ...]     # (1,32,96)
+        recon_coarse_np = recon_mask[0, :, :, 0].numpy()[None, ...] # (1,32,96)
+
+        upsampled_orig = mask_recon(orig_coarse_np, target_size=(256, 768), interpolation=1)  # cv2.INTER_LINEAR=1
+        upsampled_recon = mask_recon(recon_coarse_np, target_size=(256, 768), interpolation=1)
+
+        # Plot the first slice from each
+        upsampled_orig_2d = upsampled_orig[0]   # shape (256,768)
+        upsampled_recon_2d = upsampled_recon[0] # shape (256,768)
+
+        plt.figure(figsize=(14, 6))
+        plt.subplot(1, 2, 1)
+        plt.imshow(upsampled_orig_2d, cmap='hot', vmin=0, vmax=1)
+        plt.title(f"Upsampled Original Mask (Test {test_id})")
+        plt.colorbar()
+
+        plt.subplot(1, 2, 2)
+        plt.imshow(upsampled_recon_2d, cmap='hot', vmin=0, vmax=1)
+        plt.title("Upsampled Reconstructed Mask")
+        plt.colorbar()
+
+        plt.tight_layout()
+        plt.savefig(f"{save_dir}/test_{test_id}_masks_upsampled.png", dpi=300)
+        plt.close()
+        # --- end upsample plot ---
+
+        # --- Plot 2: Spectrograms (first channel) ---
+        plt.figure(figsize=(12, 6))
+        plt.subplot(1, 2, 1)
+        plt.imshow(spec_in[0, :, :, 0].numpy(), aspect='auto', origin='lower', cmap='viridis')
+        plt.title(f"Original Spectrogram (Ch 1) - Test {test_id}")
+        plt.colorbar()
+
+        plt.subplot(1, 2, 2)
+        plt.imshow(recon_spec[0, :, :, 0].numpy(), aspect='auto', origin='lower', cmap='viridis')
+        plt.title("Reconstructed Spectrogram (Ch 1)")
+        plt.colorbar()
+
+        plt.tight_layout()
+        plt.savefig(f"{save_dir}/test_{test_id}_specs.png", dpi=300)
+        plt.close()
+
+        # --- Plot 3: All channels overlay (blue=original, red=reconstructed) ---
+        plt.figure(figsize=(12, 6))
+        for ch in range(num_channels):
+            plt.plot(time_axis, original_ts[:, ch], 'b-', alpha=0.4)
+            plt.plot(time_axis, recon_ts[0, :, ch], 'r-', alpha=0.4)
+
+        plt.title(f"Test {test_id} - All Channels Overlaid")
+        plt.xlabel("Time (s)")
+        plt.ylabel("Amplitude")
+        plt.grid(True, alpha=0.3)
+        plt.legend(["Original (all ch)", "Reconstructed (all ch)"])
+        plt.tight_layout()
+        plt.savefig(f"{save_dir}/test_{test_id}_time_series_overlay.png", dpi=300)
+        plt.close()
+
+        # --- Plot 4: Per-channel subplots ---
+        plt.figure(figsize=(20, 15))
+        plt.suptitle(f"Test {test_id} - Time Series Comparison (Mean RMS Error: {mean_rms_error:.4f})",
+                     fontsize=16)
+        cols = 3
+        rows = int(np.ceil(num_channels / cols))
+
+        for ch in range(num_channels):
+            plt.subplot(rows, cols, ch+1)
+            plt.plot(time_axis, original_ts[:, ch], 'b-', linewidth=1.5, alpha=0.8, label='Original')
+            plt.plot(time_axis, recon_ts[0, :, ch], 'r-', linewidth=1.5, alpha=0.8, label='Reconstructed')
+            plt.title(f"Channel {ch+1} - RMS: {rms_errors[ch]:.4f}")
+            plt.xlabel("Time (s)")
+            plt.ylabel("Amplitude")
+            plt.grid(True, alpha=0.3)
+            if ch == 0:
+                plt.legend()
+
+        plt.tight_layout(rect=[0, 0, 1, 0.95])
+        plt.savefig(f"{save_dir}/test_{test_id}_time_series_detail.png", dpi=300)
+        plt.close()
+
+        # --- Write out RMS error metrics ---
+        with open(f"{save_dir}/test_{test_id}_metrics.txt", "w") as f:
+            f.write(f"Test ID: {test_id}\n")
+            f.write(f"Index used: {idx}\n")
+            f.write(f"Mean RMS Error: {mean_rms_error:.6f}\n")
+            for ch in range(num_channels):
+                f.write(f"Channel {ch+1} RMS Error: {rms_errors[ch]:.6f}\n")
+
+        processed_count += 1
+        print(f"Done reconstruction for Test ID {test_id}")
+
+    print(f"\n✅ Completed single-segment reconstruction tests for {processed_count} test IDs.")
 
 # -------------------------------------------------------------------
 # 3) Main function
@@ -480,25 +724,31 @@ def main():
     
     # Synthesis options - uncomment the ones you want to use
     
-    # 1. Generate random samples from the prior
-    generate_random_samples(
-        model, 
-        how_many=5, 
-        save_dir=f"{output_dir}/random_samples"
-    )
+    # # 1. Generate random samples from the prior
+    # generate_random_samples(
+    #     model, 
+    #     how_many=5, 
+    #     save_dir=f"{output_dir}/random_samples"
+    # )
     
-    # 2. Generate interpolations in latent space
-    generate_interpolations(
-        model, 
-        num_interpolation_steps=8, 
-        save_dir=f"{output_dir}/interpolations"
-    )
+    # # 2. Generate interpolations in latent space
+    # generate_interpolations(
+    #     model, 
+    #     num_interpolation_steps=8, 
+    #     save_dir=f"{output_dir}/interpolations"
+    # )
     
     # 3. Generate conditional samples (if data available)
     generate_conditional_samples(
         model, 
         conditioning_data=None,  # Will try to load from your dataset
         save_dir=f"{output_dir}/conditional_samples"
+    )
+
+    test_reconstruction(
+        model, 
+        test_data=None,  # Will try to load from your dataset
+        save_dir=f"{output_dir}/reconstruction_tests"
     )
     
     print(f"\n✅ All synthesis tasks completed. Results saved in '{output_dir}'")
