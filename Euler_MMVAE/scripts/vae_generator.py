@@ -32,7 +32,13 @@ mixed_precision.set_global_policy('mixed_float16')
 print(f"Mixed precision policy: {mixed_precision.global_policy()}")
 
 # Set working directory
-os.chdir("/cluster/scratch/scansimo/Euler_MMVAE")
+import platform
+if platform.system() == "Windows":
+    # Local Windows path
+    os.chdir("c:/SP-Master-Local/SP_DamageLocalization-MasonryArchBridge_SimonScandella/ProbabilisticApproach/Euler_MMVAE")
+else:
+    # Original Euler cluster path
+    os.chdir("/cluster/scratch/scansimo/Euler_MMVAE")
 print("✅ Script has started executing")
 
 # GPU Configuration
@@ -304,82 +310,37 @@ def compute_complex_spectrogram(
     return all_spectrograms
 
 def inverse_spectrogram(complex_spectrograms, time_length, fs=200, nperseg=256, noverlap=128, batch_processing_size=100):
-    """
-    Convert complex spectrograms back to time series with batched processing.
-    
-    Args:
-        complex_spectrograms: Complex spectrograms (batch, freq, time, channels)
-        time_length: Original time series length
-        fs: Sampling frequency
-        nperseg: Length of each segment
-        noverlap: Number of points to overlap between segments
-        batch_processing_size: Number of samples to process at once
-    
-    Returns:
-        Reconstructed time series (batch, time_length, channels)
-    """
-    frame_step = nperseg - noverlap
-    batch_size, freq_bins, time_bins, channels = complex_spectrograms.shape
-    num_orig_channels = channels // 2  # Since we have magnitude and phase for each channel
-    
-    # Pre-allocate the result array
+    # shape: (batch_size, freq_bins, time_bins, channels)
+    batch_size, freq_bins, time_bins, num_orig_channels = complex_spectrograms.shape
     time_series = np.zeros((batch_size, time_length, num_orig_channels), dtype=np.float32)
-    
-    # Process in batches
-    total_batches = (batch_size + batch_processing_size - 1) // batch_processing_size
 
-    # Define matching inverse window
-    inv_window_fn = tf.signal.inverse_stft_window_fn(
-        frame_step,
-        forward_window_fn=lambda length, dtype: tf.signal.hann_window(length, dtype=dtype)
-    )
-    
+    total_batches = (batch_size + batch_processing_size - 1) // batch_processing_size
+    inv_window_fn = tf.signal.inverse_stft_window_fn(nperseg - noverlap,
+         forward_window_fn=lambda length, dtype: tf.signal.hann_window(length, dtype=dtype))
+
     for batch_idx in range(total_batches):
-        print(f"Reconstructing batch {batch_idx+1}/{total_batches}")
         start_idx = batch_idx * batch_processing_size
-        end_idx = min((batch_idx + 1) * batch_processing_size, batch_size)
-        
-        # Extract the current batch
+        end_idx   = min((batch_idx + 1) * batch_processing_size, batch_size)
+
+        # Slice the current batch of complex spectrograms (already combined magnitude/phase)
         current_batch = complex_spectrograms[start_idx:end_idx]
-        
-        # Convert the spectrogram features to complex spectrograms
-        complex_specs = np.zeros((end_idx-start_idx, freq_bins, time_bins, num_orig_channels), dtype=np.complex64)
-        
-        for c in range(num_orig_channels):
-            # Extract magnitude and phase
-            log_magnitude = current_batch[:, :, :, c*2]
-            phase = current_batch[:, :, :, c*2+1]
-            
-            # Convert back to linear magnitude
-            magnitude = np.exp(log_magnitude) - 1.0
-            
-            # Combine magnitude and phase to get complex spectrogram
-            complex_specs[:, :, :, c] = magnitude * np.exp(1j * phase)
-        
-        # Apply inverse STFT
+
         for b_rel, b_abs in enumerate(range(start_idx, end_idx)):
             for c in range(num_orig_channels):
-                # Transpose back to TensorFlow's expected format
-                stft_tensor = tf.constant(complex_specs[b_rel, :, :, c].T, dtype=tf.complex64)
-                
-                # Use TensorFlow's inverse STFT
+                stft_tensor = tf.constant(current_batch[b_rel, :, :, c].T, dtype=tf.complex64)
                 inverse_stft = tf.signal.inverse_stft(
                     stft_tensor,
                     frame_length=nperseg,
-                    frame_step=nperseg-noverlap,
+                    frame_step=nperseg - noverlap,
                     fft_length=nperseg,
                     window_fn=inv_window_fn
                 )
-                
                 actual_length = min(inverse_stft.shape[0], time_length)
                 time_series[b_abs, :actual_length, c] = inverse_stft[:actual_length].numpy()
-        
-        # Clear memory between batches
-        if batch_idx < total_batches - 1:
-            tf.keras.backend.clear_session()
-            import gc
-            gc.collect()
-    
+
+        # Optional cleanup between batches
+        tf.keras.backend.clear_session()
+
     return time_series
 
 def cache_final_features(complex_specs, cache_path="cached_spectral_features.npy"):
@@ -743,7 +704,7 @@ def get_beta_schedule(epoch, max_epochs, schedule_type='cyclical'):
     """
     # Define beta limits
     BETA_MIN = 1e-8   # Start with very small value
-    BETA_MAX = 0.15   # Maximum value
+    BETA_MAX = 0.2   # Maximum value
     
     # Define warmup phase length (in epochs)
     WARMUP_EPOCHS = 50
@@ -977,7 +938,7 @@ class SpectralMMVAE(tf.keras.Model):
         
         return mus, logvars, mixture_mu, mixture_logvar
 
-    def reconstruct_time_series(self, spec_features, fs=200, nperseg=256, noverlap=128, time_length=1000):
+    def reconstruct_time_series(self, spec_features, fs=200, nperseg=256, noverlap=224, time_length=800):
         """
         Reconstruct time series from spectrogram features by:
         1. Separating magnitude and phase
@@ -1015,7 +976,6 @@ class SpectralMMVAE(tf.keras.Model):
         return time_series
     
 # ----- Data Processing and Dataset Creation -----
-
 def create_tf_dataset(
     spectrograms, mask_array, test_id_array,
     batch_size=32, shuffle=True, debug_mode=False, debug_samples=500
@@ -1062,7 +1022,7 @@ def create_tf_dataset(
     dataset = (
         dataset
         .cache()
-        .batch(batch_size)
+        .batch(batch_size, drop_remainder=True)
         .prefetch(tf.data.AUTOTUNE)
     )
     return dataset
@@ -1583,12 +1543,12 @@ def main():
     noverlap = 224 # STFT overlap
     
     latent_dim = 128 
-    batch_size = 64
+    batch_size = 80
     total_epochs = 500
     patience = 20
 
     # If you want to resume from best/final weights in a previous run:
-    resume_training = True
+    resume_training = False
 
     # Cached file paths
     final_path = "scripts/cached_spectral_features.npy"
@@ -1667,17 +1627,16 @@ def main():
 
     # ------------------------ 9) Chunked Training Setup ------------------------
     # We’ll accumulate metrics across chunks in this dictionary.
-    all_metrics = {
-        'train_total': [],
-        'train_spec': [],
-        'train_mask': [],
-        'train_js': [],
-        'train_mode': [],
-        'val_total': [],
-        'val_spec': [],
-        'val_mask': [],
-        'val_js': []
-    }
+    metrics_path = "results_mmvae/training_metrics.npy"
+    if resume_training and os.path.exists(metrics_path):
+        all_metrics = np.load(metrics_path, allow_pickle=True).item()
+        print("✅ Loaded previous metrics to resume plotting.")
+    else:
+        all_metrics = {
+            'train_total': [], 'train_spec': [], 'train_mask': [], 'train_js': [],
+            'train_mode': [], 'val_total': [], 'val_spec': [], 'val_mask': [], 'val_js': []
+        }
+
 
     CHUNK_SIZE = 100
     start_epoch = 0
@@ -1742,7 +1701,7 @@ def main():
                 num_epochs=epochs_this_chunk,
                 patience=patience,
                 beta_schedule='exponential',
-                modality_dropout_prob=0.0,
+                modality_dropout_prob=0.1,
                 strategy=strategy
             )
 
@@ -1777,24 +1736,24 @@ def main():
     # End of chunked training loop
     print("\n✅ Chunked training complete!")
     
-    # 11) (Optional) Build final model once more for evaluation / example synthesis
-    strategy = tf.distribute.MirroredStrategy()
-    with strategy.scope():
-        model = SpectralMMVAE(latent_dim, spec_shape, mask_shape)
-        dummy_spec = tf.zeros((1, *spec_shape))
-        dummy_mask = tf.zeros((1, *mask_shape))
-        _ = model(dummy_spec, dummy_mask, training=False)
+    # # 11) (Optional) Build final model once more for evaluation / example synthesis
+    # strategy = tf.distribute.MirroredStrategy()
+    # with strategy.scope():
+    #     model = SpectralMMVAE(latent_dim, spec_shape, mask_shape)
+    #     dummy_spec = tf.zeros((1, *spec_shape))
+    #     dummy_mask = tf.zeros((1, *mask_shape))
+    #     _ = model(dummy_spec, dummy_mask, training=False)
 
-        if os.path.exists(best_weights_path):
-            model.load_weights(best_weights_path)
-            print("✅ Loaded best model weights (final for evaluation).")
-        elif os.path.exists(final_weights_path):
-            model.load_weights(final_weights_path)
-            print("✅ Loaded final model weights.")
-        else:
-            print("⚠️ No saved weights found, using model from last chunk")
+    #     if os.path.exists(best_weights_path):
+    #         model.load_weights(best_weights_path)
+    #         print("✅ Loaded best model weights (final for evaluation).")
+    #     elif os.path.exists(final_weights_path):
+    #         model.load_weights(final_weights_path)
+    #         print("✅ Loaded final model weights.")
+    #     else:
+    #         print("⚠️ No saved weights found, using model from last chunk")
 
-        evaluate_selected_segments(model, test_ids_to_use=["15", "20", "22", "25"])
+    #     evaluate_selected_segments(model, test_ids_to_use=["15", "20", "22", "25"])
 
 
     # ------------------------ 12) Save Training Metrics ------------------------

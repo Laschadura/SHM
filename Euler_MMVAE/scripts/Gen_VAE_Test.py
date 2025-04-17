@@ -37,7 +37,8 @@ from vae_generator import (
     MaskDecoder,
     SpectralMMVAE,
     compute_complex_spectrogram,
-    inverse_spectrogram
+    inverse_spectrogram,
+    segment_and_transform
 )
 
 # -------------------------------------------------------------------
@@ -522,21 +523,23 @@ def generate_conditional_samples(model, conditioning_data=None, save_dir="condit
 
 def test_reconstruction(model, test_data=None, save_dir="reconstruction_tests"):
     """
-    Test reconstruction capabilities by feeding one time-series segment per unique test ID
-    (rather than all segments). This ensures we only reconstruct once per ID.
+    Test reconstruction capabilities by feeding one time-series segment per unique test ID.
+    For each unique test id, one segment is selected and four plot groups are generated:
+      1. Masks: Upsampled (to [256,768]) original and reconstructed masks in grayscale (no colorbar)
+      2. Spectrograms (first channel)
+      3. Overlay of all channels of original vs. reconstructed time series
+      4. Per-channel subplots with RMS errors
     """
 
     os.makedirs(save_dir, exist_ok=True)
 
-    # 1) If no test data, load from dataset
+    # 1) If no test data provided, load data from the data loader
     if test_data is None:
         try:
             accel_dict, binary_masks, heatmaps = data_loader.load_data()
-
-            # Grab a few test IDs
-            chosen_ids = list(accel_dict.keys())[:3]
-
-            from vae_generator import segment_and_transform
+            # Use ALL available test IDs rather than a few:
+            chosen_ids = sorted(accel_dict.keys())
+            # Get segments for all chosen tests
             raw_segments, mask_segments, test_ids = segment_and_transform(
                 {k: accel_dict[k] for k in chosen_ids},
                 {k: heatmaps[k] for k in chosen_ids},
@@ -552,119 +555,90 @@ def test_reconstruction(model, test_data=None, save_dir="reconstruction_tests"):
                 'test_ids': test_ids
             }
             print(f"✅ Loaded {len(raw_segments)} segments for reconstruction testing")
-
         except Exception as e:
             print(f"❌ Failed to load test data: {e}")
             return
 
-    # 2) Identify unique test IDs in test_data
+    # 2) Identify unique test IDs in test_data (should be 23 unique IDs)
     unique_ids = np.unique(test_data['test_ids'])
     print(f"Found {len(unique_ids)} unique IDs in the test data.")
 
-    # 3) For each test ID, pick exactly one segment index
+    # 3) For each unique test ID, select the first segment and generate 4 plot groups.
     processed_count = 0
     for test_id in unique_ids:
-        # Find all indices for this test_id
+        # Get indices for current test id and pick the first one
         indices_for_id = np.where(test_data['test_ids'] == test_id)[0]
         if len(indices_for_id) == 0:
             continue
-
-        # Just pick the first occurrence
         idx = indices_for_id[0]
-
+        
         spec_in = tf.convert_to_tensor(test_data['specs'][idx:idx+1])
         mask_in = tf.convert_to_tensor(test_data['masks'][idx:idx+1])
-
-        # Reconstruct
+        
+        # Reconstruct modalities
         recon_results = model(spec_in, mask_in, training=False)
         recon_spec = recon_results[0]
         recon_mask = recon_results[1]
-
-        # Original time series
+        
         original_ts = test_data['raw'][idx]
         time_axis = np.linspace(0, 4, original_ts.shape[0])
-
+        
         # Reconstruct the time series from the model's spectrogram
         recon_ts = model.reconstruct_time_series(
             recon_spec.numpy(),
             fs=200, nperseg=256, noverlap=224,
             time_length=original_ts.shape[0]
         )
-
-        # Calculate errors
+        
+        # Calculate per-channel RMS errors and mean error
         num_channels = original_ts.shape[1]
         rms_errors = np.zeros(num_channels)
         for ch in range(num_channels):
             original = original_ts[:, ch]
             reconstructed = recon_ts[0, :, ch]
-            rms_errors[ch] = np.sqrt(np.mean((original - reconstructed)**2))
+            rms_errors[ch] = np.sqrt(np.mean((original - reconstructed) ** 2))
         mean_rms_error = np.mean(rms_errors)
-
-        # --- Plot 1: Masks (coarse 32×96) ---
+        
+        # --- Plot Group 1: Masks (Upsampled to correct scale, grayscale, no colorbar) ---
+        # First, take the coarse (32x96) masks and upsample them to (256,768) using cv2.resize.
+        # Note: cv2.resize expects (width, height)
+        orig_coarse = mask_in[0, :, :, 0].numpy()      # shape (32,96)
+        recon_coarse = recon_mask[0, :, :, 0].numpy()    # shape (32,96)
+        # Upsample using cv2.resize directly
+        upsampled_orig = cv2.resize(orig_coarse, (768, 256), interpolation=cv2.INTER_LINEAR)
+        upsampled_recon = cv2.resize(recon_coarse, (768, 256), interpolation=cv2.INTER_LINEAR)
+        
         plt.figure(figsize=(12, 6))
         plt.subplot(1, 2, 1)
-        plt.imshow(mask_in[0, :, :, 0].numpy(), aspect='auto', cmap='gray', vmin=0, vmax=1)
+        plt.imshow(upsampled_orig, cmap='gray', vmin=0, vmax=1, aspect='auto')
         plt.title(f"Original Mask (Test {test_id})")
-        plt.colorbar()
-
+        # Remove the colorbar
         plt.subplot(1, 2, 2)
-        plt.imshow(recon_mask[0, :, :, 0].numpy(), aspect='auto', cmap='gray', vmin=0, vmax=1)
+        plt.imshow(upsampled_recon, cmap='gray', vmin=0, vmax=1, aspect='auto')
         plt.title("Reconstructed Mask")
-        plt.colorbar()
-
         plt.tight_layout()
         plt.savefig(f"{save_dir}/test_{test_id}_masks.png", dpi=300)
         plt.close()
-
-        # --- NEW: Upsample and plot side-by-side in 'hot' colormap ---
-        orig_coarse_np = mask_in[0, :, :, 0].numpy()[None, ...]     # (1,32,96)
-        recon_coarse_np = recon_mask[0, :, :, 0].numpy()[None, ...] # (1,32,96)
-
-        upsampled_orig = mask_recon(orig_coarse_np, target_size=(256, 768), interpolation=1)  # cv2.INTER_LINEAR=1
-        upsampled_recon = mask_recon(recon_coarse_np, target_size=(256, 768), interpolation=1)
-
-        # Plot the first slice from each
-        upsampled_orig_2d = upsampled_orig[0]   # shape (256,768)
-        upsampled_recon_2d = upsampled_recon[0] # shape (256,768)
-
-        plt.figure(figsize=(14, 6))
-        plt.subplot(1, 2, 1)
-        plt.imshow(upsampled_orig_2d, cmap='hot', vmin=0, vmax=1)
-        plt.title(f"Upsampled Original Mask (Test {test_id})")
-        plt.colorbar()
-
-        plt.subplot(1, 2, 2)
-        plt.imshow(upsampled_recon_2d, cmap='hot', vmin=0, vmax=1)
-        plt.title("Upsampled Reconstructed Mask")
-        plt.colorbar()
-
-        plt.tight_layout()
-        plt.savefig(f"{save_dir}/test_{test_id}_masks_upsampled.png", dpi=300)
-        plt.close()
-        # --- end upsample plot ---
-
-        # --- Plot 2: Spectrograms (first channel) ---
+        
+        # --- Plot Group 2: Spectrograms (first channel) ---
         plt.figure(figsize=(12, 6))
         plt.subplot(1, 2, 1)
         plt.imshow(spec_in[0, :, :, 0].numpy(), aspect='auto', origin='lower', cmap='viridis')
         plt.title(f"Original Spectrogram (Ch 1) - Test {test_id}")
         plt.colorbar()
-
         plt.subplot(1, 2, 2)
         plt.imshow(recon_spec[0, :, :, 0].numpy(), aspect='auto', origin='lower', cmap='viridis')
         plt.title("Reconstructed Spectrogram (Ch 1)")
         plt.colorbar()
-
         plt.tight_layout()
         plt.savefig(f"{save_dir}/test_{test_id}_specs.png", dpi=300)
         plt.close()
-
-        # --- Plot 3: All channels overlay (blue=original, red=reconstructed) ---
+        
+        # --- Plot Group 3: All Channels Overlay ---
         plt.figure(figsize=(12, 6))
         for ch in range(num_channels):
             plt.plot(time_axis, original_ts[:, ch], 'b-', alpha=0.4)
             plt.plot(time_axis, recon_ts[0, :, ch], 'r-', alpha=0.4)
-
         plt.title(f"Test {test_id} - All Channels Overlaid")
         plt.xlabel("Time (s)")
         plt.ylabel("Amplitude")
@@ -673,14 +647,12 @@ def test_reconstruction(model, test_data=None, save_dir="reconstruction_tests"):
         plt.tight_layout()
         plt.savefig(f"{save_dir}/test_{test_id}_time_series_overlay.png", dpi=300)
         plt.close()
-
-        # --- Plot 4: Per-channel subplots ---
+        
+        # --- Plot Group 4: Per-Channel Subplots ---
         plt.figure(figsize=(20, 15))
-        plt.suptitle(f"Test {test_id} - Time Series Comparison (Mean RMS Error: {mean_rms_error:.4f})",
-                     fontsize=16)
+        plt.suptitle(f"Test {test_id} - Time Series Comparison (Mean RMS Error: {mean_rms_error:.4f})", fontsize=16)
         cols = 3
         rows = int(np.ceil(num_channels / cols))
-
         for ch in range(num_channels):
             plt.subplot(rows, cols, ch+1)
             plt.plot(time_axis, original_ts[:, ch], 'b-', linewidth=1.5, alpha=0.8, label='Original')
@@ -691,11 +663,10 @@ def test_reconstruction(model, test_data=None, save_dir="reconstruction_tests"):
             plt.grid(True, alpha=0.3)
             if ch == 0:
                 plt.legend()
-
         plt.tight_layout(rect=[0, 0, 1, 0.95])
         plt.savefig(f"{save_dir}/test_{test_id}_time_series_detail.png", dpi=300)
         plt.close()
-
+        
         # --- Write out RMS error metrics ---
         with open(f"{save_dir}/test_{test_id}_metrics.txt", "w") as f:
             f.write(f"Test ID: {test_id}\n")
@@ -703,7 +674,7 @@ def test_reconstruction(model, test_data=None, save_dir="reconstruction_tests"):
             f.write(f"Mean RMS Error: {mean_rms_error:.6f}\n")
             for ch in range(num_channels):
                 f.write(f"Channel {ch+1} RMS Error: {rms_errors[ch]:.6f}\n")
-
+        
         processed_count += 1
         print(f"Done reconstruction for Test ID {test_id}")
 

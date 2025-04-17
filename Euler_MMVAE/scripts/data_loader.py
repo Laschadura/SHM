@@ -2,6 +2,7 @@ import os
 import glob
 import re
 import cv2
+import torch
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -93,17 +94,20 @@ def load_accelerometer_data(data_dir=DATA_DIR, skip_tests=SKIP_TESTS):
                                               fs=200.0,
                                               order=6)
 
-                # 2) File-wide mean & std across all samples & channels
-                file_mean = np.mean(data_matrix)
-                file_std = np.std(data_matrix)
+                # 2) Subtract file-wide mean and perform min–max normalization to [-1, 1]
+                channel_means = np.mean(data_matrix, axis=0)  # shape (num_channels,)
+                data_matrix = data_matrix - channel_means     # broadcasted subtraction
 
-                # Avoid division by zero or extremely small std
+                data_min = np.min(data_matrix)
+                data_max = np.max(data_matrix)
                 eps = 1e-8
-                if file_std < eps:
-                    file_std = eps
+                if data_max - data_min < eps:
+                    data_max = data_min + eps
 
-                # Normalize entire NxC array by the same mean/std
-                data_matrix = (data_matrix - file_mean) / file_std
+                # Scale data into [0, 1] first
+                data_matrix_scaled = (data_matrix - data_min) / (data_max - data_min)
+                # Then transform into [-1, 1]
+                data_matrix = 2 * data_matrix_scaled - 1
 
                 samples.append(data_matrix)
             except Exception as e:
@@ -171,6 +175,311 @@ def mask_to_heatmap(orig_mask, target_size=(32, 96), apply_blur=False, blur_kern
     # Ensure in [0,1]
     heatmap = np.clip(heatmap, 0.0, 1.0)
     return heatmap
+
+########################################
+# Segmentation & Spectogram computation
+########################################
+def segment_and_transform(
+    accel_dict, 
+    heatmap_dict,
+    chunk_size=1, 
+    sample_rate=200, 
+    segment_duration=4.0, 
+    percentile=99,
+    test_ids_to_use=None
+    ):
+    """
+    Extracts segments from time series data centered around peak RMS values.
+    Returns raw segments and their corresponding binary masks.
+    
+    Args:
+        accel_dict: Dictionary mapping test IDs to time series data.
+        heatmap_dict: Dictionary mapping test IDs to binary mask data (downsampled).
+        chunk_size: Number of test IDs to process in one batch.
+        sample_rate: Sampling rate of the time series data (Hz).
+        segment_duration: Duration of each segment (seconds).
+        percentile: Percentile threshold for peak detection.
+        
+    Returns:
+        Tuple of arrays: (raw_segments, mask_segments, test_ids)
+    """
+    window_size = int(sample_rate * segment_duration)
+    half_window = window_size // 2
+    
+    test_ids = list(accel_dict.keys())
+    
+    # Instead of yield, we'll collect all data and return it at once
+    all_raw_segments = []
+    all_mask_segments = []
+    all_test_ids = []
+    
+    # Dictionary to count segments per test ID for debugging
+    seg_counts = {}
+
+    if test_ids_to_use is not None:
+        test_ids_to_use = set(str(tid) for tid in test_ids_to_use)
+    
+    for i in range(0, len(test_ids), chunk_size):
+        chunk_ids = test_ids[i:i + chunk_size]
+        
+        for test_id in chunk_ids:
+            if test_ids_to_use is not None and str(test_id) not in test_ids_to_use:
+                continue
+
+
+            # Debug: print out the shape of the mask for this test
+            mask_val = heatmap_dict[test_id]
+            try:
+                mask_shape = np.array(mask_val).shape
+            except Exception:
+                mask_shape = "unknown"
+            print(f"Processing Test ID {test_id}: mask shape = {mask_shape}")
+            
+            all_ts = accel_dict[test_id]
+            
+            for ts_raw in all_ts:
+                rms_each_sample = np.sqrt(np.mean(ts_raw**2, axis=1))
+                threshold = np.percentile(rms_each_sample, percentile)
+                peak_indices = np.where(rms_each_sample >= threshold)[0]
+                
+                for pk in peak_indices:
+                    start = pk - half_window
+                    end = pk + half_window
+                    if start < 0:
+                        start = 0
+                        end = window_size
+                    if end > ts_raw.shape[0]:
+                        end = ts_raw.shape[0]
+                        start = end - window_size
+                    if (end - start) < window_size:
+                        continue
+                    
+                    segment_raw = ts_raw[start:end, :]
+                    
+                    all_raw_segments.append(segment_raw)
+                    all_mask_segments.append(heatmap_dict[test_id])
+                    all_test_ids.append(int(test_id))
+                    
+                    seg_counts[test_id] = seg_counts.get(test_id, 0) + 1
+                    
+    # Debug: print summary of segments per test ID
+    unique_test_ids = np.unique(all_test_ids)
+    print("Segment counts by test ID:", seg_counts)
+    print("Unique test IDs from segmentation:", unique_test_ids)
+    
+    # Convert lists to numpy arrays
+    raw_segments = np.array(all_raw_segments, dtype=np.float32)
+    mask_segments = np.array(all_mask_segments, dtype=np.float32)
+    test_ids = np.array(all_test_ids, dtype=np.int32)
+    
+    print(f"Extracted {len(raw_segments)} segments, each with a corresponding test ID.")
+    print(f"Number of unique test IDs in segmentation: {len(unique_test_ids)}")
+    
+    return raw_segments, mask_segments, test_ids
+
+def compute_or_load_spectograms(raw_segments, fs=200, nperseg=256, noverlap=192):
+    """
+    Compute or load cached spectrograms.
+    
+    Args:
+        raw_segments: Raw time series (N, time_length, channels)
+        fs, nperseg, noverlap: STFT parameters
+        cache_path: File path to save/load spectrograms
+        
+    Returns:
+        Spectrogram features (N, freq_bins, time_bins, channels*2)
+    """
+    print("⏳ Computing STFT for all segments...")
+    complex_spectrograms = compute_complex_spectrogram(raw_segments, fs, nperseg, noverlap)
+    return complex_spectrograms
+
+def compute_complex_spectrogram(
+    time_series,
+    fs=200,
+    nperseg=256,
+    noverlap=192
+    ):
+    """
+    Compute STFT-based spectrograms with PyTorch.
+    
+    Args:
+        time_series: shape (batch_size, time_steps, channels) — numpy or torch tensor
+        fs: Sampling frequency in Hz
+        nperseg: Window length for STFT
+        noverlap: Overlap between windows
+
+    Returns:
+        Spectrograms with shape (batch, freq_bins, time_bins, channels * 2)
+    """
+    if isinstance(time_series, np.ndarray):
+        time_series = torch.tensor(time_series, dtype=torch.float32)
+
+    batch_size, time_steps, channels = time_series.shape
+    frame_step = nperseg - noverlap
+    window = torch.hann_window(nperseg)
+
+    # Compute STFT shape using a test sample
+    test_stft = torch.stft(
+        time_series[0, :, 0],
+        n_fft=nperseg,
+        hop_length=frame_step,
+        win_length=nperseg,
+        window=window,
+        return_complex=True
+    )
+
+    freq_bins, time_bins = test_stft.shape
+    print(f"🔍 STFT Config: nperseg={nperseg}, noverlap={noverlap}, frame_step={frame_step}")
+    print(f"📏 Expected STFT shape: (freq_bins={freq_bins}, time_bins={time_bins})")
+
+    if time_bins == 0:
+        raise ValueError("⚠️ STFT produced 0 time bins! Adjust `nperseg` or `noverlap`.")
+
+    # Pre-allocate spectrograms: (batch, freq_bins, time_bins, channels * 2)
+    all_spectrograms = torch.zeros(batch_size, freq_bins, time_bins, channels * 2)
+
+    for i in range(batch_size):
+        for c in range(channels):
+            stft = torch.stft(
+                time_series[i, :, c],
+                n_fft=nperseg,
+                hop_length=frame_step,
+                win_length=nperseg,
+                window=window,
+                return_complex=True
+            )
+
+            if stft.shape[1] == 0:
+                raise ValueError(f"⚠️ STFT returned 0 time bins for sample {i}, channel {c}!")
+
+            # Magnitude and phase
+            mag = torch.log1p(torch.abs(stft))  # log(1 + |stft|)
+            phase = torch.angle(stft)           # phase in radians
+
+            # Store in final tensor (transpose to match shape: freq, time)
+            all_spectrograms[i, :, :, 2*c]   = mag
+            all_spectrograms[i, :, :, 2*c+1] = phase
+  
+
+    print(f"✅ Final spectrogram shape: {all_spectrograms.shape}")
+    return all_spectrograms.numpy()
+
+def cache_final_features(complex_specs, cache_path="cached_spectral_features.npy"):
+    """
+    If 'cache_path' exists, load it via mmap. Otherwise,
+    convert 'complex_specs' to magnitude+phase features,
+    save to disk, then memory-map.
+    """
+    if os.path.exists(cache_path):
+        print(f"📂 Loading final spectral features from {cache_path}")
+        return np.load(cache_path)
+    
+    # Save the final shape
+    np.save(cache_path, complex_specs)
+    print(f"✅ Final spectral features saved to {cache_path}")
+
+    return np.load(cache_path)
+
+########################################
+# Data Reconstruction (Spectrograms -> Time Series) & Mask upsample
+########################################
+def inverse_spectrogram(
+    complex_spectrograms,
+    time_length,
+    fs=200,
+    nperseg=256,
+    noverlap=128,
+    batch_processing_size=100
+    ):
+    """
+    Convert magnitude + phase spectrograms back to time-domain signals using PyTorch.
+    
+    Args:
+        complex_spectrograms: np.ndarray of shape (batch, freq, time, channels*2)
+        time_length: Desired output length in time steps
+        fs: Sampling frequency (unused, for compatibility)
+        nperseg: Frame size (window length)
+        noverlap: Overlap between frames
+        batch_processing_size: Number of samples processed at once
+
+    Returns:
+        np.ndarray: Time-domain signal, shape (batch, time_length, channels)
+    """
+    if isinstance(complex_spectrograms, np.ndarray):
+        complex_spectrograms = torch.tensor(complex_spectrograms, dtype=torch.float32)
+
+    frame_step = nperseg - noverlap
+    batch_size, freq_bins, time_bins, double_channels = complex_spectrograms.shape
+    num_channels = double_channels
+    window = torch.hann_window(nperseg)
+
+    time_series = torch.zeros((batch_size, time_length, num_channels), dtype=torch.float32)
+
+    total_batches = (batch_size + batch_processing_size - 1) // batch_processing_size
+
+    for batch_idx in range(total_batches):
+        print(f"🔁 Reconstructing batch {batch_idx + 1}/{total_batches}")
+        start_idx = batch_idx * batch_processing_size
+        end_idx = min((batch_idx + 1) * batch_processing_size, batch_size)
+
+        batch_spec = complex_spectrograms[start_idx:end_idx]
+
+        for b_rel, b_abs in enumerate(range(start_idx, end_idx)):
+            for c in range(num_channels):
+                # Extract magnitude and phase
+                log_mag = batch_spec[b_rel, :, :, 2*c]
+                phase = batch_spec[b_rel, :, :, 2*c+1]
+                magnitude = torch.expm1(log_mag)
+                complex_spec = magnitude * torch.exp(1j * phase)
+
+                # Transpose to shape [time, freq] for PyTorch
+                stft_input = complex_spec.T  # (time_bins, freq_bins)
+
+                # Perform inverse STFT
+                waveform = torch.istft(
+                    stft_input,
+                    n_fft=nperseg,
+                    hop_length=frame_step,
+                    win_length=nperseg,
+                    window=window,
+                    length=time_length
+                )
+
+                # Save reconstructed waveform
+                time_series[b_abs, :waveform.shape[0], c] = waveform
+
+    return time_series.numpy()
+
+def mask_recon(downsampled_masks, target_size=(256, 768), interpolation=cv2.INTER_LINEAR):
+    """
+    Reconstruct full-resolution masks from downsampled ones (e.g., 32x96 -> 256x768).
+
+    Args:
+        downsampled_masks (np.ndarray): Array of shape (N, H_low, W_low, 1) or (N, H_low, W_low)
+        target_size (tuple): Desired (height, width) in pixels, default (256, 768)
+        interpolation (int): OpenCV interpolation method (e.g., cv2.INTER_LINEAR)
+
+    Returns:
+        np.ndarray: Reconstructed masks of shape (N, target_height, target_width)
+    """
+    # Ensure shape is (N, H, W)
+    if downsampled_masks.ndim == 4 and downsampled_masks.shape[-1] == 1:
+        downsampled_masks = np.squeeze(downsampled_masks, axis=-1)
+
+    N, H, W = downsampled_masks.shape
+    H_target, W_target = target_size
+    recon_masks = np.zeros((N, H_target, W_target), dtype=np.float32)
+
+    for i in range(N):
+        recon_masks[i] = cv2.resize(
+            downsampled_masks[i], (W_target, H_target), interpolation=interpolation
+        )
+
+    return recon_masks
+
+#######################################
+# Data Loading module
+#######################################
 
 def load_data():
     accel_dict = load_accelerometer_data(DATA_DIR, SKIP_TESTS)

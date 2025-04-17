@@ -12,6 +12,7 @@ from torch.utils.data import DataLoader, TensorDataset
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+import math
 from scipy import signal
 import matplotlib.pyplot as plt
 from tqdm import tqdm
@@ -202,7 +203,7 @@ def segment_and_transform(
     
     return raw_segments, mask_segments, test_ids
 
-def compute_and_spectrograms(raw_segments, fs=200, nperseg=256, noverlap=192):
+def compute_or_load_spectograms(raw_segments, fs=200, nperseg=256, noverlap=192):
     """
     Compute or load cached spectrograms.
     
@@ -282,8 +283,9 @@ def compute_complex_spectrogram(
             phase = torch.angle(stft)           # phase in radians
 
             # Store in final tensor (transpose to match shape: freq, time)
-            all_spectrograms[i, 2*c,   :, :] = mag
-            all_spectrograms[i, 2*c+1, :, :] = phase    
+            all_spectrograms[i, :, :, 2*c]   = mag
+            all_spectrograms[i, :, :, 2*c+1] = phase
+  
 
     print(f"✅ Final spectrogram shape: {all_spectrograms.shape}")
     return all_spectrograms.numpy()
@@ -315,7 +317,7 @@ def inverse_spectrogram(
 
     frame_step = nperseg - noverlap
     batch_size, freq_bins, time_bins, double_channels = complex_spectrograms.shape
-    num_channels = double_channels // 2
+    num_channels = double_channels
     window = torch.hann_window(nperseg)
 
     time_series = torch.zeros((batch_size, time_length, num_channels), dtype=torch.float32)
@@ -332,17 +334,17 @@ def inverse_spectrogram(
         for b_rel, b_abs in enumerate(range(start_idx, end_idx)):
             for c in range(num_channels):
                 # Extract magnitude and phase
-                log_mag = batch_spec[b_rel, :, :, 2*c]
-                phase = batch_spec[b_rel, :, :, 2*c+1]
+                log_mag = batch_spec[b_rel, 2*c, :, :]
+                phase   = batch_spec[b_rel, 2*c+1, :, :]
                 magnitude = torch.expm1(log_mag)
                 complex_spec = magnitude * torch.exp(1j * phase)
 
-                # Transpose to shape [time, freq] for PyTorch
-                stft_input = complex_spec.T  # (time_bins, freq_bins)
+                print(f"shape inverse spec input should be (freq, time): {complex_spec.shape}")
+
 
                 # Perform inverse STFT
                 waveform = torch.istft(
-                    stft_input,
+                    complex_spec,
                     n_fft=nperseg,
                     hop_length=frame_step,
                     win_length=nperseg,
@@ -365,63 +367,11 @@ def cache_final_features(complex_specs, cache_path="cached_spectral_features.npy
         print(f"📂 Loading final spectral features from {cache_path}")
         return np.load(cache_path)
     
-    # Convert to final shape (mag+phase)
-    print("⏳ Converting complex STFT -> final magnitude+phase features...")
-    spectral_features = spectrogram_to_features(complex_specs)
-    
     # Save the final shape
-    np.save(cache_path, spectral_features)
+    np.save(cache_path, complex_specs)
     print(f"✅ Final spectral features saved to {cache_path}")
 
     return np.load(cache_path)
-
-def spectrogram_to_features(complex_spectrograms):
-    """
-    Convert complex spectrograms to feature representation suitable for CNN processing.
-    Now uses batched processing to save memory.
-    
-    Args:
-        complex_spectrograms: Complex spectrograms with shape (batch, freq, time, channels)
-    
-    Returns:
-        Features with shape (batch, freq, time, channels*2) where for each original channel
-        we have magnitude and phase
-    """
-    batch_size, freq_bins, time_bins, channels = complex_spectrograms.shape
-    
-    # Initialize feature array (magnitude and phase for each channel)
-    features = np.zeros((batch_size, freq_bins, time_bins, channels * 2), dtype=np.float32)
-    
-    # Process in batches of 1000 samples to save memory
-    batch_size_proc = 1000
-    
-    for start_idx in range(0, batch_size, batch_size_proc):
-        end_idx = min(start_idx + batch_size_proc, batch_size)
-        print(f"Processing spectrograms {start_idx}-{end_idx-1}/{batch_size}")
-        
-        # Extract a batch of spectrograms
-        batch_specs = complex_spectrograms[start_idx:end_idx]
-        
-        # Extract magnitude and phase
-        for c in range(channels):
-            # Magnitude (log scale for better dynamic range)
-            magnitude = np.abs(batch_specs[:, :, :, c])
-            # Add small constant to avoid log(0)
-            log_magnitude = np.log1p(magnitude)
-            
-            # Phase
-            phase = np.angle(batch_specs[:, :, :, c])
-            
-            # Store in feature array
-            features[start_idx:end_idx, :, :, c*2] = log_magnitude
-            features[start_idx:end_idx, :, :, c*2+1] = phase
-        
-        # Free memory
-        del batch_specs
-        import gc
-        gc.collect()
-    
-    return features
 
 # ----- Loss Functions and schedules -----
 def complex_spectrogram_loss(y_true, y_pred):
@@ -514,6 +464,41 @@ def dynamic_weighting(epoch, max_epochs, min_weight=0.3, max_weight=1.0):
     progress = min(1.0, epoch / (max_epochs * 0.1))  # Reach max_weight halfway through training
     return min_weight + progress * (max_weight - min_weight)
 
+def betas_for_alpha_bar(num_timesteps, max_beta=0.999):
+    ts = torch.linspace(0, num_timesteps, num_timesteps, dtype=torch.float64)
+    
+    # Convert the constant angle to a torch.Tensor:
+    angle_const = torch.tensor(
+        (0.008 / 1.008) * math.pi * 0.5,
+        dtype=ts.dtype,
+        device=ts.device
+    )
+
+    # Now both cos() calls receive torch.Tensor arguments
+    numerator = torch.cos(((ts / num_timesteps) + 0.008) / 1.008 * math.pi * 0.5) ** 2
+    denominator = torch.cos(angle_const) ** 2
+
+    alphas_cumprod = numerator / denominator
+    alphas = alphas_cumprod / alphas_cumprod.roll(1, 0)
+    betas = 1.0 - alphas
+    betas[0] = 1e-8
+    return torch.clip(betas, 0, max_beta)
+
+def sinusoidal_time_embedding(timesteps, dim):
+    # timesteps: (batch_size,) or (batch_size,1)
+    # This returns an embedding of shape (batch_size, dim)
+    import math
+    half_dim = dim // 2
+    embeddings = torch.exp(
+        torch.arange(half_dim, dtype=torch.float32, device=timesteps.device)
+        * (-math.log(10000) / half_dim)
+    )
+    # If timesteps is (B,1), flatten it:
+    timesteps = timesteps.view(-1)
+    embeddings = timesteps[:, None] * embeddings[None, :]
+    embeddings = torch.cat([torch.sin(embeddings), torch.cos(embeddings)], dim=1)
+    return embeddings
+
 # ----- Encoders -----
 class SpectrogramEncoder(nn.Module):
     """
@@ -539,8 +524,8 @@ class SpectrogramEncoder(nn.Module):
             stride=2,
             padding=1
         )
-        self.bn1 = nn.BatchNorm2d(32)
-        self.relu1 = nn.ReLU()
+        self.gn1 = nn.GroupNorm(8, 32)
+        self.relu1 = nn.LeakyReLU(0.1)
         self.dropout1 = nn.Dropout(0.3)
         
         self.conv2 = nn.Conv2d(
@@ -550,8 +535,8 @@ class SpectrogramEncoder(nn.Module):
             stride=2,
             padding=1
         )
-        self.bn2 = nn.BatchNorm2d(64)
-        self.relu2 = nn.ReLU()
+        self.gn2 = nn.GroupNorm(16, 64)
+        self.relu2 = nn.LeakyReLU(0.1)
         self.dropout2 = nn.Dropout(0.3)
         
         # IMPORTANT: Update this line to in_channels=64, not 32
@@ -562,14 +547,14 @@ class SpectrogramEncoder(nn.Module):
             stride=1,
             padding=1
         )
-        self.bn3 = nn.BatchNorm2d(128)
-        self.relu3 = nn.ReLU()
+        self.gn3 = nn.GroupNorm(32, 128)
+        self.relu3 = nn.LeakyReLU(0.1)
         self.dropout3 = nn.Dropout(0.3)
         
         # Global pooling and dense layers
         self.global_pool = nn.AdaptiveAvgPool2d(1)
         self.dense_reduce = nn.Linear(128, 512)
-        self.relu4 = nn.ReLU()
+        self.relu4 = nn.LeakyReLU(0.1)
         
         # Latent layer (for standard autoencoder)
         self.latent_layer = nn.Linear(512, latent_dim)
@@ -580,16 +565,16 @@ class SpectrogramEncoder(nn.Module):
         
         # Standard convolution path
         x = self.conv1(x)
-        x = self.relu1(self.bn1(x))
+        x = self.relu1(self.gn1(x))
         x = self.dropout1(x)
         
         x = self.conv2(x)
-        x = self.relu2(self.bn2(x))
+        x = self.relu2(self.gn2(x))
         x = self.dropout2(x)
         
         # Now conv3 receives in_channels=64
         x = self.conv3(x)
-        x = self.relu3(self.bn3(x))
+        x = self.relu3(self.gn3(x))
         x = self.dropout3(x)
         
         # Pool and encode
@@ -674,7 +659,7 @@ class SpectrogramDecoder(nn.Module):
         
         # Dense and reshape layers
         self.fc = nn.Linear(latent_dim, self.min_freq * self.min_time * 128)
-        self.relu1 = nn.ReLU()
+        self.relu1 = nn.LeakyReLU(0.1)
         
         # Upsampling blocks
         self.conv_t1 = nn.ConvTranspose2d(
@@ -685,8 +670,8 @@ class SpectrogramDecoder(nn.Module):
             padding=1,
             output_padding=1  # Required for odd dimensions in PyTorch
         )
-        self.bn1 = nn.BatchNorm2d(64)
-        self.relu2 = nn.ReLU()
+        self.gn1 = nn.GroupNorm(16, 64)
+        self.relu2 = nn.LeakyReLU(0.1)
         self.drop1 = nn.Dropout(0.3)
         
         self.conv_t2 = nn.ConvTranspose2d(
@@ -697,14 +682,14 @@ class SpectrogramDecoder(nn.Module):
             padding=1,
             output_padding=1  # Required for odd dimensions in PyTorch
         )
-        self.bn2 = nn.BatchNorm2d(32)
-        self.relu3 = nn.ReLU()
+        self.gn2 = nn.GroupNorm(8, 32)
+        self.relu3 = nn.LeakyReLU(0.1)
         self.drop2 = nn.Dropout(0.3)
         
         # Final refinement layers
         self.conv_t3 = nn.Conv2d(in_channels=32, out_channels=32, kernel_size=3, padding=1)
-        self.bn3 = nn.BatchNorm2d(32)
-        self.relu4 = nn.ReLU()
+        self.gn3 = nn.GroupNorm(8, 32)
+        self.relu4 = nn.LeakyReLU(0.1)
         self.drop3 = nn.Dropout(0.3)
         
         # Output projection 
@@ -717,17 +702,17 @@ class SpectrogramDecoder(nn.Module):
         
         # First upsampling
         x = self.conv_t1(x)
-        x = self.relu2(self.bn1(x))
+        x = self.relu2(self.gn1(x))
         x = self.drop1(x)
         
         # Second upsampling
         x = self.conv_t2(x)
-        x = self.relu3(self.bn2(x))
+        x = self.relu3(self.gn2(x))
         x = self.drop2(x)
         
         # Final refinement (no dimension change)
         x = self.conv_t3(x)
-        x = self.relu4(self.bn3(x))
+        x = self.relu4(self.gn3(x))
         x = self.drop3(x)
         
         # Final projection
@@ -853,14 +838,7 @@ class DiffusionModel(nn.Module):
                 self.cumulative_dims.append(self.cumulative_dims[-1] + dim)
             assert self.cumulative_dims[-1] == latent_dim, "Sum of modality dims must equal latent_dim"
         
-        # Time embedding network
-        self.time_embed = nn.Sequential(
-            nn.Linear(1, 128),
-            nn.SiLU(),
-            nn.Linear(128, 256),
-            nn.SiLU(),
-            nn.Linear(256, 256)
-        )
+        self.embed_dim = 256
         
         # Score prediction network (U-Net like structure)
         self.input_layer = nn.Linear(latent_dim, hidden_dims[0])
@@ -904,11 +882,14 @@ class DiffusionModel(nn.Module):
         self.output_layer = nn.Linear(hidden_dims[0], latent_dim)
         
     def forward(self, x, t, mask=None):
-        print("Input x shape:", x.shape)              # [B, latent_dim]
-        print("Expected latent_dim:", self.latent_dim)
+        # cast to float
+        x = x.float()
+        t = t.float()
+        if mask is not None:
+            mask = mask.float()
 
         # Embed diffusion time
-        t_emb = self.time_embed(t)
+        t_emb = sinusoidal_time_embedding(t, self.embed_dim)
 
         # Initial layer
         h = self.input_layer(x)
@@ -972,10 +953,10 @@ class NoiseScheduler:
         self.num_timesteps = num_timesteps
         self.beta_start = beta_start
         self.beta_end = beta_end
-        
-        # Linear beta schedule
-        self.betas = torch.linspace(beta_start, beta_end, num_timesteps)
-        
+
+        # Cosine beta schedule
+        self.betas = betas_for_alpha_bar(num_timesteps)
+
         # Pre-compute diffusion parameters
         self.alphas = 1.0 - self.betas
         self.alphas_cumprod = torch.cumprod(self.alphas, dim=0)
@@ -1239,9 +1220,9 @@ class MultiModalLatentDiffusion:
             if data is not None:
 
                 # Defensive fix for spec shape
-                if modality_name == "spec" and data.shape[1] != 48:
+                if modality_name == "spec" and data.shape[1] != 24:
                     print(f"⚠️ WARNING: Expected spec channel=48 but got {data.shape[1]}, transposing...")
-                    data = data.permute(0, 3, 1, 2)
+                    data = data.permute(0, 2, 3, 1)
 
                 data = data.to(self.device)
                 autoencoder = self.autoencoders[modality_name]
@@ -1583,7 +1564,7 @@ def create_torch_dataset(spec_data, mask_data, test_ids, batch_size, shuffle=Tru
     return dataloader
 
 # ===== Training Functions =====
-def train_autoencoders(spec_autoencoder, mask_autoencoder, train_loader, device, epochs=100, lr=1e-4):
+def train_autoencoders(spec_autoencoder, mask_autoencoder, train_loader, device, epochs=300, lr=1e-4):
     """
     Trains the spectrogram and mask autoencoders separately.
 
@@ -1601,6 +1582,10 @@ def train_autoencoders(spec_autoencoder, mask_autoencoder, train_loader, device,
     optimizer_spec = optim.AdamW(spec_autoencoder.parameters(), lr=lr)
     optimizer_mask = optim.AdamW(mask_autoencoder.parameters(), lr=lr)
 
+    scheduler_spec = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_spec, T_max=epochs)
+    scheduler_mask = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_mask, T_max=epochs)
+
+
     for epoch in range(epochs):
         spec_autoencoder.train()
         mask_autoencoder.train()
@@ -1611,9 +1596,6 @@ def train_autoencoders(spec_autoencoder, mask_autoencoder, train_loader, device,
         for spec_batch, mask_batch, _ in train_loader:
             spec_batch = spec_batch.to(device)
             mask_batch = mask_batch.to(device)
-
-            # 🔍 Add this to inspect class imbalance
-            # print("Mask batch mean (GT):", mask_batch.mean().item())
 
             # --- Train spec autoencoder ---
             optimizer_spec.zero_grad()
@@ -1631,7 +1613,11 @@ def train_autoencoders(spec_autoencoder, mask_autoencoder, train_loader, device,
             optimizer_mask.step()
             mask_loss_total += loss_mask.item()
 
-        print(f"[Epoch {epoch+1}] Spec Loss: {spec_loss_total:.4f} | Mask Loss: {mask_loss_total:.4f}")
+    # ✅ Step scheduler once per epoch
+    scheduler_spec.step()
+    scheduler_mask.step()
+
+    print(f"[Epoch {epoch+1}] Spec Loss: {spec_loss_total:.4f} | Mask Loss: {mask_loss_total:.4f}")
 
 # ----- Visualization Functions and tests -----
 def visualize_training_history(history, save_path=None):
@@ -1739,7 +1725,6 @@ def save_visualizations_and_metrics(model, train_loader, val_loader, training_me
 
 # === New function for autoencoder-based reconstruction evaluation ===
 def reconstruction_eval(model, test_ids_to_use=["25"], fs=200, nperseg=256, noverlap=224, output_dir="results_diff/recon_eval"):
-    import os
     os.makedirs(output_dir, exist_ok=True)
     
     # Reload raw data
@@ -1752,11 +1737,16 @@ def reconstruction_eval(model, test_ids_to_use=["25"], fs=200, nperseg=256, nove
     raw_segments = np.asarray(raw_segments, dtype=np.float32)
 
 
-    spectrograms = compute_and_spectrograms(raw_segments, fs, nperseg, noverlap)
-    
+    spectrograms = compute_or_load_spectograms(raw_segments, fs, nperseg, noverlap)
+
     # Transpose to match PyTorch shape
     spec_tensor = torch.tensor(spectrograms.transpose(0, 3, 1, 2), dtype=torch.float32).to(model.device)
     mask_tensor = torch.tensor(mask_segments.transpose(0, 3, 1, 2), dtype=torch.float32).to(model.device)
+
+    print(f"[DEBUG] raw_segments shape: {raw_segments.shape}")         # (N, T, C)
+    print(f"[DEBUG] spectrograms shape: {spectrograms.shape}")         # (N, F, T, 2*C)
+    print(f"[DEBUG] spec_tensor shape (for model): {spec_tensor.shape}")  # (N, 2*C, F, T)
+    print(f"[DEBUG] mask_tensor shape (for model): {mask_tensor.shape}")  # (N, 1, H, W)
 
     with torch.no_grad():
         _, z_spec = model.autoencoders["spec"](spec_tensor)
@@ -1844,12 +1834,13 @@ def main():
     fs = 200
     nperseg = 256
     noverlap = 224
-    latent_dim = 128
+    latent_dim = 256
     batch_size = 50
     num_epochs = 400
-    learning_rate = 1e-4
+    learning_rate_dm = 1e-4
+    learning_rate_ae = 5e-4
 
-    # Cache paths (unchanged!)
+    # Cache paths 
     final_path = "scripts/cached_spectral_features.npy"
     heatmaps_path = "scripts/cached_masks.npy"
     ids_path = "scripts/cached_test_ids.npy"
@@ -1865,7 +1856,7 @@ def main():
         print("⚠️ Missing cache. Recomputing features...")
         accel_dict, _, heatmaps = data_loader.load_data()
         raw_segments, mask_segments, test_ids = segment_and_transform(accel_dict, heatmaps, segment_duration=4.0)
-        complex_specs = compute_and_spectrograms(raw_segments, fs, nperseg, noverlap)
+        complex_specs = compute_or_load_spectograms(raw_segments, fs, nperseg, noverlap)
         spectral_features = cache_final_features(complex_specs, cache_path=final_path)
         np.save(heatmaps_path, mask_segments)
         np.save(ids_path, test_ids)
@@ -1896,13 +1887,13 @@ def main():
 
     if train_AE:
         print("🚀 Training full MLD pipeline (autoencoders + diffusion)...")
-        train_autoencoders(spec_autoencoder, mask_autoencoder, train_loader, device, epochs=100)
+        train_autoencoders(spec_autoencoder, mask_autoencoder, train_loader, device, epochs=300, lr=learning_rate_ae)
         mld = MultiModalLatentDiffusion(spec_autoencoder, mask_autoencoder, latent_dim, ["spec", "mask"], device)
         history = mld.train_diffusion_model(
             train_dataloader=train_loader,
             val_dataloader=val_loader,
             num_epochs=num_epochs,
-            learning_rate=learning_rate,
+            learning_rate=learning_rate_dm,
             save_dir="results_diff/diffusion"
         )
         mld.save_autoencoders("results_diff/autoencoders")
@@ -1916,14 +1907,14 @@ def main():
             train_dataloader=train_loader,
             val_dataloader=val_loader,
             num_epochs=num_epochs,
-            learning_rate=learning_rate,
+            learning_rate=learning_rate_dm,
             save_dir="results_diff/diffusion"
         )
 
     mld.save_diffusion_model("results_diff/diffusion/final_diffusion_model.pt")
     visualize_training_history(history, save_path="results_diff/diffusion/training_curve.png")
     reconstruction_eval(mld, test_ids_to_use=["21", "22", "25"], fs=fs, nperseg=nperseg, noverlap=noverlap)
-    synthesize_samples(mld, batch_size=8)
+    synthesize_samples(mld, batch_size=32)
     save_visualizations_and_metrics(mld, train_loader, val_loader, training_metrics=history, output_dir="results_diff")
 
     print("✅ All training, evaluation, and synthesis complete.")
