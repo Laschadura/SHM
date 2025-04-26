@@ -1,4 +1,5 @@
 import os
+import platform
 import sys
 import gc
 import psutil
@@ -25,8 +26,11 @@ import pandas as pd
 import umap
 import GPUtil
 
-# Set working directory
-os.chdir("/cluster/scratch/scansimo/Euler_MMVAE")
+# Set working directory based on platform
+if platform.system() == "Windows":
+    os.chdir("c:/SP-Master-Local/SP_DamageLocalization-MasonryArchBridge_SimonScandella/ProbabilisticApproach/Euler_MMVAE")
+else:
+    os.chdir("/cluster/scratch/scansimo/Euler_MMVAE")
 print("✅ Script has started executing")
 
 # GPU Configuration
@@ -43,15 +47,6 @@ def configure_gpu():
     print(f"🔍 PyTorch will run on: {device}")
 
 configure_gpu()
-
-
-# Import custom modules
-from custom_distributions import (
-    compute_js_divergence,
-    reparameterize,
-    compute_mixture_prior,
-    compute_kl_divergence,
-)
 
 # Ensure access to sibling files
 sys.path.append(os.path.dirname(__file__))
@@ -104,275 +99,6 @@ def monitor_resources():
         print(f"🚀 GPU {gpu.id} ({gpu.name}): {gpu.memoryUsed:.1f}MB / {gpu.memoryTotal:.1f}MB "
               f"| Load: {gpu.load * 100:.1f}%")
         
-# ----- Utility -----
-def segment_and_transform(
-    accel_dict, 
-    heatmap_dict,
-    chunk_size=1, 
-    sample_rate=200, 
-    segment_duration=4.0, 
-    percentile=99,
-    test_ids_to_use=None
-    ):
-    """
-    Extracts segments from time series data centered around peak RMS values.
-    Returns raw segments and their corresponding binary masks.
-    
-    Args:
-        accel_dict: Dictionary mapping test IDs to time series data.
-        heatmap_dict: Dictionary mapping test IDs to binary mask data (downsampled).
-        chunk_size: Number of test IDs to process in one batch.
-        sample_rate: Sampling rate of the time series data (Hz).
-        segment_duration: Duration of each segment (seconds).
-        percentile: Percentile threshold for peak detection.
-        
-    Returns:
-        Tuple of arrays: (raw_segments, mask_segments, test_ids)
-    """
-    window_size = int(sample_rate * segment_duration)
-    half_window = window_size // 2
-    
-    test_ids = list(accel_dict.keys())
-    
-    # Instead of yield, we'll collect all data and return it at once
-    all_raw_segments = []
-    all_mask_segments = []
-    all_test_ids = []
-    
-    # Dictionary to count segments per test ID for debugging
-    seg_counts = {}
-
-    if test_ids_to_use is not None:
-        test_ids_to_use = set(str(tid) for tid in test_ids_to_use)
-    
-    for i in range(0, len(test_ids), chunk_size):
-        chunk_ids = test_ids[i:i + chunk_size]
-        
-        for test_id in chunk_ids:
-            if test_ids_to_use is not None and str(test_id) not in test_ids_to_use:
-                continue
-
-
-            # Debug: print out the shape of the mask for this test
-            mask_val = heatmap_dict[test_id]
-            try:
-                mask_shape = np.array(mask_val).shape
-            except Exception:
-                mask_shape = "unknown"
-            print(f"Processing Test ID {test_id}: mask shape = {mask_shape}")
-            
-            all_ts = accel_dict[test_id]
-            
-            for ts_raw in all_ts:
-                rms_each_sample = np.sqrt(np.mean(ts_raw**2, axis=1))
-                threshold = np.percentile(rms_each_sample, percentile)
-                peak_indices = np.where(rms_each_sample >= threshold)[0]
-                
-                for pk in peak_indices:
-                    start = pk - half_window
-                    end = pk + half_window
-                    if start < 0:
-                        start = 0
-                        end = window_size
-                    if end > ts_raw.shape[0]:
-                        end = ts_raw.shape[0]
-                        start = end - window_size
-                    if (end - start) < window_size:
-                        continue
-                    
-                    segment_raw = ts_raw[start:end, :]
-                    
-                    all_raw_segments.append(segment_raw)
-                    all_mask_segments.append(heatmap_dict[test_id])
-                    all_test_ids.append(int(test_id))
-                    
-                    seg_counts[test_id] = seg_counts.get(test_id, 0) + 1
-                    
-    # Debug: print summary of segments per test ID
-    unique_test_ids = np.unique(all_test_ids)
-    print("Segment counts by test ID:", seg_counts)
-    print("Unique test IDs from segmentation:", unique_test_ids)
-    
-    # Convert lists to numpy arrays
-    raw_segments = np.array(all_raw_segments, dtype=np.float32)
-    mask_segments = np.array(all_mask_segments, dtype=np.float32)
-    test_ids = np.array(all_test_ids, dtype=np.int32)
-    
-    print(f"Extracted {len(raw_segments)} segments, each with a corresponding test ID.")
-    print(f"Number of unique test IDs in segmentation: {len(unique_test_ids)}")
-    
-    return raw_segments, mask_segments, test_ids
-
-def compute_or_load_spectograms(raw_segments, fs=200, nperseg=256, noverlap=192):
-    """
-    Compute or load cached spectrograms.
-    
-    Args:
-        raw_segments: Raw time series (N, time_length, channels)
-        fs, nperseg, noverlap: STFT parameters
-        cache_path: File path to save/load spectrograms
-        
-    Returns:
-        Spectrogram features (N, freq_bins, time_bins, channels*2)
-    """
-    print("⏳ Computing STFT for all segments...")
-    complex_spectrograms = compute_complex_spectrogram(raw_segments, fs, nperseg, noverlap)
-    return complex_spectrograms
-
-def compute_complex_spectrogram(
-    time_series,
-    fs=200,
-    nperseg=128,
-    noverlap=64
-    ):
-    """
-    Compute STFT-based spectrograms with PyTorch.
-    
-    Args:
-        time_series: shape (batch_size, time_steps, channels) — numpy or torch tensor
-        fs: Sampling frequency in Hz
-        nperseg: Window length for STFT
-        noverlap: Overlap between windows
-
-    Returns:
-        Spectrograms with shape (batch, freq_bins, time_bins, channels * 2)
-    """
-    if isinstance(time_series, np.ndarray):
-        time_series = torch.tensor(time_series, dtype=torch.float32)
-
-    batch_size, time_steps, channels = time_series.shape
-    frame_step = nperseg - noverlap
-    window = torch.hann_window(nperseg)
-
-    # Compute STFT shape using a test sample
-    test_stft = torch.stft(
-        time_series[0, :, 0],
-        n_fft=nperseg,
-        hop_length=frame_step,
-        win_length=nperseg,
-        window=window,
-        return_complex=True
-    )
-
-    freq_bins, time_bins = test_stft.shape
-    print(f"🔍 STFT Config: nperseg={nperseg}, noverlap={noverlap}, frame_step={frame_step}")
-    print(f"📏 Expected STFT shape: (freq_bins={freq_bins}, time_bins={time_bins})")
-
-    if time_bins == 0:
-        raise ValueError("⚠️ STFT produced 0 time bins! Adjust `nperseg` or `noverlap`.")
-
-    # Pre-allocate spectrograms: (batch, freq_bins, time_bins, channels * 2)
-    all_spectrograms = torch.zeros(batch_size, freq_bins, time_bins, channels * 2)
-
-    for i in range(batch_size):
-        for c in range(channels):
-            stft = torch.stft(
-                time_series[i, :, c],
-                n_fft=nperseg,
-                hop_length=frame_step,
-                win_length=nperseg,
-                window=window,
-                return_complex=True
-            )
-
-            if stft.shape[1] == 0:
-                raise ValueError(f"⚠️ STFT returned 0 time bins for sample {i}, channel {c}!")
-
-            # Magnitude and phase
-            mag = torch.log1p(torch.abs(stft))  # log(1 + |stft|)
-            phase = torch.angle(stft)           # phase in radians
-
-            # Store in final tensor (transpose to match shape: freq, time)
-            all_spectrograms[i, :, :, 2*c]   = mag
-            all_spectrograms[i, :, :, 2*c+1] = phase
-  
-
-    print(f"✅ Final spectrogram shape: {all_spectrograms.shape}")
-    return all_spectrograms.numpy()
-
-def inverse_spectrogram(
-    complex_spectrograms,
-    time_length,
-    fs=200,
-    nperseg=256,
-    noverlap=128,
-    batch_processing_size=100
-    ):
-    """
-    Convert magnitude + phase spectrograms back to time-domain signals using PyTorch.
-    
-    Args:
-        complex_spectrograms: np.ndarray of shape (batch, freq, time, channels*2)
-        time_length: Desired output length in time steps
-        fs: Sampling frequency (unused, for compatibility)
-        nperseg: Frame size (window length)
-        noverlap: Overlap between frames
-        batch_processing_size: Number of samples processed at once
-
-    Returns:
-        np.ndarray: Time-domain signal, shape (batch, time_length, channels)
-    """
-    if isinstance(complex_spectrograms, np.ndarray):
-        complex_spectrograms = torch.tensor(complex_spectrograms, dtype=torch.float32)
-
-    frame_step = nperseg - noverlap
-    batch_size, freq_bins, time_bins, double_channels = complex_spectrograms.shape
-    num_channels = double_channels
-    window = torch.hann_window(nperseg)
-
-    time_series = torch.zeros((batch_size, time_length, num_channels), dtype=torch.float32)
-
-    total_batches = (batch_size + batch_processing_size - 1) // batch_processing_size
-
-    for batch_idx in range(total_batches):
-        print(f"🔁 Reconstructing batch {batch_idx + 1}/{total_batches}")
-        start_idx = batch_idx * batch_processing_size
-        end_idx = min((batch_idx + 1) * batch_processing_size, batch_size)
-
-        batch_spec = complex_spectrograms[start_idx:end_idx]
-
-        for b_rel, b_abs in enumerate(range(start_idx, end_idx)):
-            for c in range(num_channels):
-                # Extract magnitude and phase
-                log_mag = batch_spec[b_rel, 2*c, :, :]
-                phase   = batch_spec[b_rel, 2*c+1, :, :]
-                magnitude = torch.expm1(log_mag)
-                complex_spec = magnitude * torch.exp(1j * phase)
-
-                print(f"shape inverse spec input should be (freq, time): {complex_spec.shape}")
-
-
-                # Perform inverse STFT
-                waveform = torch.istft(
-                    complex_spec,
-                    n_fft=nperseg,
-                    hop_length=frame_step,
-                    win_length=nperseg,
-                    window=window,
-                    length=time_length
-                )
-
-                # Save reconstructed waveform
-                time_series[b_abs, :waveform.shape[0], c] = waveform
-
-    return time_series.numpy()
-
-def cache_final_features(complex_specs, cache_path="cached_spectral_features.npy"):
-    """
-    If 'cache_path' exists, load it via mmap. Otherwise,
-    convert 'complex_specs' to magnitude+phase features,
-    save to disk, then memory-map.
-    """
-    if os.path.exists(cache_path):
-        print(f"📂 Loading final spectral features from {cache_path}")
-        return np.load(cache_path)
-    
-    # Save the final shape
-    np.save(cache_path, complex_specs)
-    print(f"✅ Final spectral features saved to {cache_path}")
-
-    return np.load(cache_path)
-
 # ----- Loss Functions and schedules -----
 def complex_spectrogram_loss(y_true, y_pred):
     """
@@ -404,6 +130,28 @@ def complex_spectrogram_loss(y_true, y_pred):
     # Combined loss: weighted
     total_loss = 0.8 * mag_loss + 0.2 * phase_loss
     return total_loss
+
+def spectro_time_consistency_loss(orig_wave, recon_spec,
+                                  fs=200, nperseg=256, noverlap=224,
+                                  weight=1.0):
+    """
+    orig_wave : (B, T, C)    pre-processed window
+    recon_spec: (B, 2C, F, T) decoder output (log-mag | phase)
+
+    Computes ISTFT of recon_spec, aligns RMS to orig_wave, and
+    returns L1 distance; multiply by `weight` before adding.
+    """
+    with torch.no_grad():
+        spec_np = recon_spec.detach().cpu().numpy().transpose(0, 2, 3, 1)
+        wav_rec = data_loader.inverse_spectrogram(
+            spec_np, time_length=orig_wave.shape[1],
+            fs=fs, nperseg=nperseg, noverlap=noverlap)
+        wav_rec = torch.tensor(wav_rec, device=orig_wave.device)
+
+    # RMS-match before L1/L2
+    scale = orig_wave.std(dim=1, keepdim=True) / (wav_rec.std(dim=1, keepdim=True) + 1e-8)
+    wav_rec *= scale
+    return weight * F.l1_loss(wav_rec, orig_wave)
 
 def custom_mask_loss(y_true, y_pred,
                      weight_bce=0.1,
@@ -539,7 +287,6 @@ class SpectrogramEncoder(nn.Module):
         self.relu2 = nn.LeakyReLU(0.1)
         self.dropout2 = nn.Dropout(0.3)
         
-        # IMPORTANT: Update this line to in_channels=64, not 32
         self.conv3 = nn.Conv2d(
             in_channels=64,
             out_channels=128,
@@ -572,7 +319,6 @@ class SpectrogramEncoder(nn.Module):
         x = self.relu2(self.gn2(x))
         x = self.dropout2(x)
         
-        # Now conv3 receives in_channels=64
         x = self.conv3(x)
         x = self.relu3(self.gn3(x))
         x = self.dropout3(x)
@@ -1213,6 +959,18 @@ class MultiModalLatentDiffusion:
             beta_end=0.02
         )
     
+    def eval(self):
+        self.autoencoders["spec"].eval()
+        self.autoencoders["mask"].eval()
+        self.diffusion_model.eval()
+        return self
+
+    def train(self, mode=True):
+        self.autoencoders["spec"].train(mode)
+        self.autoencoders["mask"].train(mode)
+        self.diffusion_model.train(mode)
+        return self
+
     def encode_modalities(self, modality_data):
         latents = {}
 
@@ -1498,8 +1256,8 @@ class MultiModalLatentDiffusion:
                 )
         
         # Decode the joint latent back to each modality
-        outputs = self.decode_modalities(joint_latent)
-        
+        outputs = self.decode_modalities(joint_latent.float())
+
         return outputs
     
     def save_autoencoders(self, save_dir="./results/autoencoders"):
@@ -1530,7 +1288,7 @@ class MultiModalLatentDiffusion:
 
 
 # ===== Helper Function for Creating Datasets =====
-def create_torch_dataset(spec_data, mask_data, test_ids, batch_size, shuffle=True):
+def create_torch_dataset(spec_data, mask_data, seg_data, test_ids, batch_size, shuffle=True):
     """
     Create a PyTorch DataLoader from the spectrogram and mask data.
     
@@ -1544,12 +1302,13 @@ def create_torch_dataset(spec_data, mask_data, test_ids, batch_size, shuffle=Tru
         PyTorch DataLoader
     """
     # Convert numpy arrays to PyTorch tensors
-    spec_tensor = torch.tensor(spec_data, dtype=torch.float32)
-    mask_tensor = torch.tensor(mask_data, dtype=torch.float32)
-    ids_tensor  = torch.tensor(test_ids, dtype=torch.int32)
+    spec    = torch.tensor(spec_data, dtype=torch.float32)
+    mask    = torch.tensor(mask_data, dtype=torch.float32)
+    seg     = torch.tensor(seg_data,  dtype=torch.float32)
+    ids     = torch.tensor(test_ids, dtype=torch.int32)
     
     # Create TensorDataset
-    dataset = TensorDataset(spec_tensor, mask_tensor, ids_tensor)
+    dataset = TensorDataset(spec, mask, seg, ids)
     
     # Create DataLoader
     dataloader = DataLoader(
@@ -1564,17 +1323,25 @@ def create_torch_dataset(spec_data, mask_data, test_ids, batch_size, shuffle=Tru
     return dataloader
 
 # ===== Training Functions =====
-def train_autoencoders(spec_autoencoder, mask_autoencoder, train_loader, device, epochs=300, lr=1e-4):
+def train_autoencoders(
+        spec_autoencoder,
+        mask_autoencoder,
+        train_loader,
+        device,
+        epochs: int = 100,
+        lr: float = 5e-4
+    ):
     """
     Trains the spectrogram and mask autoencoders separately.
 
-    Args:
-        spec_autoencoder: SpectrogramAutoencoder model
-        mask_autoencoder: MaskAutoencoder model
-        train_loader: PyTorch DataLoader yielding (spec, mask, id)
-        device: torch.device
-        epochs: Number of epochs
-        lr: Learning rate
+    Args
+    ----
+    spec_autoencoder : SpectrogramAutoencoder
+    mask_autoencoder : MaskAutoencoder
+    train_loader     : DataLoader yielding (spec, mask, seg, id)
+    device           : torch.device
+    epochs           : int  – number of epochs
+    lr               : float – learning‑rate
     """
     spec_autoencoder.to(device)
     mask_autoencoder.to(device)
@@ -1582,42 +1349,59 @@ def train_autoencoders(spec_autoencoder, mask_autoencoder, train_loader, device,
     optimizer_spec = optim.AdamW(spec_autoencoder.parameters(), lr=lr)
     optimizer_mask = optim.AdamW(mask_autoencoder.parameters(), lr=lr)
 
-    scheduler_spec = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_spec, T_max=epochs)
-    scheduler_mask = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer_mask, T_max=epochs)
-
+    scheduler_spec = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer_spec, T_max=epochs
+    )
+    scheduler_mask = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer_mask, T_max=epochs
+    )
 
     for epoch in range(epochs):
         spec_autoencoder.train()
         mask_autoencoder.train()
 
-        spec_loss_total = 0.0
-        mask_loss_total = 0.0
+        spec_loss_sum  = 0.0     # running *sum* for this epoch
+        mask_loss_sum  = 0.0
+        batch_counter  = 0
 
-        for spec_batch, mask_batch, _ in train_loader:
+        for spec_batch, mask_batch, seg_batch, _ in train_loader:
+            batch_counter += 1
+
             spec_batch = spec_batch.to(device)
             mask_batch = mask_batch.to(device)
+            seg_batch  = seg_batch.to(device)
 
-            # --- Train spec autoencoder ---
+            # ---- spectrogram AE ----
             optimizer_spec.zero_grad()
             recon_spec, _ = spec_autoencoder(spec_batch)
-            loss_spec = complex_spectrogram_loss(spec_batch, recon_spec)
-            loss_spec.backward()
-            optimizer_spec.step()
-            spec_loss_total += loss_spec.item()
 
-            # --- Train mask autoencoder ---
+            loss_spec_mag = complex_spectrogram_loss(spec_batch, recon_spec)
+            loss_time = spectro_time_consistency_loss(
+                orig_wave = seg_batch,           # (B, T, C) raw window
+                recon_spec = recon_spec)
+            
+            loss_spec_total = loss_spec_mag + 0.1 * loss_time      # weight=0.1
+            loss_spec_total.backward()
+            optimizer_spec.step()
+            spec_loss_sum += loss_spec_total.item()
+
+            # ---- mask AE ----
             optimizer_mask.zero_grad()
             recon_mask, _ = mask_autoencoder(mask_batch)
             loss_mask = custom_mask_loss(mask_batch, recon_mask)
             loss_mask.backward()
             optimizer_mask.step()
-            mask_loss_total += loss_mask.item()
+            mask_loss_sum += loss_mask.item()
 
-    # ✅ Step scheduler once per epoch
-    scheduler_spec.step()
-    scheduler_mask.step()
+        # -------- end of epoch: compute means & log --------
+        avg_spec_loss = spec_loss_sum / batch_counter
+        avg_mask_loss = mask_loss_sum / batch_counter
+        print(f"[Epoch {epoch+1:3d}/{epochs}]  "
+              f"spec={avg_spec_loss:.4f}  mask={avg_mask_loss:.4f}")
 
-    print(f"[Epoch {epoch+1}] Spec Loss: {spec_loss_total:.4f} | Mask Loss: {mask_loss_total:.4f}")
+        # step the LR schedulers once per epoch
+        scheduler_spec.step()
+        scheduler_mask.step()
 
 # ----- Visualization Functions and tests -----
 def visualize_training_history(history, save_path=None):
@@ -1668,18 +1452,27 @@ def save_visualizations_and_metrics(model, train_loader, val_loader, training_me
     plot_training_curves(training_metrics)
 
     def extract_and_reduce_latents(loader):
-        model.eval()
+        # Explicitly set evaluation mode for internal modules
+        model.diffusion_model.eval()
+        for ae in model.autoencoders.values():
+            ae.eval()
+
         latents, ids = [], []
-        for spec, _, test_id in loader:
-            spec = spec.to(next(model.parameters()).device)
+        device = model.device  # Correct way to get the device
+
+        for spec, _, _, test_id in loader:
+            spec = spec.to(device)
             with torch.no_grad():
                 _, z = model.autoencoders["spec"](spec)
             latents.append(z.cpu().numpy())
             ids.append(test_id.numpy().flatten())
+
         latents = np.concatenate(latents, axis=0)
         ids = np.concatenate(ids, axis=0)
+
         reducer = umap.UMAP(n_components=3, random_state=42, n_neighbors=100)
         latent_3d = reducer.fit_transform(latents)
+
         return latent_3d, ids
 
     latent_3d, train_ids = extract_and_reduce_latents(train_loader)
@@ -1723,201 +1516,139 @@ def save_visualizations_and_metrics(model, train_loader, val_loader, training_me
         "latent_space_3d": latent_3d
     }
 
-# === New function for autoencoder-based reconstruction evaluation ===
-def reconstruction_eval(model, test_ids_to_use=["25"], fs=200, nperseg=256, noverlap=224, output_dir="results_diff/recon_eval"):
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Reload raw data
-    accel_dict, binary_masks, heatmaps = data_loader.load_data()
-
-    raw_segments, mask_segments, test_ids = segment_and_transform(
-        accel_dict, heatmaps, segment_duration=4.0, test_ids_to_use=test_ids_to_use
-    )
-    # Ensure valid shape before spectrogram computation
-    raw_segments = np.asarray(raw_segments, dtype=np.float32)
-
-
-    spectrograms = compute_or_load_spectograms(raw_segments, fs, nperseg, noverlap)
-
-    # Transpose to match PyTorch shape
-    spec_tensor = torch.tensor(spectrograms.transpose(0, 3, 1, 2), dtype=torch.float32).to(model.device)
-    mask_tensor = torch.tensor(mask_segments.transpose(0, 3, 1, 2), dtype=torch.float32).to(model.device)
-
-    print(f"[DEBUG] raw_segments shape: {raw_segments.shape}")         # (N, T, C)
-    print(f"[DEBUG] spectrograms shape: {spectrograms.shape}")         # (N, F, T, 2*C)
-    print(f"[DEBUG] spec_tensor shape (for model): {spec_tensor.shape}")  # (N, 2*C, F, T)
-    print(f"[DEBUG] mask_tensor shape (for model): {mask_tensor.shape}")  # (N, 1, H, W)
-
-    with torch.no_grad():
-        _, z_spec = model.autoencoders["spec"](spec_tensor)
-        _, z_mask = model.autoencoders["mask"](mask_tensor)
-
-        recon_spec = model.autoencoders["spec"].decoder(z_spec)
-        recon_mask = model.autoencoders["mask"].decoder(z_mask)
-
-    # Inverse spectrogram
-    recon_ts = inverse_spectrogram(
-        recon_spec.cpu().numpy(), fs=fs, nperseg=nperseg, noverlap=noverlap, time_length=800
-    )
-
-    for i in range(len(raw_segments)):
-        time_axis = np.linspace(0, 4, 800)
-        plt.figure(figsize=(10, 5))
-        for ch in range(raw_segments.shape[2]):
-            plt.plot(time_axis, raw_segments[i, :, ch], color='blue', alpha=0.4)
-            plt.plot(time_axis, recon_ts[i, :, ch], color='red', alpha=0.4)
-        plt.title(f"Time Series Reconstruction | Test ID {test_ids[i]}")
-        plt.tight_layout()
-        plt.savefig(f"{output_dir}/ts_recon_id_{test_ids[i]}_{i}.png", dpi=300)
-        plt.close()
-
-        # Plot masks
-        plt.figure(figsize=(6, 3))
-        plt.subplot(1, 2, 1)
-        plt.imshow(mask_tensor[i, 0].cpu(), cmap="gray")
-        plt.title("GT Mask")
-        plt.axis("off")
-
-        plt.subplot(1, 2, 2)
-        plt.imshow(recon_mask[i, 0].cpu(), cmap="gray")
-        plt.title("Reconstructed Mask")
-        plt.axis("off")
-        plt.tight_layout()
-        plt.savefig(f"{output_dir}/mask_recon_id_{test_ids[i]}_{i}.png", dpi=300)
-        plt.close()
-
-    print(f"✅ Reconstruction plots saved to {output_dir}")
-
-# === New function for diffusion-based generation ===
-def synthesize_samples(model, output_dir="results_diff/samples"
-                       , batch_size=8):
-    os.makedirs(output_dir, exist_ok=True)
-    with torch.no_grad():
-        samples = model.sample(batch_size=batch_size)
-
-    spec = samples["spec"].cpu().numpy()
-    masks = samples["mask"].cpu().numpy()
-
-    # Invert spectrograms
-    ts_data = inverse_spectrogram(spec, fs=200, nperseg=256, noverlap=224, time_length=800)
-
-    for i in range(batch_size):
-        # Time series
-        plt.figure(figsize=(10, 5))
-        for ch in range(ts_data.shape[2]):
-            plt.plot(np.linspace(0, 4, 800), ts_data[i, :, ch], alpha=0.4)
-        plt.title(f"Synthetic Time Series #{i}")
-        plt.tight_layout()
-        plt.savefig(f"{output_dir}/synthetic_ts_{i}.png", dpi=300)
-        plt.close()
-
-        # Mask
-        plt.imshow(masks[i, 0], cmap='gray')
-        plt.title(f"Synthetic Mask #{i}")
-        plt.axis("off")
-        plt.savefig(f"{output_dir}/synthetic_mask_{i}.png", dpi=300)
-        plt.close()
-
-    print(f"✅ Synthetic samples saved to {output_dir}")
 
 # ----- Main Function -----
 def main():
-    # Configuration
-    train_AE = True
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # ─── Mode Control ───────────────────────────────────────────────
+    train_AE        = False                   # whether to train AE
+    recompute_data  = False                   # whether to recompute cache
+    dm_mode         = "continue"              # "scratch" or "continue"
+    dm_epochs       = 100                     # extra epochs for diffusion
+    learning_rate_dm = 1e-4
+    learning_rate_ae = 5e-4
+    diff_ckpt       = "results_diff/diffusion/final_diffusion_model.pt"
 
-    # Output dirs
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs("results_diff/autoencoders", exist_ok=True)
     os.makedirs("results_diff/diffusion", exist_ok=True)
 
-    # Data parameters
+    # ─── Data Parameters ────────────────────────────────────────────
     fs = 200
+    segment_duration = 4.0
     nperseg = 256
     noverlap = 224
     latent_dim = 256
     batch_size = 50
-    num_epochs = 400
-    learning_rate_dm = 1e-4
-    learning_rate_ae = 5e-4
 
-    # Cache paths 
-    final_path = "scripts/cached_spectral_features.npy"
-    heatmaps_path = "scripts/cached_masks.npy"
-    ids_path = "scripts/cached_test_ids.npy"
+    tag = f"{segment_duration:.2f}s_{nperseg}_{noverlap}"
+    cache_dir = "cache"
+    os.makedirs(cache_dir, exist_ok=True)
 
-    # Load or compute features
-    all_cached = os.path.exists(final_path) and os.path.exists(heatmaps_path) and os.path.exists(ids_path)
-    if all_cached:
+    final_path    = os.path.join(cache_dir, f"specs_{tag}.npy")
+    heatmaps_path = os.path.join(cache_dir, f"masks_{tag}.npy")
+    ids_path      = os.path.join(cache_dir, f"segIDs_{tag}.npy")
+    seg_path      = os.path.join(cache_dir, f"segments_{tag}.npy")
+
+    # ─── Load or compute features ───────────────────────────────────
+    all_cached = all(os.path.exists(p) for p in [final_path, heatmaps_path, ids_path, seg_path])
+    if all_cached and not recompute_data:
         print("✅ Loading cached files...")
         spectral_features = np.load(final_path)
-        mask_segments = np.load(heatmaps_path)
-        test_ids = np.load(ids_path)
+        mask_segments     = np.load(heatmaps_path)
+        test_ids          = np.load(ids_path)
+        segments          = np.load(seg_path)
     else:
-        print("⚠️ Missing cache. Recomputing features...")
-        accel_dict, _, heatmaps = data_loader.load_data()
-        raw_segments, mask_segments, test_ids = segment_and_transform(accel_dict, heatmaps, segment_duration=4.0)
-        complex_specs = compute_or_load_spectograms(raw_segments, fs, nperseg, noverlap)
-        spectral_features = cache_final_features(complex_specs, cache_path=final_path)
-        np.save(heatmaps_path, mask_segments)
-        np.save(ids_path, test_ids)
+        print("⚠️  Cache missing or recompute requested … building fresh.")
+        _, _, heatmaps, segments, spectrograms, test_ids = data_loader.load_data(
+            segment_duration = segment_duration,
+            nperseg          = nperseg,
+            noverlap         = noverlap,
+            sample_rate      = fs,
+            recompute        = recompute_data,
+            cache_dir        = cache_dir
+        )
+        spectral_features = spectrograms
+        mask_segments     = np.stack([heatmaps[tid] for tid in test_ids], axis=0)
 
-    spectral_features = spectral_features.transpose(0, 3, 1, 2)
-    mask_segments = mask_segments.transpose(0, 3, 1, 2)
+        np.save(final_path,    spectral_features)
+        np.save(heatmaps_path, mask_segments)
+        np.save(ids_path,      test_ids)
+        np.save(seg_path,      segments)
+        print("✅ New cache written.")
+
+    # ─── Dataset Splitting ──────────────────────────────────────────
+    spectral_features = spectral_features.transpose(0, 3, 1, 2)  # (N,2C,F,T)
+    mask_segments     = mask_segments.transpose(0, 3, 1, 2)
 
     N = spectral_features.shape[0]
     indices = np.random.permutation(N)
     split = int(0.8 * N)
     train_idx, val_idx = indices[:split], indices[split:]
 
-    train_spec, val_spec = spectral_features[train_idx], spectral_features[val_idx]
-    train_mask, val_mask = mask_segments[train_idx], mask_segments[val_idx]
-    train_ids, val_ids = test_ids[train_idx], test_ids[val_idx]
+    train_spec = spectral_features[train_idx]
+    val_spec   = spectral_features[val_idx]
+    train_mask = mask_segments[train_idx]
+    val_mask   = mask_segments[val_idx]
+    train_ids  = test_ids[train_idx]
+    val_ids    = test_ids[val_idx]
+    train_seg  = segments[train_idx]
+    val_seg    = segments[val_idx]
 
     print(f"✅ Train: {train_spec.shape[0]} samples | Val: {val_spec.shape[0]} samples")
 
-    train_loader = create_torch_dataset(train_spec, train_mask, train_ids, batch_size=batch_size)
-    val_loader = create_torch_dataset(val_spec, val_mask, val_ids, batch_size=batch_size)
+    # ─── Create Torch Loaders ───────────────────────────────────────
+    train_loader = create_torch_dataset(train_spec, train_mask, train_seg, train_ids, batch_size=batch_size)
+    val_loader   = create_torch_dataset(val_spec,   val_mask,   val_seg,   val_ids,   batch_size=batch_size)
 
     freq_bins, time_bins = train_spec.shape[2:]
     channels = train_spec.shape[1] // 2
     mask_height, mask_width = mask_segments.shape[-2:]
 
+    # ─── Build Model ────────────────────────────────────────────────
     spec_autoencoder = SpectrogramAutoencoder(latent_dim, channels, freq_bins, time_bins).to(device)
     mask_autoencoder = MaskAutoencoder(latent_dim, (mask_height, mask_width)).to(device)
 
     if train_AE:
-        print("🚀 Training full MLD pipeline (autoencoders + diffusion)...")
+        print("🚀 Training Autoencoders...")
         train_autoencoders(spec_autoencoder, mask_autoencoder, train_loader, device, epochs=300, lr=learning_rate_ae)
-        mld = MultiModalLatentDiffusion(spec_autoencoder, mask_autoencoder, latent_dim, ["spec", "mask"], device)
-        history = mld.train_diffusion_model(
-            train_dataloader=train_loader,
-            val_dataloader=val_loader,
-            num_epochs=num_epochs,
-            learning_rate=learning_rate_dm,
-            save_dir="results_diff/diffusion"
-        )
-        mld.save_autoencoders("results_diff/autoencoders")
+        torch.save(spec_autoencoder.state_dict(), "results_diff/autoencoders/spec_autoencoder.pt")
+        torch.save(mask_autoencoder.state_dict(), "results_diff/autoencoders/mask_autoencoder.pt")
     else:
-        print("🔄 Loading pretrained autoencoders and training diffusion only...")
-        spec_autoencoder = SpectrogramAutoencoder(latent_dim, channels, freq_bins, time_bins).to(device)
-        mask_autoencoder = MaskAutoencoder(latent_dim, (mask_height, mask_width)).to(device)
-        mld = MultiModalLatentDiffusion(spec_autoencoder, mask_autoencoder, latent_dim, ["spec", "mask"], device)
-        mld.load_autoencoders("results_diff/autoencoders")
-        history = mld.train_diffusion_model(
-            train_dataloader=train_loader,
-            val_dataloader=val_loader,
-            num_epochs=num_epochs,
-            learning_rate=learning_rate_dm,
-            save_dir="results_diff/diffusion"
-        )
+        print("🔄 Loading pretrained autoencoders...")
+        spec_autoencoder.load_state_dict(torch.load("results_diff/autoencoders/spec_autoencoder.pt", map_location=device))
+        mask_autoencoder.load_state_dict(torch.load("results_diff/autoencoders/mask_autoencoder.pt", map_location=device))
 
-    mld.save_diffusion_model("results_diff/diffusion/final_diffusion_model.pt")
+    mld = MultiModalLatentDiffusion(spec_autoencoder, mask_autoencoder, latent_dim, ["spec", "mask"], device)
+
+    # ─── Diffusion training control ─────────────────────────────────
+    if dm_mode == "continue":
+        if os.path.exists(diff_ckpt):
+            print("🔄 Continuing diffusion training from checkpoint.")
+            mld.load_diffusion_model(diff_ckpt)
+        else:
+            print("❌ No diffusion checkpoint found – aborting continue mode.")
+            return
+    elif dm_mode == "scratch":
+        print("🆕 Training diffusion model from scratch.")
+    else:
+        raise ValueError(f"Invalid dm_mode: {dm_mode}. Choose 'scratch' or 'continue'.")
+
+    print(f"🚀 Training diffusion model for {dm_epochs} epoch(s).")
+    history = mld.train_diffusion_model(
+        train_dataloader = train_loader,
+        val_dataloader   = val_loader,
+        num_epochs       = dm_epochs,
+        learning_rate    = learning_rate_dm,
+        save_dir         = "results_diff/diffusion"
+    )
+
+    mld.save_diffusion_model(diff_ckpt)
+
     visualize_training_history(history, save_path="results_diff/diffusion/training_curve.png")
-    reconstruction_eval(mld, test_ids_to_use=["21", "22", "25"], fs=fs, nperseg=nperseg, noverlap=noverlap)
-    synthesize_samples(mld, batch_size=32)
     save_visualizations_and_metrics(mld, train_loader, val_loader, training_metrics=history, output_dir="results_diff")
 
     print("✅ All training, evaluation, and synthesis complete.")
+
 
 
 if __name__ == "__main__":

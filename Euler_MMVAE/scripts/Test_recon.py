@@ -360,6 +360,14 @@ def plot_overlay_all_channels(original, reconstructed, segment_idx=0, fs=200, no
     plt.savefig(f'all_channels_segment_{segment_idx}.png', dpi=300)
     plt.show()
 
+def test_chatgpt():
+    """
+    Test function to check if the script is running correctly.
+    This is a placeholder and can be removed or modified as needed.
+    """
+    print("ChatGPT is smart!")
+
+
 def main():
     """Main function to run the reconstruction test with normalization"""
     # Parameters

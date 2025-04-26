@@ -1,6 +1,10 @@
 import os
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+import os
 import glob
 import re
+import random
 import cv2
 import torch
 import numpy as np
@@ -26,39 +30,44 @@ perspective_map = {
 }
 
 ######################################
-# Accelerometer Data Loading
+# Time-series data pre- and postprocessing
 ######################################
 def highpass_filter(data, cutoff=10.0, fs=200.0, order=4):
     """
-    Apply a Butterworth high-pass filter to data.
+    Apply a Butterworth high-pass filter to 1D or 2D time-series data.
 
     Args:
-        data: 1D NumPy array of shape (N,) or 2D (N, C). 
-              If 2D, we apply filter to each column.
+        data: NumPy array of shape (N,) or (N, C). If 2D, filters each channel independently.
         cutoff: High-pass cutoff frequency in Hz.
         fs: Sampling frequency in Hz.
         order: Order of the Butterworth filter.
     
     Returns:
-        Filtered data, same shape as input.
+        Filtered data with same shape as input.
     """
     nyquist = 0.5 * fs
     normal_cutoff = cutoff / nyquist
-
-    # Get filter coefficients
     b, a = butter(order, normal_cutoff, btype='high', analog=False)
 
-    # If data is 1D, just apply it directly
     if data.ndim == 1:
         return filtfilt(b, a, data, axis=0)
 
-    # If data is 2D (N,C), apply filter channel by channel
     filtered = np.zeros_like(data)
     for c in range(data.shape[1]):
         filtered[:, c] = filtfilt(b, a, data[:, c], axis=0)
     return filtered
 
 def load_accelerometer_data(data_dir=DATA_DIR, skip_tests=SKIP_TESTS):
+    """
+    Load raw accelerometer CSV files for all test directories.
+
+    Args:
+        data_dir: Path to the dataset directory.
+        skip_tests: List of test IDs to ignore.
+    
+    Returns:
+        Dictionary mapping test ID to a list of raw (time × channel) arrays.
+    """
     test_dirs = [d for d in glob.glob(os.path.join(data_dir, "Test_*")) if os.path.isdir(d)]
     tests_data = {}
 
@@ -83,33 +92,10 @@ def load_accelerometer_data(data_dir=DATA_DIR, skip_tests=SKIP_TESTS):
                     continue
 
                 data_matrix = df[accel_cols].values.astype(np.float32)
-
-                # Truncate to EXPECTED_LENGTH if needed
                 if data_matrix.shape[0] > EXPECTED_LENGTH:
                     data_matrix = data_matrix[:EXPECTED_LENGTH, :]
-
-                # 1) High-pass filter to remove low-frequency drift
-                data_matrix = highpass_filter(data_matrix, 
-                                              cutoff=10.0,
-                                              fs=200.0,
-                                              order=6)
-
-                # 2) Subtract file-wide mean and perform min–max normalization to [-1, 1]
-                channel_means = np.mean(data_matrix, axis=0)  # shape (num_channels,)
-                data_matrix = data_matrix - channel_means     # broadcasted subtraction
-
-                data_min = np.min(data_matrix)
-                data_max = np.max(data_matrix)
-                eps = 1e-8
-                if data_max - data_min < eps:
-                    data_max = data_min + eps
-
-                # Scale data into [0, 1] first
-                data_matrix_scaled = (data_matrix - data_min) / (data_max - data_min)
-                # Then transform into [-1, 1]
-                data_matrix = 2 * data_matrix_scaled - 1
-
                 samples.append(data_matrix)
+
             except Exception as e:
                 print(f"Skipping file {csv_file} due to error: {e}")
                 continue
@@ -119,165 +105,136 @@ def load_accelerometer_data(data_dir=DATA_DIR, skip_tests=SKIP_TESTS):
 
     return tests_data
 
-######################################
-# Label Image Processing
-######################################
-def load_perspective_image(test_id, perspective, labels_dir=LABELS_DIR, target_size=(256,256)):
-    # Your existing code - unchanged
-    label_name = perspective_map.get(perspective)
-    file_path = os.path.join(labels_dir, f"Test_{test_id}", f"{label_name}_T{test_id}.png")
-
-    if not os.path.exists(file_path):
-        return None
-
-    img = cv2.imread(file_path)
-    if img is None:
-        return None
-
-    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-    img_resized = cv2.resize(img, target_size, interpolation=cv2.INTER_AREA)
-    return img_resized
-
-def load_combined_label(test_id, labels_dir=LABELS_DIR, image_shape=IMAGE_SHAPE):
-    # Your existing code - unchanged
-    images = [load_perspective_image(test_id, p, labels_dir, (image_shape[0], image_shape[1] // 3)) for p in ['A', 'B', 'C']]
-    images = [img if img is not None else np.zeros((image_shape[0], image_shape[1] // 3, 3), dtype=np.uint8) for img in images]
-    return np.concatenate(images, axis=1)
-
-######################################
-# Mask and Heatmap computation
-######################################
-def compute_binary_mask(combined_image):
-    hsv = cv2.cvtColor(combined_image, cv2.COLOR_RGB2HSV)
-    mask1 = cv2.inRange(hsv, np.array([0, 70, 50]), np.array([10, 255, 255]))
-    mask2 = cv2.inRange(hsv, np.array([170, 70, 50]), np.array([180, 255, 255]))
-    return cv2.bitwise_or(mask1, mask2).astype(np.uint8)
-
-def mask_to_heatmap(orig_mask, target_size=(32, 96), apply_blur=False, blur_kernel=(3,3)):
-    """
-    Converts a high-res binary mask (H×W) to a coarse heatmap (target_size).
-    Each pixel of the heatmap ~ fraction_of_masked_pixels_in_that_region.
-    """
-    # If mask is in {0,255}, convert to {0,1}
-    if orig_mask.max() > 1:
-        orig_mask = (orig_mask > 0).astype(np.float32)
-    
-    # Downsample using INTER_AREA (area averaging)
-    newH, newW = target_size
-    heatmap = cv2.resize(orig_mask.astype(np.float32),
-                         (newW, newH),
-                         interpolation=cv2.INTER_AREA)
-    
-    # Optional smoothing
-    if apply_blur:
-        heatmap = cv2.GaussianBlur(heatmap, blur_kernel, sigmaX=0)
-    
-    # Ensure in [0,1]
-    heatmap = np.clip(heatmap, 0.0, 1.0)
-    return heatmap
-
-########################################
-# Segmentation & Spectogram computation
-########################################
-def segment_and_transform(
-    accel_dict, 
-    heatmap_dict,
-    chunk_size=1, 
-    sample_rate=200, 
-    segment_duration=4.0, 
-    percentile=99,
-    test_ids_to_use=None
+def preprocess_segment(
+        seg: np.ndarray,
+        fs: int = 200,
+        hp_cut: float = 10.0,
+        rms_norm: bool = True,
+        peak_norm: bool = False,
     ):
     """
-    Extracts segments from time series data centered around peak RMS values.
-    Returns raw segments and their corresponding binary masks.
-    
-    Args:
-        accel_dict: Dictionary mapping test IDs to time series data.
-        heatmap_dict: Dictionary mapping test IDs to binary mask data (downsampled).
-        chunk_size: Number of test IDs to process in one batch.
-        sample_rate: Sampling rate of the time series data (Hz).
-        segment_duration: Duration of each segment (seconds).
-        percentile: Percentile threshold for peak detection.
-        
-    Returns:
-        Tuple of arrays: (raw_segments, mask_segments, test_ids)
+    Parameters
+    ----------
+    seg : (T, C)      raw window (float32)
+    hp_cut : float    high‑pass cut‑off in Hz for drift removal
+    rms_norm : bool   divide each channel by its σ  (recommended)
+    peak_norm: bool   divide each channel by its max(|x|)
+                     (use at most **one** of rms_norm / peak_norm)
+
+    Returns
+    -------
+    seg_proc : (T, C)  float32
     """
-    window_size = int(sample_rate * segment_duration)
-    half_window = window_size // 2
-    
-    test_ids = list(accel_dict.keys())
-    
-    # Instead of yield, we'll collect all data and return it at once
-    all_raw_segments = []
-    all_mask_segments = []
-    all_test_ids = []
-    
-    # Dictionary to count segments per test ID for debugging
+    # -- 1) remove per‑channel mean ---------------------------------
+    seg = seg - seg.mean(axis=0, keepdims=True)
+
+    # -- 2) high‑pass to kill drift / gravity -----------------------
+    if hp_cut is not None and hp_cut > 0:
+        seg = highpass_filter(seg, cutoff=hp_cut, fs=fs, order=6)
+
+    # -- 3) scale to comparable energy ------------------------------
+    if rms_norm and peak_norm:
+        raise ValueError("Choose either rms_norm OR peak_norm – not both.")
+
+    if rms_norm:                    # preferred
+        sigma = np.maximum(seg.std(axis=0, keepdims=True), 1e-8)
+        seg   = seg / sigma
+    elif peak_norm:
+        peak  = np.maximum(np.abs(seg).max(axis=0, keepdims=True), 1e-8)
+        seg   = seg / peak
+
+    return seg.astype(np.float32)
+
+def segment_and_transform(
+    accel_dict: dict,
+    heatmap_dict: dict,
+    sample_rate: int   = 200,
+    segment_duration: float = 4.0,
+    percentile: float = 99.9,
+    min_separation: float = 0.25,          # s – ignore peaks closer than this
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """
+    Slice every raw trace into fixed‑length windows centred on the largest‑RMS
+    instants and apply per‑segment preprocessing (demean ➜ HP‑filter ➜ min‑max).
+
+    Returns
+    -------
+    raw_segments : (N , win , C)  float32  [-1,1]
+    mask_segments: (N , H  , W)   float32
+    test_ids     : (N,)           int32
+    """
+    win          = int(round(sample_rate * segment_duration))          # samples
+    half_win     = win // 2
+    min_sep_samp = int(round(sample_rate * min_separation))
+
+    all_segs, all_masks, all_ids = [], [], []
     seg_counts = {}
 
-    if test_ids_to_use is not None:
-        test_ids_to_use = set(str(tid) for tid in test_ids_to_use)
-    
-    for i in range(0, len(test_ids), chunk_size):
-        chunk_ids = test_ids[i:i + chunk_size]
-        
-        for test_id in chunk_ids:
-            if test_ids_to_use is not None and str(test_id) not in test_ids_to_use:
-                continue
+    for tid, traces in accel_dict.items():
+        mask = heatmap_dict[tid]
+
+        for ts in traces:                                             # (T,C)
+            # ------- 1.  find candidate peak positions ---------------
+            ts_hp  = highpass_filter(ts, cutoff=2.0, fs=sample_rate, order=4)
+            rms    = np.sqrt(np.mean(ts_hp ** 2, axis=1))             # (T,)
+            thresh = np.percentile(rms, percentile)
+            peaks  = np.where(rms >= thresh)[0]
+
+            # keep only well‑separated peaks (largest first)
+            peaks = peaks[np.argsort(rms[peaks])[::-1]]
+            selected = []
+            for p in peaks:
+                if all(abs(p - q) > min_sep_samp for q in selected):
+                    selected.append(p)
+            # ---------------------------------------------------------
+
+            for pk in selected:
+                start = pk - half_win
+                end   = start + win                                       # non‑inclusive
+
+                # clip to valid range and pad if needed
+                pad_before = max(0, -start)
+                pad_after  = max(0, end - ts.shape[0])
+                start      = max(start, 0)
+                end        = min(end, ts.shape[0])
+
+                seg = ts[start:end, :]
+                if pad_before or pad_after:
+                    seg = np.pad(seg,
+                                 ((pad_before, pad_after), (0, 0)),
+                                 mode="constant")
+
+                if seg.shape[0] != win:          # safety – should not happen
+                    continue
+
+                # ---- per‑segment preprocessing ----------------------
+                seg = preprocess_segment(
+                        seg,
+                        fs=sample_rate,
+                        hp_cut=10.0,          # 10 Hz for bridge vibration spectrum
+                        rms_norm=True,        # σ‑normalisation
+                        peak_norm=False
+                )
+                # ------------------------------------------------------
+
+                all_segs.append(seg.astype(np.float32))
+                all_masks.append(mask.astype(np.float32))
+                all_ids.append(tid)
+                seg_counts[tid] = seg_counts.get(tid, 0) + 1
+
+    print("Segment counts:", seg_counts)
+    print(f"✅ Extracted {len(all_segs)} segments of "
+          f"{segment_duration:.1f} s ({win} samples) each.")
+
+    return (
+        np.stack(all_segs,  axis=0),
+        np.stack(all_masks, axis=0),
+        np.array(all_ids,   dtype=np.int32)
+    )
 
 
-            # Debug: print out the shape of the mask for this test
-            mask_val = heatmap_dict[test_id]
-            try:
-                mask_shape = np.array(mask_val).shape
-            except Exception:
-                mask_shape = "unknown"
-            print(f"Processing Test ID {test_id}: mask shape = {mask_shape}")
-            
-            all_ts = accel_dict[test_id]
-            
-            for ts_raw in all_ts:
-                rms_each_sample = np.sqrt(np.mean(ts_raw**2, axis=1))
-                threshold = np.percentile(rms_each_sample, percentile)
-                peak_indices = np.where(rms_each_sample >= threshold)[0]
-                
-                for pk in peak_indices:
-                    start = pk - half_window
-                    end = pk + half_window
-                    if start < 0:
-                        start = 0
-                        end = window_size
-                    if end > ts_raw.shape[0]:
-                        end = ts_raw.shape[0]
-                        start = end - window_size
-                    if (end - start) < window_size:
-                        continue
-                    
-                    segment_raw = ts_raw[start:end, :]
-                    
-                    all_raw_segments.append(segment_raw)
-                    all_mask_segments.append(heatmap_dict[test_id])
-                    all_test_ids.append(int(test_id))
-                    
-                    seg_counts[test_id] = seg_counts.get(test_id, 0) + 1
-                    
-    # Debug: print summary of segments per test ID
-    unique_test_ids = np.unique(all_test_ids)
-    print("Segment counts by test ID:", seg_counts)
-    print("Unique test IDs from segmentation:", unique_test_ids)
-    
-    # Convert lists to numpy arrays
-    raw_segments = np.array(all_raw_segments, dtype=np.float32)
-    mask_segments = np.array(all_mask_segments, dtype=np.float32)
-    test_ids = np.array(all_test_ids, dtype=np.int32)
-    
-    print(f"Extracted {len(raw_segments)} segments, each with a corresponding test ID.")
-    print(f"Number of unique test IDs in segmentation: {len(unique_test_ids)}")
-    
-    return raw_segments, mask_segments, test_ids
-
-def compute_or_load_spectograms(raw_segments, fs=200, nperseg=256, noverlap=192):
+#--------------- Spectogram computation ---------------
+def compute_or_load_spectrograms(raw_segments, fs=200, nperseg=256, noverlap=192):
     """
     Compute or load cached spectrograms.
     
@@ -364,6 +321,7 @@ def compute_complex_spectrogram(
     print(f"✅ Final spectrogram shape: {all_spectrograms.shape}")
     return all_spectrograms.numpy()
 
+#---------------- caching and time-series reconstruction ----------------
 def cache_final_features(complex_specs, cache_path="cached_spectral_features.npy"):
     """
     If 'cache_path' exists, load it via mmap. Otherwise,
@@ -380,9 +338,6 @@ def cache_final_features(complex_specs, cache_path="cached_spectral_features.npy
 
     return np.load(cache_path)
 
-########################################
-# Data Reconstruction (Spectrograms -> Time Series) & Mask upsample
-########################################
 def inverse_spectrogram(
     complex_spectrograms,
     time_length,
@@ -410,7 +365,7 @@ def inverse_spectrogram(
 
     frame_step = nperseg - noverlap
     batch_size, freq_bins, time_bins, double_channels = complex_spectrograms.shape
-    num_channels = double_channels
+    num_channels = double_channels // 2
     window = torch.hann_window(nperseg)
 
     time_series = torch.zeros((batch_size, time_length, num_channels), dtype=torch.float32)
@@ -433,7 +388,7 @@ def inverse_spectrogram(
                 complex_spec = magnitude * torch.exp(1j * phase)
 
                 # Transpose to shape [time, freq] for PyTorch
-                stft_input = complex_spec.T  # (time_bins, freq_bins)
+                stft_input = complex_spec  # (time_bins, freq_bins)
 
                 # Perform inverse STFT
                 waveform = torch.istft(
@@ -449,6 +404,60 @@ def inverse_spectrogram(
                 time_series[b_abs, :waveform.shape[0], c] = waveform
 
     return time_series.numpy()
+
+######################################
+# Mask pre- and postprocessing
+######################################
+def load_perspective_image(test_id, perspective, labels_dir=LABELS_DIR, target_size=(256,256)):
+    # Your existing code - unchanged
+    label_name = perspective_map.get(perspective)
+    file_path = os.path.join(labels_dir, f"Test_{test_id}", f"{label_name}_T{test_id}.png")
+
+    if not os.path.exists(file_path):
+        return None
+
+    img = cv2.imread(file_path)
+    if img is None:
+        return None
+
+    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    img_resized = cv2.resize(img, target_size, interpolation=cv2.INTER_AREA)
+    return img_resized
+
+def load_combined_label(test_id, labels_dir=LABELS_DIR, image_shape=IMAGE_SHAPE):
+    # Your existing code - unchanged
+    images = [load_perspective_image(test_id, p, labels_dir, (image_shape[0], image_shape[1] // 3)) for p in ['A', 'B', 'C']]
+    images = [img if img is not None else np.zeros((image_shape[0], image_shape[1] // 3, 3), dtype=np.uint8) for img in images]
+    return np.concatenate(images, axis=1)
+
+def compute_binary_mask(combined_image):
+    hsv = cv2.cvtColor(combined_image, cv2.COLOR_RGB2HSV)
+    mask1 = cv2.inRange(hsv, np.array([0, 70, 50]), np.array([10, 255, 255]))
+    mask2 = cv2.inRange(hsv, np.array([170, 70, 50]), np.array([180, 255, 255]))
+    return cv2.bitwise_or(mask1, mask2).astype(np.uint8)
+
+def mask_to_heatmap(orig_mask, target_size=(32, 96), apply_blur=False, blur_kernel=(3,3)):
+    """
+    Converts a high-res binary mask (H×W) to a coarse heatmap (target_size).
+    Each pixel of the heatmap ~ fraction_of_masked_pixels_in_that_region.
+    """
+    # If mask is in {0,255}, convert to {0,1}
+    if orig_mask.max() > 1:
+        orig_mask = (orig_mask > 0).astype(np.float32)
+    
+    # Downsample using INTER_AREA (area averaging)
+    newH, newW = target_size
+    heatmap = cv2.resize(orig_mask.astype(np.float32),
+                         (newW, newH),
+                         interpolation=cv2.INTER_AREA)
+    
+    # Optional smoothing
+    if apply_blur:
+        heatmap = cv2.GaussianBlur(heatmap, blur_kernel, sigmaX=0)
+    
+    # Ensure in [0,1]
+    heatmap = np.clip(heatmap, 0.0, 1.0)
+    return heatmap
 
 def mask_recon(downsampled_masks, target_size=(256, 768), interpolation=cv2.INTER_LINEAR):
     """
@@ -481,108 +490,280 @@ def mask_recon(downsampled_masks, target_size=(256, 768), interpolation=cv2.INTE
 # Data Loading module
 #######################################
 
-def load_data():
-    accel_dict = load_accelerometer_data(DATA_DIR, SKIP_TESTS)
-    binary_masks = {}
-    heatmaps = {}
+# ====================== data_loader.py ==============================
+def load_data(segment_duration: float = 4.0,
+              nperseg: int        = 256,
+              noverlap: int       = 192,
+              sample_rate: int    = 200,
+              recompute: bool     = False,
+              cache_dir: str      = "cache"):
+    """
+    Unified loader.
+    ───────────────
+    * Always returns the three dictionaries you already use
+      (accel_dict, binary_masks, heatmaps).
+    * Additionally returns:
+        segments      : (N, win, C)    pre‑processed windows
+        spectrograms  : (N, F, T, 2C)  log‑mag | phase
+        test_ids      : (N,)           int32  – ID per segment
+    * `segment_duration`, `nperseg`, `noverlap`
+      are **baked into the cache file‑names** so multiple
+      configs can coexist.
+    """
+    # -----------------------------------------------------------------
+    accel_dict, binary_masks, heatmaps = load_accelerometer_data(
+        DATA_DIR, SKIP_TESTS), {}, {}
 
-    test_ids = sorted(accel_dict.keys())
-    
-    for test_id in test_ids:
-        if test_id in SKIP_TESTS:
+    for tid in sorted(accel_dict.keys()):
+        if tid in SKIP_TESTS:
             continue
+        comb = load_combined_label(tid, LABELS_DIR, IMAGE_SHAPE)
+        bin_mask = compute_binary_mask(comb)
+        binary_masks[tid] = bin_mask
+        heatmap = mask_to_heatmap(bin_mask, (32, 96), True, (3, 3))
+        heatmaps[tid] = heatmap[..., None]                 # (32,96,1)
+    # -----------------------------------------------------------------
+    # ---- caching ----
+    os.makedirs(cache_dir, exist_ok=True)
+    tag = f"{segment_duration:.2f}s_{nperseg}_{noverlap}"
+    seg_path  = os.path.join(cache_dir, f"segments_{tag}.npy")
+    id_path   = os.path.join(cache_dir, f"segIDs_{tag}.npy")
+    spec_path = os.path.join(cache_dir, f"specs_{tag}.npy")
 
-        combined_image = load_combined_label(test_id, LABELS_DIR, IMAGE_SHAPE)
-        binary_mask = compute_binary_mask(combined_image)
+    if not recompute and all(os.path.exists(p) for p in (seg_path, id_path, spec_path)):
+        print("📂  Loading segments & spectrograms from cache …")
+        segments     = np.load(seg_path,  mmap_mode="r")
+        test_ids     = np.load(id_path,   mmap_mode="r")
+        spectrograms = np.load(spec_path, mmap_mode="r")
+        return (accel_dict, binary_masks, heatmaps,
+                segments, spectrograms, test_ids)
 
-        # Store original binary mask
-        binary_masks[test_id] = binary_mask
+    # -----------------------------------------------------------------
+    print("✂️  Segmenting traces …")
+    segments, masks, test_ids = segment_and_transform(
+        accel_dict, heatmaps,
+        sample_rate      = sample_rate,
+        segment_duration = segment_duration)
 
-        # Create a coarse heatmap (32×96) without blur
-        heatmap_coarse = mask_to_heatmap(binary_mask, target_size=(32, 96), apply_blur=True, blur_kernel=(3, 3))
-        # Expand dims so shape is (32, 96, 1)
-        heatmaps[test_id] = np.expand_dims(heatmap_coarse, axis=-1)
+    print("🔄  Computing/ caching spectrograms …")
+    spectrograms = compute_or_load_spectrograms(
+        segments,
+        fs       = sample_rate,
+        nperseg  = nperseg,
+        noverlap = noverlap)
 
-    return accel_dict, binary_masks, heatmaps
+    np.save(seg_path,  segments)
+    np.save(id_path,   test_ids)
+    np.save(spec_path, spectrograms)
+    print(f"✅  Cached → {cache_dir}")
+
+    return (accel_dict, binary_masks, heatmaps,
+            segments, spectrograms, test_ids)
+
 
 ######################################
 # For testing and visualization
 ######################################
 def main():
-    # Load data
-    accel_dict, binary_masks, heatmaps = load_data()
+    print("🚀 Starting main()...")
 
-    test_ids = sorted(accel_dict.keys())
-    if not test_ids:
-        print("No data loaded, check your data path or skip-tests list.")
-        return
+    # ---------------------------------------------------------------
+    # 0.  Hyper‑parameters for windowing / STFT
+    # ---------------------------------------------------------------
+    SEG_LEN   = 4.0      # [s] – window length used in the global cache
+    NPERSEG   = 256
+    NOVERLAP  = 224
+    fs        = 200      # [Hz] – sampling rate
+
+    # ---------------------------------------------------------------
+    # 1.  Load everything (accel_dict + masks + *optionally* segments)
+    # ---------------------------------------------------------------
+    (accel_dict, binary_masks, heatmaps,
+    segments, specs, segIDs) = load_data(
+            segment_duration = SEG_LEN,
+            nperseg          = NPERSEG,
+            noverlap         = NOVERLAP,
+            recompute        = False)      # True → overwrite cache
+
+    print("✅ Data loaded.")
+    print(f"   • accel_dict tests .......... {len(accel_dict):>5}")
+    print(f"   • cached segments  .......... {segments.shape}")
+    print(f"   • cached spectrograms ....... {specs.shape}")
+
+    # ---------------------------------------------------------------
+    # 2.  Pick one random raw trace  (unchanged code below)
+    # ---------------------------------------------------------------
+    tid    = random.choice(list(accel_dict.keys()))
+    ts_raw = random.choice(accel_dict[tid])
+    n_chan = ts_raw.shape[1]
+    print(f"🧪 Using Test {tid} – trace with shape {ts_raw.shape}")
+
+    # ---------------------------------------------------------------
+    # 3.  Full‑trace RMS to find the loudest instant
+    # ---------------------------------------------------------------
+    rms      = np.sqrt(np.mean(highpass_filter(ts_raw, 2.0, fs, 4)**2,
+                               axis=1))
+    thresh   = np.percentile(rms, 99.5)
+    peak_idx = int(np.argmax(rms))                            # global max
+
+    # ---------------------------------------------------------------
+    # 4.  Extract 5‑s window centred on that peak
+    # ---------------------------------------------------------------
+    win      = int(fs * 5.0)                                  # samples
+    half_win = win // 2
+    start    = max(0, peak_idx - half_win)
+    end      = start + win
+    if end > ts_raw.shape[0]:                                 # shift if needed
+        end   = ts_raw.shape[0]
+        start = end - win
+    segment  = ts_raw[start:end, :]                           # (win, C)
+
+    # ---------------------------------------------------------------
+    # 5.  Pre‑processing chain for visual inspection
+    # ---------------------------------------------------------------
+    seg_zero = segment - segment.mean(axis=0, keepdims=True)       # demean
+    seg_hp   = highpass_filter(seg_zero, cutoff=10.0, fs=fs,
+                               order=6)                            # HP 10 Hz
+    seg_proc = preprocess_segment(segment, fs=fs,
+                                  hp_cut=10.0, rms_norm=True)      # final
+
+    stages  = [segment, seg_zero, seg_hp, seg_proc]
+    labels  = ["Original",
+               "Zero‑mean",
+               "HP > 10 Hz",
+               "HP + σ‑norm (final)"]
     
-    first_test_id = test_ids[0]
-    samples_for_first_test = accel_dict[first_test_id]
+    # ------------------------- NEW  --------------------------------
+    # Compute STFT of the final‑processed window for demo purposes
+    spec_demo = compute_complex_spectrogram(
+                    seg_proc[None, ...],     # add batch‑dim
+                    fs       = fs,
+                    nperseg  = NPERSEG,
+                    noverlap = NOVERLAP)[0]   # (F,T,2C) → remove batch
 
-    if not samples_for_first_test:
-        print(f"No samples found in Test ID {first_test_id}.")
-        return
+    F, T, _ = spec_demo.shape
+    mag_demo = spec_demo[:, :, 0]            # log‑mag of channel 0
 
-    # In your CSV data, each "sample" is a (time_steps×channels) np.array
-    # We'll just pick the first sample
-    raw_sample = samples_for_first_test[0]  # shape ~ (12000, 12) if 60 s at 200 Hz
+    # ---------------------------------------------------------------
+    # 6.  FIG 1 – RMS over full trace with chosen window highlighted
+    # ---------------------------------------------------------------
+    t_full = np.arange(len(rms)) / fs
+    fig1, ax1 = plt.subplots(figsize=(12, 3))
+    ax1.plot(t_full, rms, label="RMS")
+    ax1.axhline(thresh, color="crimson", ls="--",
+                label="99.5‑percentile")
+    ax1.axvspan(start / fs, end / fs, color="gold", alpha=.25,
+                label="chosen 5 s window")
+    ax1.set(title=f"RMS – Test {tid}", xlabel="Time [s]", ylabel="RMS")
+    ax1.grid(alpha=.3); ax1.legend()
+    plt.show()
 
-    # Plot amplitude vs. time for each channel
-    fs = 200.0  # or your known sampling rate
-    time_axis = np.arange(raw_sample.shape[0]) / fs  # in seconds
+    # ---------------------------------------------------------------
+    # 7.  FIG 2 – Evolution of the 5‑s window through the pipeline
+    # ---------------------------------------------------------------
+    t_seg = np.arange(win) / fs
+    fig2, axes = plt.subplots(len(stages), 1,
+                              figsize=(12, 2.4 * len(stages)))
 
-    plt.figure(figsize=(12,6))
-    for ch in range(raw_sample.shape[1]):
-        plt.plot(time_axis, raw_sample[:, ch], label=f"Ch {ch+1}")
+    for ax, data, lbl in zip(axes, stages, labels):
+        for c in range(n_chan):
+            ax.plot(t_seg, data[:, c], lw=.8, alpha=.7)
+        ax.set_title(lbl, loc="left", fontsize=11)
+        ax.set_ylabel("Amplitude")
+        ax.set_xlabel("Time [s]")
+        ax.grid(alpha=.3)
 
-    plt.title(f"Test ID {first_test_id}: First 60s sample (12 channels)")
-    plt.xlabel("Time (s)")
-    plt.ylabel("Amplitude")
-    plt.legend()
+    fig2.suptitle(f"All {n_chan} channels – 5‑s window centred on max‑RMS "
+                  f"(Test {tid})",
+                  y=1.02, fontsize=14)
+    fig2.tight_layout()
+    plt.show()
+
+    # ---------------------------------------------------------------
+    # 8.  FIG 3 –  log‑magnitude spectrogram of processed window
+    # ---------------------------------------------------------------
+    plt.figure(figsize=(8, 4))
+    plt.imshow(mag_demo,
+            origin="lower",
+            aspect="auto",
+            cmap="viridis")
+    plt.colorbar(label="log(1 + |STFT|)")
+    plt.title("Channel 0  •  log‑magnitude spectrogram "
+            f"(win={SEG_LEN:.1f} s, nperseg={NPERSEG})")
+    plt.xlabel("Time bins");  plt.ylabel("Frequency bins")
     plt.tight_layout()
     plt.show()
 
-    # Choose three test IDs you want to visualize (change these IDs to whatever exist in your dataset)
-    test_ids = [8, 18, 25]  # Example IDs - update as needed
 
-    for tid in test_ids:
-        if tid not in binary_masks or tid not in heatmaps:
-            print(f"Test ID {tid} not found in data. Skipping.")
-            continue
+
+    # test_ids = sorted(accel_dict.keys())
+    # first_test_id = test_ids[0]
+    # samples_for_first_test = accel_dict[first_test_id]
+    # # In your CSV data, each "sample" is a (time_steps×channels) np.array
+    # # We'll just pick the first sample
+    # raw_sample = samples_for_first_test[0]  # shape ~ (12000, 12) if 60 s at 200 Hz
+
+    # # Plot amplitude vs. time for each channel
+    # fs = 200.0  # or your known sampling rate
+    # time_axis = np.arange(raw_sample.shape[0]) / fs  # in seconds
+
+    # plt.figure(figsize=(12,6))
+    # for ch in range(raw_sample.shape[1]):
+    #     plt.plot(time_axis, raw_sample[:, ch], label=f"Ch {ch+1}")
+
+    # plt.title(f"Test ID {first_test_id}: First 60s sample (12 channels)")
+    # plt.xlabel("Time (s)")
+    # plt.ylabel("Amplitude")
+    # plt.legend()
+    # plt.tight_layout()
+    # plt.show()
+
+    # # Choose three test IDs you want to visualize (change these IDs to whatever exist in your dataset)
+    # test_ids = [8, 18, 25]  # Example IDs - update as needed
+
+    # for tid in test_ids:
+    #     if tid not in binary_masks or tid not in heatmaps:
+    #         print(f"Test ID {tid} not found in data. Skipping.")
+    #         continue
         
-        mask = binary_masks[tid]         # shape (256,768), values {0,255}
-        heatmap_3d = heatmaps[tid]      # shape (32,96,1)
-        heatmap_2d = np.squeeze(heatmap_3d, axis=-1)  # (32,96), float in [0,1]
+    #     mask = binary_masks[tid]         # shape (256,768), values {0,255}
+    #     heatmap_3d = heatmaps[tid]      # shape (32,96,1)
+    #     heatmap_2d = np.squeeze(heatmap_3d, axis=-1)  # (32,96), float in [0,1]
 
-        # For demonstration, also create a blurred version:
-        heatmap_blur_2d = mask_to_heatmap(mask, target_size=(32,96), apply_blur=True, blur_kernel=(3,3))
+    #     # For demonstration, also create a blurred version:
+    #     heatmap_blur_2d = mask_to_heatmap(mask, target_size=(32,96), apply_blur=True, blur_kernel=(3,3))
 
-        # "Reconstructed" (upsampled) heatmap back to 256×768
-        upsampled = cv2.resize(heatmap_2d, (mask.shape[1], mask.shape[0]), interpolation=cv2.INTER_LINEAR)
-        upsampled_blur = cv2.resize(heatmap_blur_2d, (mask.shape[1], mask.shape[0]), interpolation=cv2.INTER_LINEAR)
+    #     # "Reconstructed" (upsampled) heatmap back to 256×768
+    #     upsampled = cv2.resize(heatmap_2d, (mask.shape[1], mask.shape[0]), interpolation=cv2.INTER_LINEAR)
+    #     upsampled_blur = cv2.resize(heatmap_blur_2d, (mask.shape[1], mask.shape[0]), interpolation=cv2.INTER_LINEAR)
 
-        # Plot: Original, coarse, blurred coarse, and upsampled
-        fig, axes = plt.subplots(1, 5, figsize=(20, 5))
+    #     # Plot: Original, coarse, blurred coarse, and upsampled
+    #     fig, axes = plt.subplots(1, 5, figsize=(20, 5))
 
-        axes[0].imshow(mask, cmap='gray')
-        axes[0].set_title(f"Original Binary Mask ")
+    #     axes[0].imshow(mask, cmap='gray')
+    #     axes[0].set_title(f"Original Binary Mask ")
 
-        axes[1].imshow(heatmap_2d, cmap='hot')
-        axes[1].set_title("Coarse Heatmap (32×96)")
+    #     axes[1].imshow(heatmap_2d, cmap='hot')
+    #     axes[1].set_title("Coarse Heatmap (32×96)")
 
-        axes[2].imshow(heatmap_blur_2d, cmap='hot')
-        axes[2].set_title("Blurred Heatmap (32×96)")
+    #     axes[2].imshow(heatmap_blur_2d, cmap='hot')
+    #     axes[2].set_title("Blurred Heatmap (32×96)")
 
-        axes[3].imshow(upsampled, cmap='hot')
-        axes[3].set_title("Upsampled (From Unblurred)")
+    #     axes[3].imshow(upsampled, cmap='hot')
+    #     axes[3].set_title("Upsampled (From Unblurred)")
 
-        axes[4].imshow(upsampled_blur, cmap='hot')
-        axes[4].set_title("Upsampled (From Blurred)")
+    #     axes[4].imshow(upsampled_blur, cmap='hot')
+    #     axes[4].set_title("Upsampled (From Blurred)")
 
-        plt.tight_layout()
-        plt.show()
+    #     plt.tight_layout()
+    #     plt.show()
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        import traceback
+        print("❌ Uncaught exception:", e)
+        traceback.print_exc()
+

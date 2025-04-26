@@ -2,8 +2,8 @@ import tensorflow as tf
 import numpy as np
 
 # Constants for numerical stability
-EPSILON = 1e-8
-LOGVAR_MIN = -10.0
+EPSILON = 1e-6
+LOGVAR_MIN = -20.0
 LOGVAR_MAX = 8.0
 
 def reparameterize(mean, logvar):
@@ -24,6 +24,7 @@ def reparameterize(mean, logvar):
     
     eps = tf.random.normal(shape=tf.shape(mean), dtype=tf.float32)
     std = tf.exp(0.5 * logvar)
+    std = tf.maximum(std, EPSILON)
     return mean + eps * std
 
 def compute_kl_divergence(mu_q, logvar_q, mu_p=None, logvar_p=None):
@@ -57,16 +58,22 @@ def compute_kl_divergence(mu_q, logvar_q, mu_p=None, logvar_p=None):
         # Clip p distribution logvar as well
         logvar_p = tf.clip_by_value(logvar_p, LOGVAR_MIN, LOGVAR_MAX)
         
-        # Compute variances with epsilon for stability
-        var_q = tf.exp(logvar_q) + EPSILON
-        var_p = tf.exp(logvar_p) + EPSILON
-        
-        # Compute KL divergence between two Gaussians
+        # compute the variances
+        var_q = tf.exp(logvar_q)
+        var_p = tf.exp(logvar_p)
+
+        # clamp them to be at least EPSILON
+        var_q = tf.maximum(var_q, EPSILON)
+        var_p = tf.maximum(var_p, EPSILON)
+
+        # now safe to do the KL formula
         kl = 0.5 * tf.reduce_sum(
-            logvar_p - logvar_q + (var_q + tf.square(mu_q - mu_p)) / var_p - 1,
+            logvar_p - logvar_q +
+            (var_q + tf.square(mu_q - mu_p)) / var_p -
+            1,
             axis=-1
         )
-    
+
     # Apply tf.maximum to avoid extreme negative values
     return tf.reduce_mean(tf.maximum(kl, 0.0))
 
@@ -110,7 +117,8 @@ def compute_mixture_prior(mus, logvars):
     mu_diff_sq = tf.reduce_mean(tf.square(all_mus - mixture_mu[tf.newaxis, :, :]), axis=0)
     
     # Total variance is mean of variances plus variance of means, add epsilon for stability
-    mixture_var = mean_var + mu_diff_sq + EPSILON
+    mixture_var = mean_var + mu_diff_sq
+    mixture_var = tf.maximum(mixture_var, EPSILON)      # enforce > 0
     mixture_logvar = tf.math.log(mixture_var)
     
     # Final clip on the mixture logvar
@@ -136,40 +144,37 @@ def compute_js_divergence(mus, logvars):
     mus = [tf.cast(m, tf.float32) for m in mus]
     logvars = [tf.cast(lv, tf.float32) for lv in logvars]
 
-    # Handle empty or single distributions
     num_modalities = len(mus)
     if num_modalities <= 1:
         return tf.constant(0.0, dtype=tf.float32)
-    
-    # Compute mixture prior parameters
+
     try:
         mixture_mu, mixture_logvar = compute_mixture_prior(mus, logvars)
     except ValueError:
-        # Return zero if mixture computation fails
         return tf.constant(0.0, dtype=tf.float32)
-    
-    # Compute KL divergence for each modality from the mixture
+
     kl_divs = []
     for i in range(num_modalities):
-        # Clip inputs to KL computation
-        mu_i = tf.clip_by_norm(mus[i], 10.0, axes=-1)  # Prevent extreme means
+        mu_i = tf.clip_by_norm(mus[i], 10.0, axes=-1)
         logvar_i = tf.clip_by_value(logvars[i], LOGVAR_MIN, LOGVAR_MAX)
-        
-        kl_div = compute_kl_divergence(
-            mu_i, logvar_i, 
-            mixture_mu, mixture_logvar
-        )
-        kl_divs.append(kl_div)
-    
-    # Compute JS divergence (average of KLs)
-    js_div = tf.reduce_mean(tf.stack(kl_divs))
-    
-    # Scale by number of modalities (as in paper)
-    # This is because JS = (1/M) * sum(KL(q_i || mixture))
-    scaled_js = js_div * num_modalities
-    
-    # Final clip to prevent extreme values
-    return tf.clip_by_value(scaled_js, 0.0, 1000.0)
+        kl = compute_kl_divergence(mu_i, logvar_i, mixture_mu, mixture_logvar)
+        kl_divs.append(kl)
+
+    kl_divs = tf.stack(kl_divs)
+    is_finite = tf.math.is_finite(kl_divs)
+    safe_kl_divs = tf.boolean_mask(kl_divs, is_finite)
+
+    num_masked = tf.reduce_sum(tf.cast(tf.logical_not(is_finite), tf.int32))
+    tf.print("⚠️ JS divergence: masked", num_masked, "non-finite KL terms")
+
+    if tf.size(safe_kl_divs) > 0:
+        js_div = tf.reduce_mean(safe_kl_divs)
+    else:
+        tf.print("⚠️ JS divergence: all KL terms were invalid, returning 0")
+        js_div = tf.constant(0.0, dtype=tf.float32)
+
+    return tf.clip_by_value(js_div, 0.0, 1000.0)
+
 
 def sample_from_mixture_prior(mus, logvars):
     """
