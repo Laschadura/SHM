@@ -20,7 +20,7 @@ import cv2
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from custom_distributions import reparameterize 
 import data_loader
-from data_loader import inverse_spectrogram 
+from data_loader import inverse_spectrogram, mask_recon, inspect_frequency_content
 from vae_generator import (
     SpectralMMVAE,
 )
@@ -317,20 +317,31 @@ def generate_conditional_samples(model, cached, save_dir="conditional_samples"):
 
     print(f"✅  Generated samples for {len(processed)} unique test IDs")
 
+import os
+import numpy as np
+import matplotlib.pyplot as plt
+import tensorflow as tf
+from pathlib import Path
+from data_loader import mask_recon, inspect_frequency_content
+
 def test_reconstruction(model, cached, save_dir="reconstruction_tests"):
     """
     One segment per test-ID → four plot groups (mask, spec, overlay,
-    per-channel) plus RMS metrics – all from cached arrays.
+    per-channel, PSD) from cached arrays.
     """
-    os.makedirs(save_dir, exist_ok=True)
+    base_dir = Path(save_dir)
+    ts_dir   = base_dir / "ts"
+    psd_dir  = base_dir / "psd"
+    spec_dir = base_dir / "spec"
+    mask_dir = base_dir / "masks"
 
-    specs    = cached["specs"]                # (N, F, T, 2C)
-    raw_seg  = cached["segments"]             # (N, time, C)
-    test_ids = cached["test_ids"]             # (N,)
-    mask_dict = (
-        cached.get("heatmaps_per_segment", None)
-        or cached["heatmaps"]
-    )
+    for d in (ts_dir, psd_dir, spec_dir, mask_dir):
+        d.mkdir(parents=True, exist_ok=True)
+
+    specs    = cached["specs"]
+    raw_seg  = cached["segments"]
+    test_ids = cached["test_ids"]
+    mask_dict = cached.get("heatmaps_per_segment", cached["heatmaps"])
     masks_np  = np.stack([mask_dict[int(tid)] for tid in test_ids], axis=0)
 
     specs_tf = tf.convert_to_tensor(specs)
@@ -338,84 +349,113 @@ def test_reconstruction(model, cached, save_dir="reconstruction_tests"):
 
     unique_ids = np.unique(test_ids)
     for tid in unique_ids:
-        # pick first segment for this tid
         idx = np.where(test_ids == tid)[0][0]
-
         spec_in = specs_tf[idx : idx + 1]
         mask_in = masks_tf[idx : idx + 1]
 
-        # run through VAE
         recon_spec, recon_mask, _ = model(spec_in, mask_in, training=False)
-
-        orig_ts = raw_seg[idx]   # (time, C)
+        orig_ts = raw_seg[idx]
         recon_ts = model.reconstruct_time_series(
-            recon_spec.numpy(),
-            fs=200,
-            nperseg=256,
-            noverlap=224,
-            time_length=orig_ts.shape[0]
-        )  # yields shape (1, time, C)
-        recon_ts = recon_ts.squeeze(0)
+            recon_spec.numpy(), fs=200, nperseg=256, noverlap=224, time_length=orig_ts.shape[0]
+        )[0]
 
-        # ——————————————————————————————————————————————
-        # 1) Overlay all 12 channels
         t = np.linspace(0, 4, orig_ts.shape[0])
-        plt.figure(figsize=(15,4))
+
+        # Overlay all channels
+        plt.figure(figsize=(15, 4))
         for ch in range(orig_ts.shape[1]):
             scale = orig_ts[:,ch].std() / (recon_ts[:,ch].std() + 1e-8)
-            plt.plot(t, orig_ts[:,ch],            color="royalblue", lw=0.8, alpha=0.6)
-            plt.plot(t, recon_ts[:,ch]*scale,     color="crimson",   lw=0.8, alpha=0.6)
+            plt.plot(t, orig_ts[:,ch], color="royalblue", lw=0.8, alpha=0.6)
+            plt.plot(t, recon_ts[:,ch]*scale, color="crimson", lw=0.8, alpha=0.6)
         plt.title(f"Test {tid} • Original vs Recon (all channels)")
         plt.xlabel("Time [s]"); plt.ylabel("Amplitude"); plt.grid(alpha=0.25)
-        plt.legend(["Original","Reconstructed"], framealpha=0.7)
+        plt.legend(["Original", "Reconstructed"], framealpha=0.7)
         plt.tight_layout()
-        plt.savefig(f"{save_dir}/test{tid}_ts_overlay.png", dpi=300)
+        plt.savefig(ts_dir / f"test{tid}_ts_overlay.png", dpi=300)
         plt.close()
 
-        # 2) Per-channel subplots (6 rows × 2 cols)
-        fig, axs = plt.subplots(6, 2, figsize=(14,10))
+        # Per-channel subplots
+        fig, axs = plt.subplots(6, 2, figsize=(14, 10))
         for ch in range(orig_ts.shape[1]):
-            ax = axs[ch//2, ch%2]
+            ax = axs[ch // 2, ch % 2]
             scale = orig_ts[:,ch].std() / (recon_ts[:,ch].std() + 1e-8)
-            ax.plot(t, orig_ts[:,ch],           color="royalblue", lw=0.7, alpha=0.7)
-            ax.plot(t, recon_ts[:,ch]*scale,    color="crimson",   lw=0.7, alpha=0.7)
+            ax.plot(t, orig_ts[:,ch], color="royalblue", lw=0.7, alpha=0.7)
+            ax.plot(t, recon_ts[:,ch]*scale, color="crimson", lw=0.7, alpha=0.7)
             ax.set_title(f"Channel {ch+1}")
             ax.grid(alpha=0.3)
-        fig.legend(["Original","Reconstructed"], loc="upper right", framealpha=0.7)
+        fig.legend(["Original", "Reconstructed"], loc="upper right", framealpha=0.7)
         plt.tight_layout()
-        plt.savefig(f"{save_dir}/test{tid}_ts_subplots.png", dpi=300)
+        plt.savefig(ts_dir / f"test{tid}_ts_subplots.png", dpi=300)
         plt.close()
 
-        # 3) Spectrogram comparison (Channel 1)
-        orig_spec = specs[idx, :, :, 0]               # (F, T)
+        # Spectrogram comparison (Ch1)
+        orig_spec = specs[idx, :, :, 0]
         recon_spec_ch1 = recon_spec.numpy()[0, :, :, 0]
-        fig, (ax1,ax2) = plt.subplots(1, 2, figsize=(12,5), sharey=True)
-        im1 = ax1.imshow(orig_spec,    origin="lower", aspect="auto", cmap="viridis")
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5), sharey=True)
+        im1 = ax1.imshow(orig_spec, origin="lower", aspect="auto", cmap="viridis")
         ax1.set_title(f"Original Spectrogram (Ch1) • Test {tid}")
-        ax1.set_xlabel("Time bins"); ax1.set_ylabel("Freq bins")
         plt.colorbar(im1, ax=ax1)
-
         im2 = ax2.imshow(recon_spec_ch1, origin="lower", aspect="auto", cmap="viridis")
         ax2.set_title("Reconstructed Spectrogram (Ch1)")
-        ax2.set_xlabel("Time bins")
         plt.colorbar(im2, ax=ax2)
-
         plt.tight_layout()
-        plt.savefig(f"{save_dir}/test{tid}_spectrogram_comparison.png", dpi=300)
+        plt.savefig(spec_dir / f"test{tid}_spectrogram_comparison.png", dpi=300)
         plt.close()
 
-        # 4) Mask comparison at full resolution (256×768)
-        high_gt  = data_loader.mask_recon(mask_dict[tid][None])[0]
-        high_rec = data_loader.mask_recon(recon_mask.numpy())[0]
-        fig, (m1,m2) = plt.subplots(1, 2, figsize=(12,4))
-        m1.imshow(high_gt, cmap="gray", aspect="auto")
-        m1.set_title("Original Mask (256×768)"); m1.axis("off")
-        m2.imshow(high_rec, cmap="gray", aspect="auto")
-        m2.set_title("Reconstructed Mask"); m2.axis("off")
+        # Mask comparison
+        high_gt  = mask_recon(mask_dict[tid][None])[0]
+        high_rec = mask_recon(recon_mask.numpy())[0]
+        fig, (m1, m2) = plt.subplots(1, 2, figsize=(12, 4))
+        m1.imshow(high_gt, cmap="gray", aspect="auto"); m1.set_title("Original Mask"); m1.axis("off")
+        m2.imshow(high_rec, cmap="gray", aspect="auto"); m2.set_title("Reconstructed Mask"); m2.axis("off")
         plt.tight_layout()
-        plt.savefig(f"{save_dir}/test{tid}_mask_comparison.png", dpi=300)
+        plt.savefig(mask_dir / f"test{tid}_mask_comparison.png", dpi=300)
         plt.close()
-        # ——————————————————————————————————————————————
+
+        # PSD plots
+        fs = 200
+        f, psd_orig = data_loader.inspect_frequency_content(orig_ts[None], fs=fs, avg_over_segments=False)
+        _, psd_recon = data_loader.inspect_frequency_content(recon_ts[None], fs=fs, avg_over_segments=False)
+        psd_orig, psd_recon = psd_orig[0], psd_recon[0]  # (freq, C)
+
+        # Per-channel PSD
+        C = psd_orig.shape[1]
+        fig, axs = plt.subplots((C+1)//2, 2, figsize=(14, 4*((C+1)//2)))
+        axs = axs.ravel()
+        for ch in range(C):
+            ax = axs[ch]
+            ax.semilogy(f, psd_orig[:,ch], color="royalblue", lw=0.8, label="Orig" if ch==0 else None)
+            ax.semilogy(f, psd_recon[:,ch], color="crimson", lw=0.8, label="Recon" if ch==0 else None)
+            ax.fill_between(f, psd_orig[:,ch], psd_recon[:,ch],
+                            where=psd_recon[:,ch] > psd_orig[:,ch],
+                            color="crimson", alpha=0.2)
+            ax.fill_between(f, psd_orig[:,ch], psd_recon[:,ch],
+                            where=psd_recon[:,ch] < psd_orig[:,ch],
+                            color="royalblue", alpha=0.2)
+            ax.set_title(f"Ch {ch+1}")
+            ax.grid(alpha=0.3)
+        for ch in range(C, len(axs)): axs[ch].axis("off")
+        fig.legend(loc="upper right", framealpha=0.8)
+        fig.suptitle(f"Test {tid} • PSD comparison (per-channel)")
+        plt.tight_layout()
+        plt.savefig(psd_dir / f"test{tid}_psd_subplots.png", dpi=300)
+        plt.close()
+
+        # Mean PSD
+        mean_orig = psd_orig.mean(axis=1)
+        mean_recon = psd_recon.mean(axis=1)
+        lo_o, hi_o = np.percentile(psd_orig, [2.5, 97.5], axis=1)
+        lo_r, hi_r = np.percentile(psd_recon, [2.5, 97.5], axis=1)
+        plt.figure(figsize=(8,4))
+        plt.semilogy(f, mean_orig, label="Orig (mean)", color="royalblue")
+        plt.semilogy(f, mean_recon, label="Recon (mean)", color="crimson")
+        plt.fill_between(f, lo_o, hi_o, color="royalblue", alpha=0.15)
+        plt.fill_between(f, lo_r, hi_r, color="crimson", alpha=0.15)
+        plt.title(f"Test {tid} • PSD averaged over {C} channels")
+        plt.xlabel("Frequency [Hz]"); plt.ylabel("PSD [V²/Hz]"); plt.grid(alpha=0.3)
+        plt.legend(); plt.tight_layout()
+        plt.savefig(psd_dir / f"test{tid}_psd_mean.png", dpi=300)
+        plt.close()
 
         print(f"✓  reconstruction plots saved for Test {tid}")
 

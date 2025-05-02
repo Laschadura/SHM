@@ -10,7 +10,7 @@ import torch
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from scipy.signal import butter, filtfilt
+from scipy.signal import butter, filtfilt, welch
 from scipy.interpolate import splprep, splev
 
 ######################################
@@ -108,7 +108,6 @@ def load_accelerometer_data(data_dir=DATA_DIR, skip_tests=SKIP_TESTS):
 def preprocess_segment(
         seg: np.ndarray,
         fs: int = 200,
-        hp_cut: float = 10.0,
         rms_norm: bool = True,
         peak_norm: bool = False,
     ):
@@ -128,11 +127,7 @@ def preprocess_segment(
     # -- 1) remove per‑channel mean ---------------------------------
     seg = seg - seg.mean(axis=0, keepdims=True)
 
-    # -- 2) high‑pass to kill drift / gravity -----------------------
-    if hp_cut is not None and hp_cut > 0:
-        seg = highpass_filter(seg, cutoff=hp_cut, fs=fs, order=6)
-
-    # -- 3) scale to comparable energy ------------------------------
+    # -- 2) scale to comparable energy ------------------------------
     if rms_norm and peak_norm:
         raise ValueError("Choose either rms_norm OR peak_norm – not both.")
 
@@ -175,7 +170,7 @@ def segment_and_transform(
 
         for ts in traces:                                             # (T,C)
             # ------- 1.  find candidate peak positions ---------------
-            ts_hp  = highpass_filter(ts, cutoff=2.0, fs=sample_rate, order=4)
+            ts_hp  = highpass_filter(ts, cutoff=10.0, fs=sample_rate, order=6)
             rms    = np.sqrt(np.mean(ts_hp ** 2, axis=1))             # (T,)
             thresh = np.percentile(rms, percentile)
             peaks  = np.where(rms >= thresh)[0]
@@ -211,7 +206,6 @@ def segment_and_transform(
                 seg = preprocess_segment(
                         seg,
                         fs=sample_rate,
-                        hp_cut=10.0,          # 10 Hz for bridge vibration spectrum
                         rms_norm=True,        # σ‑normalisation
                         peak_norm=False
                 )
@@ -373,7 +367,6 @@ def inverse_spectrogram(
     total_batches = (batch_size + batch_processing_size - 1) // batch_processing_size
 
     for batch_idx in range(total_batches):
-        print(f"🔁 Reconstructing batch {batch_idx + 1}/{total_batches}")
         start_idx = batch_idx * batch_processing_size
         end_idx = min((batch_idx + 1) * batch_processing_size, batch_size)
 
@@ -487,10 +480,56 @@ def mask_recon(downsampled_masks, target_size=(256, 768), interpolation=cv2.INTE
     return recon_masks
 
 #######################################
+# Postprocessing analysis
+#######################################
+def inspect_frequency_content(
+        segments: np.ndarray,
+        fs: float = 200.0,
+        nfft: int = 1024,
+        avg_over_segments: bool = False,
+    ):
+    """
+    Compute the frequency content (Power Spectral Density, PSD) of segments.
+
+    Args:
+        segments (np.ndarray): Array of shape (N, T, C).
+                               N = number of segments,
+                               T = time steps,
+                               C = number of channels.
+        fs (float): Sampling frequency in Hz.
+        nfft (int): Number of FFT points for Welch's method.
+        avg_over_segments (bool): Whether to average PSDs across segments.
+
+    Returns:
+        f (np.ndarray): Frequency vector (Hz).
+        psd (np.ndarray): 
+            If avg_over_segments=True: shape (freq, channels).
+            If avg_over_segments=False: shape (segments, freq, channels).
+    """
+    N, T, C = segments.shape
+    frame_length = min(T, nfft)   # automatic handling if segment shorter than nfft
+    all_psd = []
+
+    for i in range(N):
+        psd_per_seg = []
+        for ch in range(C):
+            f, Pxx = welch(segments[i, :, ch], fs=fs, nperseg=frame_length)
+            psd_per_seg.append(Pxx)
+        psd_per_seg = np.stack(psd_per_seg, axis=-1)  # (freq, channels)
+        all_psd.append(psd_per_seg)
+
+    all_psd = np.stack(all_psd, axis=0)  # (segments, freq, channels)
+
+    if avg_over_segments:
+        psd_avg = np.mean(all_psd, axis=0)  # (freq, channels)
+        return f, psd_avg
+    else:
+        return f, all_psd
+
+
+#######################################
 # Data Loading module
 #######################################
-
-# ====================== data_loader.py ==============================
 def load_data(segment_duration: float = 4.0,
               nperseg: int        = 256,
               noverlap: int       = 192,

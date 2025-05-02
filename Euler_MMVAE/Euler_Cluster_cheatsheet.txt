@@ -83,7 +83,7 @@ watch -n 2 nvidia-smi
 Sync folder (done over local terminal -> not in ssh euler)
 
 Upload: 
-rsync -av --progress "/drives/c/SP-Master-Local/SP_DamageLocalization-MasonryArchBridge_SimonScandella/ProbabilisticApproach/Euler_MMVAE/" scansimo@euler.ethz.ch:/cluster/scratch/scansimo/Euler_MMVAE/
+rsync -av --progress "/drives/c/SP-Master-Local/SP_DamageLocalization-MasonryArchBridge_SimonScandella/ProbabilisticApproach/Euler_MMVAE/scripts/" scansimo@euler.ethz.ch:/cluster/scratch/scansimo/Euler_MMVAE/scripts/
 
 Donwload:
 rsync -av --progress scansimo@euler.ethz.ch:/cluster/scratch/scansimo/Euler_MMVAE/ "/drives/c/SP-Master-Local/SP_DamageLocalization-MasonryArchBridge_SimonScandella/ProbabilisticApproach/Euler_MMVAE/"

@@ -3,7 +3,7 @@
 #SBATCH --output=vae_run.out
 #SBATCH --error=vae_run.err
 #SBATCH -A es_chatzi
-#SBATCH --gpus=v100:2
+#SBATCH --gpus=rtx_4090:2
 #SBATCH --cpus-per-task=2
 #SBATCH --mem-per-cpu=32G
 #SBATCH --time=18:00:00

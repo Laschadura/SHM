@@ -1054,7 +1054,7 @@ def save_visualizations_and_metrics(model, train_dataset, val_dataset, training_
         latent_vectors = np.concatenate(latent_vectors, axis=0)
         test_ids = np.concatenate(test_ids, axis=0)
         # Reduce dimensionality using UMAP.
-        reducer = umap.UMAP(n_components=3, random_state=42, n_neighbors=100)
+        reducer = umap.UMAP(n_components=3, random_state=42, n_neighbors=15, min_dist=0.05)
         latent_3d = reducer.fit_transform(latent_vectors.reshape(latent_vectors.shape[0], -1))
         return latent_3d, test_ids
 
@@ -1153,8 +1153,8 @@ def main():
     debug_mode     = False
     latent_dim     = 128
     batch_size     = 128
-    total_epochs   = 600
-    patience       = 100
+    total_epochs   = 1500
+    patience       = 150
     resume_training = False
 
     segment_duration = 4.0

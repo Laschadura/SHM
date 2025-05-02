@@ -14,3 +14,9 @@ Euler_MMVAE/data
 clean_env_mirror/
 DataGenMethods/
 polyline_reconstruction_results/
+cache/
+Diff_eval/
+reconstruction_results/
+results_diff/
+synthesis_results_mmvae/
+results_mmvae/
