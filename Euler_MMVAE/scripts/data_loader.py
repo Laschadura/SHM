@@ -7,6 +7,8 @@ import re
 import random
 import cv2
 import torch
+import torch.nn as nn
+import tensorflow as tf
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -28,6 +30,77 @@ perspective_map = {
     'B': 'North_Spandrel_Wall',
     'C': 'South_Spandrel_Wall'
 }
+
+# ────────────  A U G M E N T A T I O N  ──────────────────────────
+_FRAME_STEP  = 32        #  nperseg 256 – noverlap 224  ⇒ 256-224 = 32
+_MAX_SHIFT   = 160       #  ≤0.8 s at 200 Hz  (tweakable)
+_PINK_ALPHA  = 0.5       #  0→white, 0.5→pink, 1→brown
+
+def _make_pink(shape, alpha=0.5):
+    """TensorFlow-compatible 1/f^alpha pink noise generator (approx)."""
+    T = shape[0]
+    C = shape[1]
+
+    # Ensure FFT length is next power of 2 for efficiency
+    fft_len = tf.cast(tf.math.pow(2.0, tf.math.ceil(tf.math.log(tf.cast(T, tf.float32)) / tf.math.log(2.0))), tf.int32)
+
+    # Frequency shaping
+    freqs = tf.cast(tf.range(1, fft_len // 2 + 1), tf.float32)
+    scale = tf.pow(freqs, -alpha)[:, tf.newaxis]  # (F,1)
+
+    # Random phase and magnitude
+    real = tf.random.normal([fft_len // 2, C])
+    imag = tf.random.normal([fft_len // 2, C])
+    comp = tf.complex(real * scale, imag * scale)
+
+    # Mirror to get full spectrum (DC + pos + neg freq)
+    comp_full = tf.concat(
+        [tf.complex(tf.zeros([1, C]), tf.zeros([1, C])), comp, tf.reverse(tf.math.conj(comp), axis=[0])],
+        axis=0
+    )
+
+    # IFFT to time-domain
+    pink = tf.signal.ifft(comp_full)
+    pink = tf.math.real(pink[:T])  # (T,C)
+    return tf.cast(pink, tf.float32)
+
+def augment_fn(spec, mask, tid, wave):
+    """Synchronised spec + wave augmentation."""
+    # 1. random time-shift
+    samp_shift  = tf.random.uniform([], -_MAX_SHIFT, _MAX_SHIFT, tf.int32)
+    frame_shift = samp_shift // _FRAME_STEP
+    wave = tf.roll(wave,  samp_shift,  axis=0)
+    spec = tf.roll(spec, frame_shift, axis=1)
+
+    # 2. random gain  ±3 dB
+    gain = tf.pow(10.0, tf.random.uniform([], -3.0, 3.0) / 20.0)
+    wave = wave * gain
+    mag  = spec[..., 0::2] * gain               # scale magnitude only
+    spec = tf.concat([mag, spec[..., 1::2]], -1)
+
+    # 3. sensor-axis sign-flip  (50 %)
+    flip = tf.random.uniform([]) > 0.5
+    wave = tf.where(flip, -wave, wave)
+    phase = spec[..., 1::2] + tf.where(flip, np.pi, 0.0)
+    spec  = tf.concat([spec[..., 0::2], phase], -1)
+
+    # 4. pink noise, σ≈0.005
+    noise = _make_pink(tf.shape(wave)) * 0.005
+    wave  = wave + noise
+
+    # 5. SpecAug-style frequency drop (1-3 bins)
+    f_drop = tf.random.uniform([], 1, 4, tf.int32)
+    f0     = tf.random.uniform([], 0, tf.shape(spec)[0] - f_drop, tf.int32)
+    zeros  = tf.zeros_like(spec[f0:f0+f_drop, :, 0::2])
+    spec = tf.tensor_scatter_nd_update(
+              spec,
+              indices=tf.range(f0, f0+f_drop)[:,None],
+              updates=tf.concat([zeros,
+                                 spec[f0:f0+f_drop,:,1::2]], -1))
+
+    return spec, mask, tid, wave
+# ─────────────────────────────────────────────────────────────────
+
 
 ######################################
 # Time-series data pre- and postprocessing
@@ -397,6 +470,194 @@ def inverse_spectrogram(
                 time_series[b_abs, :waveform.shape[0], c] = waveform
 
     return time_series.numpy()
+
+# trainable ISTFT for PyTorch
+class DifferentiableISTFT(nn.Module):
+    def __init__(self, nperseg=256, noverlap=128):
+        super().__init__()
+        self.nperseg   = nperseg
+        self.hop_len   = nperseg - noverlap
+        # register the window as a buffer so it moves with .to(device)
+        self.register_buffer('window',
+            torch.hann_window(nperseg), persistent=False)
+
+    def forward(self, spec, length):
+        # spec: (B, F, T, 2*C)
+        B, F, T, D = spec.shape
+        C = D // 2
+
+        # reshape so we can batch‐proces all channels at once:
+        # → (B*C, F, T), interleaving the channel dims
+        spec = spec.view(B, F, T, C, 2)
+        log_mag = spec[..., 0]              # (B, F, T, C)
+        phase   = spec[..., 1]
+
+        # to (B*C,  F,  T)
+        log_mag = log_mag.permute(0,3,1,2).reshape(-1, F, T)
+        phase   = phase.permute(0,3,1,2).reshape(-1, F, T)
+
+        # back to linear magnitude
+        mag = torch.expm1(log_mag)
+
+        # complex STFT bins: (B*C, F, T) → (B*C, F, T, 2)
+        real = mag * torch.cos(phase)
+        imag = mag * torch.sin(phase)
+        complex_spec = torch.stack([real, imag], dim=-1)
+
+        # istft wants shape (..., freq, frame, 2)
+        # so our complex_spec is already (..., F, T, 2)
+        wav = torch.istft(
+            complex_spec,
+            n_fft=self.nperseg,
+            hop_length=self.hop_len,
+            win_length=self.nperseg,
+            window=self.window,
+            center=False,
+            normalized=False,
+            onesided=True,
+            length=length
+        )
+        # wav: (B*C, length)
+        # reshape → (B, C, length) → (B, length, C)
+        wav = wav.view(B, C, -1).permute(0,2,1)
+        return wav
+    
+    import tensorflow as tf
+
+# trainable TensorFlow inverse stft for MMVAE
+@tf.keras.saving.register_keras_serializable('mmvae')
+class TFInverseISTFT(tf.keras.layers.Layer):
+    def __init__(self, frame_length=256, frame_step=32, **kwargs):
+        super().__init__(**kwargs)
+        self.frame_length = frame_length
+        self.frame_step   = frame_step
+        self.window_fn = tf.signal.inverse_stft_window_fn(
+            frame_step,
+            forward_window_fn=tf.signal.hann_window
+        )
+        # Add learnable scalar for magnitude scaling
+        self.beta = self.add_weight(
+            name="beta",
+            shape=(),
+            initializer=tf.keras.initializers.Ones(),
+            trainable=True,
+        )
+
+    def call(self, spec_logits, length):
+        B = tf.shape(spec_logits)[0]
+        D = tf.shape(spec_logits)[3]
+        C = D // 2
+
+        # Clip to prevent extreme values before softplus
+        log_mag = tf.clip_by_value(spec_logits[..., 0::2], -8.0, 5.0)
+        phase   = spec_logits[..., 1::2]
+
+        # Learnable softplus for magnitude
+        mag = tf.nn.softplus(self.beta * log_mag)
+
+        mag   = tf.reshape(mag,   [B*C, tf.shape(mag)[1], tf.shape(mag)[2]])
+        phase = tf.reshape(phase, [B*C, tf.shape(phase)[1], tf.shape(phase)[2]])
+
+        real = mag * tf.cos(phase)
+        imag = mag * tf.sin(phase)
+        real = tf.cast(real, tf.float32)
+        imag = tf.cast(imag, tf.float32)
+
+        complex_spec = tf.complex(real, imag)
+        complex_spec = tf.transpose(complex_spec, [0,2,1])  # [B*C, T, F]
+
+        wav = tf.signal.inverse_stft(
+            complex_spec,
+            self.frame_length,
+            self.frame_step,
+            window_fn=self.window_fn
+        )
+
+        # pad or crop
+        wav = wav[:, :length]
+        wav = tf.pad(wav, [[0,0], [0, tf.maximum(0, length - tf.shape(wav)[1])]])
+
+        # [B*C, L] → [B, L, C]
+        wav = tf.reshape(wav, [B, C, length])
+        wav = tf.transpose(wav, [0,2,1])
+        return wav
+    
+    def get_config(self):
+        config = super().get_config()
+        config.update({
+            "frame_length": self.frame_length,
+            "frame_step": self.frame_step
+        })
+        return config
+
+    @classmethod
+    def from_config(cls, config):
+        return cls(**config)
+
+
+# class TFInverseISTFT(tf.keras.layers.Layer):
+#     def __init__(self, frame_length=256, frame_step=32, **kwargs):
+#         super().__init__(**kwargs)
+#         self.frame_length = frame_length
+#         self.frame_step   = frame_step
+#         self.window_fn = tf.signal.inverse_stft_window_fn(
+#             frame_step,
+#             forward_window_fn=tf.signal.hann_window
+#         )
+#         # Add learnable scalar for magnitude scaling
+#         self.beta = self.add_weight(
+#             name="beta",
+#             shape=(),
+#             initializer=tf.keras.initializers.Ones(),
+#             trainable=True,
+#         )
+
+#     def call(self, spec_logits, length):
+#         B = tf.shape(spec_logits)[0]
+#         D = tf.shape(spec_logits)[3]
+#         C = D // 2
+
+#         # Clip to prevent extreme values before exp
+#         log_mag = tf.clip_by_value(spec_logits[..., 0::2], -8.0, 5.0)
+#         phase   = spec_logits[..., 1::2]
+
+#         # Learnable exp for magnitude
+#         mag = tf.exp(self.beta * log_mag)
+
+#         # Wrap phase to [-pi, pi] using angle(exp(i*phase))
+#         phase = tf.math.angle(tf.exp(tf.complex(tf.zeros_like(phase), phase)))
+
+#         mag   = tf.reshape(mag,   [B*C, tf.shape(mag)[1], tf.shape(mag)[2]])
+#         phase = tf.reshape(phase, [B*C, tf.shape(phase)[1], tf.shape(phase)[2]])
+
+#         tf.print("🌀 Phase range:", tf.reduce_min(phase), tf.reduce_max(phase))
+#         tf.print("📈 Mag range:", tf.reduce_min(mag), tf.reduce_max(mag))
+
+
+#         real = mag * tf.cos(phase)
+#         imag = mag * tf.sin(phase)
+#         real = tf.cast(real, tf.float32)
+#         imag = tf.cast(imag, tf.float32)
+
+#         complex_spec = tf.complex(real, imag)
+#         complex_spec = tf.transpose(complex_spec, [0,2,1])  # [B*C, T, F]
+
+#         wav = tf.signal.inverse_stft(
+#             complex_spec,
+#             self.frame_length,
+#             self.frame_step,
+#             window_fn=self.window_fn
+#         )
+
+#         # pad or crop
+#         wav = wav[:, :length]
+#         wav = tf.pad(wav, [[0,0], [0, tf.maximum(0, length - tf.shape(wav)[1])]])
+
+#         # [B*C, L] → [B, L, C]
+#         wav = tf.reshape(wav, [B, C, length])
+#         wav = tf.transpose(wav, [0,2,1])
+#         return wav   
+
 
 ######################################
 # Mask pre- and postprocessing

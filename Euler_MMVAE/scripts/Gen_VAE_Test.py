@@ -7,12 +7,14 @@ Generate synthetic samples from a trained SpectralMMVAE, using the
 """
 
 import os
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 import sys
 import numpy as np
 import tensorflow as tf
 import matplotlib.pyplot as plt
 from tensorflow.keras import mixed_precision  # type: ignore
 import cv2
+from pathlib import Path
 
 # ------------------------------------------------------------------ #
 #  project‑local imports
@@ -20,10 +22,9 @@ import cv2
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from custom_distributions import reparameterize 
 import data_loader
-from data_loader import inverse_spectrogram, mask_recon, inspect_frequency_content
-from vae_generator import (
-    SpectralMMVAE,
-)
+from data_loader import TFInverseISTFT, mask_recon, inspect_frequency_content
+from vae_generator import SpectralMMVAE
+
 
 # ------------------------------------------------------------------ #
 #  0)  convenience – fetch ALL cached arrays in one call
@@ -65,106 +66,71 @@ def get_cached_data(*,
 # ------------------------------------------------------------------ #
 #  1)  model loader –  **now uses shapes from the cache**
 # ------------------------------------------------------------------ #
-def load_trained_mmvae(weights_path: str, spec_shape, mask_shape, latent_dim=128):
+def load_trained_mmvae(model_path: str,
+                       spec_shape,
+                       mask_shape):
     """
-    Build a SpectralMMVAE whose input shapes match the cached data
-    and load pre‑trained weights.
+    Load a fully-serialized SpectralMMVAE model from a .keras archive
+    without letting Keras build it prematurely.
     """
-    model = SpectralMMVAE(latent_dim, spec_shape, mask_shape)
-
-    # dummy forward pass to create variables
-    _ = model(
-        tf.zeros((1, *spec_shape), dtype=tf.float32),
-        tf.zeros((1, *mask_shape), dtype=tf.float32),
-        training=False,
+    model = tf.keras.models.load_model(
+        model_path,
+        custom_objects={"SpectralMMVAE": SpectralMMVAE},
+        compile=False,      # don’t try to restore the optimizer
+        safe_mode=False     # <- ***key line***  skips automatic build()
     )
 
-    model.load_weights(weights_path)
-    print(f"✅  Loaded SpectralMMVAE weights from {weights_path}")
+    # ---- manual one-shot build ------------------------------------
+    dummy_spec = tf.zeros((1, *spec_shape), dtype=tf.float32)
+    dummy_mask = tf.zeros((1, *mask_shape), dtype=tf.float32)
+    _ = model(dummy_spec, dummy_mask, training=False)
+    print(f"✅ Loaded SpectralMMVAE from {model_path}")
     return model
+
+
+
 
 # ------------------------------------------------------------------ #
 #  2)  ----  synthesis helpers  ------------------------------------ #
 # ------------------------------------------------------------------ #
 def generate_random_samples(model, how_many=5, save_dir="synthesized_samples"):
-    """
-    Generate random samples from the mixture-of-experts prior and visualize them.
-    
-    Args:
-        model: Trained SpectralMMVAE model
-        how_many: Number of samples to generate
-        save_dir: Directory to save visualization outputs
-    """
     os.makedirs(save_dir, exist_ok=True)
-    
     for i in range(how_many):
         print(f"Generating sample {i+1}/{how_many}...")
-        
-        # Generate samples from the model's prior
         recon_spec, recon_mask = model.generate(modality='both')
-        
-        # Save spectrograms as numpy arrays for potential further processing
         np.save(f"{save_dir}/sample_{i+1}_spec.npy", recon_spec.numpy())
         np.save(f"{save_dir}/sample_{i+1}_mask.npy", recon_mask.numpy())
-        
-        # Visualize spectrograms (first channel only for simplicity)
         plt.figure(figsize=(12, 6))
-        
-        # Plot magnitude spectrogram (even indices are magnitudes)
         plt.subplot(1, 3, 1)
-        # Take first magnitude channel (index 0)
         magnitude = recon_spec[0, :, :, 0].numpy()
         plt.imshow(magnitude, aspect='auto', origin='lower', cmap='viridis')
         plt.title(f"Sample {i+1}: Magnitude Spectrogram (Ch 1)")
         plt.colorbar()
-        
-        # If you have multiple channels, optionally show another one
-        if recon_spec.shape[-1] > 2:  # If we have more than 1 channel (magnitude+phase)
+        if recon_spec.shape[-1] > 2:
             plt.subplot(1, 3, 2)
-            # Take second magnitude channel (index 2)
             magnitude2 = recon_spec[0, :, :, 2].numpy()
             plt.imshow(magnitude2, aspect='auto', origin='lower', cmap='viridis')
             plt.title("Magnitude Spectrogram (Ch 2)")
             plt.colorbar()
-        
-        # Plot mask
         plt.subplot(1, 3, 3)
         plt.imshow(recon_mask[0, :, :, 0].numpy(), aspect='auto', cmap='gray')
         plt.title("Generated Mask")
         plt.colorbar()
-        
         plt.tight_layout()
         plt.savefig(f"{save_dir}/sample_{i+1}_visualization.png", dpi=300)
         plt.close()
-        
-        # Optional: Convert spectrogram to time series and save/visualize
         try:
-            # Assumes you have the reconstruct_time_series function from your model
-            time_series = model.reconstruct_time_series(
-                recon_spec.numpy(), 
-                fs=200,  # Sampling rate
-                nperseg=256,  # STFT parameter from the log: nperseg=256
-                noverlap=224, # STFT parameter from the log: noverlap=224
-                time_length=800  # Time length from raw_segments.shape[1]
-            )
-            
-            # Save time series
+            time_series = model.istft_layer(
+                tf.convert_to_tensor(recon_spec.numpy(), dtype=tf.float32),
+                length=800
+            ).numpy()
             np.save(f"{save_dir}/sample_{i+1}_time_series.npy", time_series)
-            
-            # Visualize time series
             plt.figure(figsize=(12, 4))
-            time_axis = np.linspace(0, 4, 800)  # Assuming 4 seconds at 200Hz
-            
-            # Plot first few channels
+            time_axis = np.linspace(0, 4, 800)
             num_channels_to_plot = min(3, time_series.shape[2])
             colors = ['blue', 'red', 'green']
-            
             for ch in range(num_channels_to_plot):
-                plt.plot(time_axis, time_series[0, :, ch], 
-                         label=f'Channel {ch+1}', 
-                         color=colors[ch], 
-                         alpha=0.8)
-            
+                plt.plot(time_axis, time_series[0, :, ch], label=f'Channel {ch+1}', color=colors[ch], alpha=0.8)
             plt.title(f"Sample {i+1}: Reconstructed Time Series")
             plt.xlabel("Time (s)")
             plt.ylabel("Amplitude")
@@ -173,10 +139,8 @@ def generate_random_samples(model, how_many=5, save_dir="synthesized_samples"):
             plt.tight_layout()
             plt.savefig(f"{save_dir}/sample_{i+1}_time_series.png", dpi=300)
             plt.close()
-            
         except Exception as e:
             print(f"Error reconstructing time series: {e}")
-    
     print(f"✅ Generated {how_many} samples in '{save_dir}' directory")
 
 def generate_interpolations(model, num_interpolation_steps=10, save_dir="interpolation_samples"):
@@ -232,13 +196,10 @@ def generate_interpolations(model, num_interpolation_steps=10, save_dir="interpo
         
         # Convert to time series if possible
         try:
-            time_series = model.reconstruct_time_series(
-                recon_spec.numpy(), 
-                fs=200, 
-                nperseg=256, 
-                noverlap=224,
-                time_length=800
-            )
+            time_series = model.istft_layer(
+                tf.convert_to_tensor(recon_spec.numpy(), dtype=tf.float32),
+                length=800
+            ).numpy()
             all_time_series.append(time_series[0])
             
             # Add time series to plot - just the first channel for clarity
@@ -317,18 +278,8 @@ def generate_conditional_samples(model, cached, save_dir="conditional_samples"):
 
     print(f"✅  Generated samples for {len(processed)} unique test IDs")
 
-import os
-import numpy as np
-import matplotlib.pyplot as plt
-import tensorflow as tf
-from pathlib import Path
-from data_loader import mask_recon, inspect_frequency_content
 
 def test_reconstruction(model, cached, save_dir="reconstruction_tests"):
-    """
-    One segment per test-ID → four plot groups (mask, spec, overlay,
-    per-channel, PSD) from cached arrays.
-    """
     base_dir = Path(save_dir)
     ts_dir   = base_dir / "ts"
     psd_dir  = base_dir / "psd"
@@ -355,9 +306,11 @@ def test_reconstruction(model, cached, save_dir="reconstruction_tests"):
 
         recon_spec, recon_mask, _ = model(spec_in, mask_in, training=False)
         orig_ts = raw_seg[idx]
-        recon_ts = model.reconstruct_time_series(
-            recon_spec.numpy(), fs=200, nperseg=256, noverlap=224, time_length=orig_ts.shape[0]
-        )[0]
+        recon_ts = model.istft_layer(
+            tf.convert_to_tensor(recon_spec, dtype=tf.float32),
+            length=orig_ts.shape[0]
+        ).numpy()[0]
+
 
         t = np.linspace(0, 4, orig_ts.shape[0])
 
@@ -401,6 +354,37 @@ def test_reconstruction(model, cached, save_dir="reconstruction_tests"):
         plt.tight_layout()
         plt.savefig(spec_dir / f"test{tid}_spectrogram_comparison.png", dpi=300)
         plt.close()
+
+        #-------------------------------------------------
+        # --- Phase comparison (Ch1) ---
+        orig_wave = tf.convert_to_tensor(orig_ts[None, :, :], dtype=tf.float32)
+        recon_wave_tf = tf.convert_to_tensor(recon_ts[None, :, :], dtype=tf.float32)
+
+        # Use same STFT settings as your ISTFT layer
+        n_fft = 256
+        hop = 256 - 32  # ≈25% overlap
+        win_fn = lambda L, dtype=tf.float32: tf.signal.hann_window(L, dtype=dtype)
+
+        # Compute complex STFTs
+        S_orig = tf.signal.stft(orig_wave[..., 0], n_fft, hop, window_fn=win_fn)
+        S_recon = tf.signal.stft(recon_wave_tf[..., 0], n_fft, hop, window_fn=win_fn)
+
+        phase_orig = tf.math.angle(S_orig)
+        phase_recon = tf.math.angle(S_recon)
+
+        # Phase difference (wrapped to [-π, π])
+        phase_diff = tf.math.angle(tf.exp(1j * (phase_orig - phase_recon)))
+
+        # Plot
+        plt.figure(figsize=(12, 5))
+        plt.imshow(phase_diff.numpy().T, aspect="auto", origin="lower", cmap="twilight", vmin=-np.pi, vmax=np.pi)
+        plt.title(f"Phase Error (Ch1) • Test {tid}")
+        plt.xlabel("Frame"); plt.ylabel("Freq bin")
+        plt.colorbar(label="Δphase [rad]")
+        plt.tight_layout()
+        plt.savefig(spec_dir / f"test{tid}_phase_error_ch1.png", dpi=300)
+        plt.close()
+        #-------------------------------------------------
 
         # Mask comparison
         high_gt  = mask_recon(mask_dict[tid][None])[0]
@@ -469,44 +453,46 @@ def main():
     weights_path = "results_mmvae/final_spectral_mmvae.weights.h5"
     out_dir = "synthesis_results_mmvae"
     os.makedirs(out_dir, exist_ok=True)
+    print("📄 Loading weights from:", os.path.abspath(weights_path))
 
     # ---- load cached data --------------------------------------------------
     cached = get_cached_data(
-    recompute=False,
-    segment_duration=4.0,
-    nperseg=256,
-    noverlap=224
+        recompute=False,
+        segment_duration=4.0,
+        nperseg=256,
+        noverlap=224
     )
 
+    print("📐  Cached shapes loaded from disk")
 
-    # derive shapes directly from cache
-    spec_shape = tuple(cached["specs"].shape[1:])   # (F, T, 2C)
-    mask_shape = tuple(cached["heatmaps"][list(cached['heatmaps'].keys())[0]].shape)  # (32,96,1)
+    # shapes come from the cached arrays you just loaded
+    spec_shape = cached["specs"].shape[1:]   # (F, T, 2C)
+    mask_shape = cached["heatmaps"][next(iter(cached["heatmaps"]))].shape
 
-    print(f"📐  spec_shape = {spec_shape} | mask_shape = {mask_shape}")
-
-    # build + load model
     model = load_trained_mmvae(
-        weights_path,
-        spec_shape=spec_shape,
-        mask_shape=mask_shape,
-        latent_dim=128,
+        "results_mmvae/final_model_spectral_mmvae.keras",
+        spec_shape,
+        mask_shape
     )
 
     # --- choose any synthesis routine you need -----------------------------
-    generate_conditional_samples(
-        model,
-        cached,
-        save_dir=os.path.join(out_dir, "conditional_samples"),
-    )
+    try:
+        generate_conditional_samples(
+            model,
+            cached,
+            save_dir=os.path.join(out_dir, "conditional_samples"),
+        )
 
-    test_reconstruction(
-        model,
-        cached,
-        save_dir=os.path.join(out_dir, "reconstruction_tests"),
-    )
+        test_reconstruction(
+            model,
+            cached,
+            save_dir=os.path.join(out_dir, "reconstruction_tests"),
+        )
 
-    print(f"\n✅  All synthesis tasks finished – see '{out_dir}'")
+        print(f"\n✅  All synthesis tasks finished – see '{out_dir}'")
+    except Exception as e:
+        print(f"❌ Error during synthesis or reconstruction: {e}")
+
 
 if __name__ == "__main__":
     main()

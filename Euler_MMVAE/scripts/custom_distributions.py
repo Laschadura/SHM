@@ -165,12 +165,12 @@ def compute_js_divergence(mus, logvars):
     safe_kl_divs = tf.boolean_mask(kl_divs, is_finite)
 
     num_masked = tf.reduce_sum(tf.cast(tf.logical_not(is_finite), tf.int32))
-    tf.print("⚠️ JS divergence: masked", num_masked, "non-finite KL terms")
+    tf.print("JS divergence: masked", num_masked, "non-finite KL terms")
 
     if tf.size(safe_kl_divs) > 0:
         js_div = tf.reduce_mean(safe_kl_divs)
     else:
-        tf.print("⚠️ JS divergence: all KL terms were invalid, returning 0")
+        tf.print("JS divergence: all KL terms were invalid, returning 0")
         js_div = tf.constant(0.0, dtype=tf.float32)
 
     return tf.clip_by_value(js_div, 0.0, 1000.0)
