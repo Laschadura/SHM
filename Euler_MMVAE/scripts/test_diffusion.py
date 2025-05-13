@@ -23,6 +23,7 @@ from collections import defaultdict
 import torch
 from torch.utils.data import DataLoader, TensorDataset
 import matplotlib.pyplot as plt
+from pathlib import Path  
 
 # ---------------------------------------------------------------------------
 # working directory (cluster vs local) -------------------------------------
@@ -38,6 +39,7 @@ print("✅ Script has started executing")
 # ---------------------------------------------------------------------------
 import diffusion_model as dm        # your training script
 import data_loader                  # STFT ↔︎ time‑series, mask resize
+from data_loader import inspect_frequency_content
 
 import warnings
 warnings.filterwarnings("ignore", category=UserWarning)
@@ -45,7 +47,7 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 
 # ---------------------------------------------------------------------------
-# Helper metrics ------------------------------------------------------------
+# Helper metrics and utils --------------------------------------------------
 # ---------------------------------------------------------------------------
 
 def dice_iou_scores(target: torch.Tensor, pred: torch.Tensor, thr: float = 0.5):
@@ -68,14 +70,7 @@ def latent_fid(real: np.ndarray, fake: np.ndarray) -> float:
     covmean = torch.linalg.matrix_power(covmean, 1//2).numpy()
     return float(np.sum((mu_r - mu_f) ** 2) + np.trace(cov_r + cov_f - 2 * covmean))
 
-# ---------------------------------------------------------------------------
-# NEW  –   round‑trip utilities --------------------------------------------
-# ---------------------------------------------------------------------------
 
-# ------------------------------------------------------------------
-# robust wrapper: converts (N, 2C, F, T)  *or*  (N, 2C, T, F)
-#                 to      (N, F,  T, 2C) before inverse-STFT
-# ------------------------------------------------------------------
 def spectrograms_to_timeseries(spec_batch: torch.Tensor,
                                *, fs=200, nperseg=256, noverlap=224):
     """
@@ -109,8 +104,6 @@ def spectrograms_to_timeseries(spec_batch: torch.Tensor,
         fs=fs, nperseg=nperseg, noverlap=noverlap)
 
 
-
-
 def masks_to_fullsize(mask_batch: torch.Tensor, *, target=(256, 768)):
     """Convert 32×96 float masks ➜ full 256×768."""
     mk_np = mask_batch.detach().cpu().numpy().squeeze(1)   # (N,H,W)
@@ -120,8 +113,134 @@ def masks_to_fullsize(mask_batch: torch.Tensor, *, target=(256, 768)):
 # ---------------------------------------------------------------------------
 # Evaluation ---------------------------------------------------------------
 # ---------------------------------------------------------------------------
+def evaluate_synthesis(
+        mld: dm.MultiModalLatentDiffusion,
+        loader: DataLoader,
+        device: torch.device,
+        *,
+        pair_ids: list[int],          # e.g. [20,21,22,25]
+        steps_per_pair: int = 3,      # Nr. of α-values *between* each pair
+        out_dir: str = "results_diff",
+        segments: np.ndarray | None = None,
+        heats:    np.ndarray | None = None):
 
-def evaluate(mld: dm.MultiModalLatentDiffusion,
+    import matplotlib.pyplot as plt
+    from collections import defaultdict
+    from pathlib import Path
+    # ────────────────────────────────────────────────────────────────────
+    # 0. folders
+    # ────────────────────────────────────────────────────────────────────
+    root_dir  = Path(out_dir)
+    synth_dir = root_dir / "synthesis"
+    synth_dir.mkdir(parents=True, exist_ok=True)        # only this one
+
+    ae_spec, ae_mask = mld.autoencoders["spec"].eval(), mld.autoencoders["mask"].eval()
+
+    # ────────────────────────────────────────────────────────────────────
+    # 1. collect latents + ids for every batch
+    # ────────────────────────────────────────────────────────────────────
+    lat_spec, lat_mask, id_all = [], [], []
+    with torch.no_grad():
+        for spec, mask, ids in loader:
+            z_s = ae_spec.encoder(spec.to(device))  # Unpack both
+            z_m = ae_mask.encoder(mask.to(device))
+            lat_spec.append(z_s.cpu())
+            lat_mask.append(z_m.cpu())
+            id_all.extend(ids.cpu().numpy())
+
+    lat_spec = torch.cat(lat_spec, 0)          # (N , d)
+    lat_mask = torch.cat(lat_mask, 0)
+    joint_lat = torch.cat([lat_spec, lat_mask], 1).numpy()
+    id_all    = np.asarray(id_all, dtype=int)
+
+    # ────────────────────────────────────────────────────────────────────
+    # 2. one representative window per test-ID  →   centroid_ts
+    # ────────────────────────────────────────────────────────────────────
+    id2idx = defaultdict(list)
+    for i, tid in enumerate(id_all):
+        id2idx[tid].append(i)
+
+    rep_idx = [ max(idxs, key=lambda x: 0) for idxs in id2idx.values() ]  # arbitrary pick
+    reps_real = loader.dataset.tensors[0][rep_idx].float().to(device)
+    reps_ts   = spectrograms_to_timeseries(ae_spec(reps_real)[0])          # (n_IDs, T, C)
+    centroid_ts = { int(id_all[i]): reps_ts[j][:,0] for j,i in enumerate(rep_idx) }
+
+    # latent centroids (for interpolation)
+    centroid_lat = { tid: joint_lat[id_all == tid].mean(0) for tid in np.unique(id_all) }
+
+    # ────────────────────────────────────────────────────────────────────
+    # 3. centroid-to-centroid interpolation + 5-step snap-back
+    # ────────────────────────────────────────────────────────────────────
+    hops   = [(pair_ids[i], pair_ids[i+1]) for i in range(len(pair_ids)-1)]
+    alphas = np.linspace(0,1, steps_per_pair+2, endpoint=True)[1:-1]
+
+    syn_lat, lab_A, lab_B, lab_alpha = [], [], [], []
+    for A,B in hops:
+        zA = torch.tensor(centroid_lat[A], device=device).float()
+        zB = torch.tensor(centroid_lat[B], device=device).float()
+        for a in alphas:
+            z_mid = a*zA + (1-a)*zB
+            # snap-back (last 5 steps)
+            z_ref = z_mid[None].clone()
+            for t in range(mld.noise_scheduler.num_timesteps-5,
+                           mld.noise_scheduler.num_timesteps):
+                tt = torch.full((1,), t, device=device, dtype=torch.long)
+                z_ref = mld.noise_scheduler.p_sample(mld.diffusion_model, z_ref, tt)
+            syn_lat.append(z_ref.squeeze(0))
+            lab_A.append(A); lab_B.append(B); lab_alpha.append(float(a))
+
+    syn_lat = torch.stack(syn_lat).float()
+    syn = mld.decode_modalities(syn_lat)
+    ts_syn  = spectrograms_to_timeseries(syn["spec"])
+    mk_up   = masks_to_fullsize(syn["mask"])
+
+
+    #  We want everything roughly in [-1,1] so we can see the shape,
+    #  not the absolute amplitude.
+    for tid, trace in centroid_ts.items():
+        rms = trace.std()
+        centroid_ts[tid] = trace / (rms + 1e-8)          # RMS-norm ❶
+
+    # do the same normalisation for each synthetic window just before plotting
+    # (store scale factors once if you need the originals later)
+    ts_syn_norm = ts_syn / (ts_syn.std(axis=1, keepdims=True) + 1e-8)  # ❷
+
+
+
+    # ────────────────────────────────────────────────────────────────────
+    # 4. quick-check panels
+    # ────────────────────────────────────────────────────────────────────
+    max_vis = min(6, ts_syn.shape[0])
+    for k in range(max_vis):
+        A,B,a = lab_A[k], lab_B[k], lab_alpha[k]
+        fig = plt.figure(figsize=(10,4)); gs = fig.add_gridspec(2,3,width_ratios=[2,1,1])
+
+        # plot time-series
+        ax = fig.add_subplot(gs[:,0])
+        t  = np.linspace(0, 4, ts_syn.shape[1])
+        ax.plot(t, centroid_ts[A], color="#1f77b4", lw=.8, alpha=.6, label=f"T{A}")
+        ax.plot(t, centroid_ts[B], color="#ff7f0e", lw=.8, alpha=.6, label=f"T{B}")
+        ax.plot(t, ts_syn_norm[k,:,0], color="#d62728", lw=.9, label="synthetic")  # ❸
+        ax.set(title=f"α = {a:.2f}   •   T{A} → T{B}",
+            xlabel="t [s]", ylabel="norm. amp")
+        ax.legend(framealpha=.8, fontsize=8)
+        ax.grid(alpha=.3)
+
+
+        # masks
+        fig.add_subplot(gs[0,1]).imshow(syn["mask"][k,0].cpu(), cmap="gray"); plt.axis("off"); plt.title("32×96")
+        fig.add_subplot(gs[1,1]).imshow(mk_up[k],            cmap="gray"); plt.axis("off"); plt.title("256×768")
+
+        if heats is not None:
+            fig.add_subplot(gs[0,2]).imshow(heats[A][...,0], cmap="gray"); plt.axis("off"); plt.title(f"T{A} GT", fontsize=8)
+            fig.add_subplot(gs[1,2]).imshow(heats[B][...,0], cmap="gray"); plt.axis("off"); plt.title(f"T{B} GT", fontsize=8)
+
+        fig.tight_layout()
+        fig.savefig(synth_dir/f"quickcheck_{k}.png", dpi=150); plt.close(fig)
+
+
+
+def evaluate_reconstruction(mld: dm.MultiModalLatentDiffusion,
              loader: DataLoader,
              device: torch.device,
              *,
@@ -137,7 +256,23 @@ def evaluate(mld: dm.MultiModalLatentDiffusion,
     • latent-FID on unconditional samples
     • visual comparison (1 repr. segment per unique test-id)
     """
-    os.makedirs(out_dir, exist_ok=True)
+    root_dir   = Path(out_dir)
+    recon_dir  = root_dir / "reconstruction"
+    recon_dir.mkdir(parents=True, exist_ok=True)
+
+    # ------------------------------------------------------------------
+    # dedicated sub-folders
+    # ------------------------------------------------------------------
+    ts_dir   = recon_dir / "ts"
+    psd_dir  = recon_dir / "psd"
+    spec_dir = recon_dir / "spec"
+    mask_dir = recon_dir / "masks"
+
+    for d in (ts_dir, psd_dir, spec_dir, mask_dir):
+        d.mkdir(parents=True, exist_ok=True)
+
+
+
     ae_spec, ae_mask = (mld.autoencoders["spec"].eval(),
                         mld.autoencoders["mask"].eval())
     
@@ -203,8 +338,8 @@ def evaluate(mld: dm.MultiModalLatentDiffusion,
     # latent-FID (same as before)
     z_fake = []
     for i in range(gen_samples):
-        z_s = ae_spec.encoder(fake["spec"][i:i+1].to(device))
-        z_m = ae_mask.encoder(fake["mask"][i:i+1].to(device))
+        z_s    = ae_spec.encoder(fake["spec"][i:i+1].to(device))
+        z_m    = ae_mask.encoder(fake["mask"][i:i+1].to(device))
         z_fake.append(torch.cat([z_s, z_m], 1).detach().cpu().numpy())
     z_fake = np.concatenate(z_fake, 0)
 
@@ -238,7 +373,7 @@ def evaluate(mld: dm.MultiModalLatentDiffusion,
             plt.xlabel("Time [s]"); plt.ylabel("Amplitude"); plt.grid(alpha=.25)
             plt.legend(["original", "recon"], framealpha=.7)
             plt.tight_layout()
-            plt.savefig(f"{out_dir}/testid_{test_id}_ts_overlay.png", dpi=300)
+            plt.savefig(ts_dir / f"testid_{test_id}_ts_overlay.png", dpi=300)
             plt.close()
 
         # 2) per-channel sub-plots ----------------------------------------------
@@ -254,10 +389,78 @@ def evaluate(mld: dm.MultiModalLatentDiffusion,
                 ax.grid(alpha=.3)
             fig.legend(["original","recon"], loc="upper right", framealpha=.7)
             plt.tight_layout()
-            plt.savefig(f"{out_dir}/testid_{test_id}_ts_subplots.png", dpi=300)
+            plt.savefig(ts_dir / f"testid_{test_id}_ts_subplots.png", dpi=300)
             plt.close()
 
-        # 3) decoder spectrograms (first 4 channels) -----------------------------
+        # 3) frequency content comparison (PSD original vs reconstruction) ---------
+        if ts_orig is not None:
+            fs = 200
+            ts_o = ts_orig[None]          # (1,T,C)
+            ts_r = ts_sample[None]
+
+            f,  psd_orig  = inspect_frequency_content(ts_o, fs=fs, avg_over_segments=False)
+            _,  psd_recon = inspect_frequency_content(ts_r, fs=fs, avg_over_segments=False)
+            psd_orig, psd_recon = psd_orig[0], psd_recon[0]     # (freq, C)
+
+            # -------- per-channel shaded plots -----------------------------------
+            C     = psd_orig.shape[1]
+            rows  = int(np.ceil(C / 2))
+            fig, axs = plt.subplots(rows, 2, figsize=(14, 4*rows), squeeze=False)
+            axs = axs.ravel()
+
+            for ch in range(C):
+                ax = axs[ch]
+                ax.semilogy(f, psd_orig[:, ch], color="royalblue", lw=.8, label="orig"  if ch==0 else None)
+                ax.semilogy(f, psd_recon[:, ch], color="crimson",   lw=.8, label="recon" if ch==0 else None)
+
+                # shaded differences
+                ax.fill_between(f, psd_orig[:, ch], psd_recon[:, ch],
+                                where=psd_recon[:, ch] > psd_orig[:, ch],
+                                color="crimson",  alpha=.25)
+                ax.fill_between(f, psd_orig[:, ch], psd_recon[:, ch],
+                                where=psd_recon[:, ch] < psd_orig[:, ch],
+                                color="royalblue", alpha=.25)
+
+                ax.set_title(f"Ch {ch+1}")
+                ax.set_xlabel("Frequency [Hz]")
+                ax.set_ylabel("PSD [V²/Hz]")
+                ax.grid(alpha=.3)
+
+            # hide unused axes if channel count is odd
+            for k in range(C, len(axs)):
+                axs[k].axis("off")
+
+            fig.legend(loc="upper right", framealpha=.8)
+            fig.suptitle(f"Test {test_id} • PSD comparison")
+            plt.tight_layout()
+            plt.savefig(psd_dir / f"testid_{test_id}_psd_subplots.png", dpi=300)
+            plt.close()
+
+            # -------- mean PSD with 95 % spread ----------------------------------
+            psd_o_mean = psd_orig.mean(1)         # (freq,)
+            psd_r_mean = psd_recon.mean(1)
+
+            lo_o, hi_o = np.percentile(psd_orig,  [2.5, 97.5], axis=1)
+            lo_r, hi_r = np.percentile(psd_recon, [2.5, 97.5], axis=1)
+
+            plt.figure(figsize=(8,4))
+            plt.semilogy(f, psd_o_mean, label="orig (mean)",  color="royalblue")
+            plt.semilogy(f, psd_r_mean, label="recon (mean)", color="crimson")
+            plt.fill_between(f, lo_o, hi_o, color="royalblue", alpha=.15)
+            plt.fill_between(f, lo_r, hi_r, color="crimson",  alpha=.15)
+
+            plt.title(f"Test {test_id} • PSD averaged over {C} channels")
+            plt.xlabel("Frequency [Hz]")
+            plt.ylabel("PSD [V²/Hz]")
+            plt.grid(alpha=.3)
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig(psd_dir / f"testid_{test_id}_psd_mean.png", dpi=300)
+            plt.close()
+
+
+
+        # 4) decoder spectrograms (first 4 channels) -----------------------------
         plt.figure(figsize=(12,6))
         for j in range(min(4, spec_sample.shape[0]//2)):
             plt.subplot(2,2,j+1)
@@ -266,10 +469,10 @@ def evaluate(mld: dm.MultiModalLatentDiffusion,
             plt.colorbar()
         plt.suptitle(f"Decoder output • Test ID {test_id}")
         plt.tight_layout()
-        plt.savefig(f"{out_dir}/testid_{test_id}_spectrograms.png", dpi=300)
+        plt.savefig(spec_dir / f"testid_{test_id}_spectrograms.png", dpi=300)
         plt.close()
 
-        # 4) mask comparison -----------------------------------------------------
+        # 5) mask comparison -----------------------------------------------------
         if heats is not None:
             # use heatmaps[test_id] as the true low-res mask
             lowres_gt  = heats[test_id]               # (32,96,1)
@@ -284,11 +487,8 @@ def evaluate(mld: dm.MultiModalLatentDiffusion,
             ax[1, 1].imshow(highres_rec,    cmap="gray");     ax[1, 1].set_title("Reconstructed upsampled")
             for a in ax.ravel(): a.axis("off")
             plt.tight_layout()
-            plt.savefig(f"{out_dir}/testid_{test_id}_mask_comparison.png", dpi=300)
+            plt.savefig(mask_dir / f"testid_{test_id}_mask_comparison.png", dpi=300)
             plt.close()
-
-
-
 
 
 # ---------------------------------------------------------------------------
@@ -310,12 +510,7 @@ def main():
     latent_dim = 256
 
     # ── load cached data ────────────────────────────────────────────────────
-    tag       = f"{segment_duration:.2f}s_{nperseg}_{noverlap}"
     cache_dir = "cache"
-    spec_path = os.path.join(cache_dir, f"specs_{tag}.npy")
-    seg_path  = os.path.join(cache_dir, f"segments_{tag}.npy")   # ← NEW
-    heat_path = os.path.join(cache_dir, f"masks_{tag}.npy")
-    ids_path  = os.path.join(cache_dir, f"segIDs_{tag}.npy")
 
     print("📂 Loading pre-computed cache from:", cache_dir)
     accel_dict, binary_masks, heats, segments, specs, ids = data_loader.load_data(
@@ -350,18 +545,36 @@ def main():
                       torch.from_numpy(masks).float(),
                       torch.from_numpy(ids)),
         batch_size=args.batch, shuffle=False, num_workers=4)
+    
+    # ------------------------------------------------------------------
+    # Which test-IDs to interpolate and how many interior points
+    # ------------------------------------------------------------------
+    PAIR_IDS       = [20, 21, 22, 25]   # chain order matters
+    STEPS_PER_PAIR = 3                  # α-values between each pair
+
 
     # ── run evaluation ──────────────────────────────────────────────────────
-    evaluate(mld,
+    evaluate_synthesis(
+        mld, loader, device,
+        pair_ids=PAIR_IDS,
+        steps_per_pair=STEPS_PER_PAIR,
+        out_dir="Diff_eval",
+        segments=segments,
+        heats=heats)
+    
+    # ── run evaluation ──────────────────────────────────────────────────────
+    evaluate_reconstruction(mld,
             loader,
             device,
             gen_samples=23,
             out_dir="Diff_eval",
             segments=segments,       
             test_ids=ids,                
-            heats=heats)                 
+            heats=heats)    
+
 
 
 
 if __name__ == "__main__":
     main()
+

@@ -119,17 +119,24 @@ def complex_spectrogram_loss(y_true, y_pred):
     phase_pred = y_pred[:, 1::2, :, :]
 
     # Magnitude loss (log-MSE)
-    mag_loss = F.mse_loss(mag_true, mag_pred)
+    eps = 1e-6
+    mag_pred_safe = torch.clamp(mag_pred, min=0.0)
+    log_mag_true  = torch.log(mag_true + eps)
+    log_mag_pred  = torch.log(mag_pred_safe + eps)
+    mag_loss = F.mse_loss(log_mag_true, log_mag_pred)
 
-    # Phase loss (circular difference via cosine)
+
+    # Relative magnitude error (optional, replace or add)
+    rel_mag_err = ((mag_true - mag_pred) ** 2 / (mag_true**2 + 1e-6)).mean()
+
+    # Phase loss (cosine similarity)
     phase_true_complex = torch.complex(torch.cos(phase_true), torch.sin(phase_true))
     phase_pred_complex = torch.complex(torch.cos(phase_pred), torch.sin(phase_pred))
     phase_diff_cos = torch.real(phase_true_complex * torch.conj(phase_pred_complex))
     phase_loss = torch.mean(1.0 - phase_diff_cos)
 
-    # Combined loss: weighted
-    total_loss = 0.8 * mag_loss + 0.2 * phase_loss
-    return total_loss
+    # Total weighted
+    return 0.6 * mag_loss + 0.2 * rel_mag_err + 0.2 * phase_loss
 
 def spectro_time_consistency_loss(orig_wave, recon_spec,
                                   fs=200, nperseg=256, noverlap=224,
@@ -299,37 +306,29 @@ class SpectrogramEncoder(nn.Module):
         self.dropout3 = nn.Dropout(0.3)
         
         # Global pooling and dense layers
-        self.global_pool = nn.AdaptiveAvgPool2d(1)
-        self.dense_reduce = nn.Linear(128, 512)
+        self.global_pool = nn.AdaptiveAvgPool2d((2, 2))
+        self.dense_reduce = nn.Linear(128 * 2 * 2, 512)
         self.relu4 = nn.LeakyReLU(0.1)
-        
+
         # Latent layer (for standard autoencoder)
         self.latent_layer = nn.Linear(512, latent_dim)
     
     def forward(self, x):
-        # Initial dimension adjustment
         x = self.adjust_relu(self.adjust_conv(x))
-        
-        # Standard convolution path
-        x = self.conv1(x)
-        x = self.relu1(self.gn1(x))
-        x = self.dropout1(x)
-        
-        x = self.conv2(x)
-        x = self.relu2(self.gn2(x))
-        x = self.dropout2(x)
-        
-        x = self.conv3(x)
-        x = self.relu3(self.gn3(x))
-        x = self.dropout3(x)
-        
-        # Pool and encode
-        x = self.global_pool(x)
-        x = x.view(x.size(0), -1)  # Flatten
-        x = self.relu4(self.dense_reduce(x))
-        
-        # Get latent representation
-        latent = self.latent_layer(x)
+
+        x1 = self.relu1(self.gn1(self.conv1(x)))
+        x1 = self.dropout1(x1)
+
+        x2 = self.relu2(self.gn2(self.conv2(x1)))
+        x2 = self.dropout2(x2)
+
+        x3 = self.relu3(self.gn3(self.conv3(x2)))
+        x3 = self.dropout3(x3)
+
+        x_pool = self.global_pool(x3)        # (B,128,2,2)
+        x_flat = x_pool.view(x_pool.size(0), -1)
+        x_fc   = self.relu4(self.dense_reduce(x_flat))
+        latent = self.latent_layer(x_fc)
         return latent
 
 class MaskEncoder(nn.Module):
@@ -431,7 +430,7 @@ class SpectrogramDecoder(nn.Module):
         self.gn2 = nn.GroupNorm(8, 32)
         self.relu3 = nn.LeakyReLU(0.1)
         self.drop2 = nn.Dropout(0.3)
-        
+
         # Final refinement layers
         self.conv_t3 = nn.Conv2d(in_channels=32, out_channels=32, kernel_size=3, padding=1)
         self.gn3 = nn.GroupNorm(8, 32)
@@ -447,7 +446,7 @@ class SpectrogramDecoder(nn.Module):
         x = x.view(-1, 128, self.min_freq, self.min_time)
         
         # First upsampling
-        x = self.conv_t1(x)
+        x  = self.conv_t1(x)
         x = self.relu2(self.gn1(x))
         x = self.drop1(x)
         
@@ -456,10 +455,10 @@ class SpectrogramDecoder(nn.Module):
         x = self.relu3(self.gn2(x))
         x = self.drop2(x)
         
-        # Final refinement (no dimension change)
+        # Final refinement
         x = self.conv_t3(x)
-        x = self.relu4(self.gn3(x))
-        x = self.drop3(x)
+        x  = self.relu4(self.gn3(x))
+        x  = self.drop3(x)
         
         # Final projection
         x = self.conv_out(x)
@@ -1013,15 +1012,17 @@ class MultiModalLatentDiffusion:
         for i, modality_name in enumerate(self.modality_names):
             end_idx = start_idx + self.modality_dims[i]
             modality_latent = joint_latent[:, start_idx:end_idx]
-            
-            # Decode the modality latent
+
             autoencoder = self.autoencoders[modality_name]
             with torch.no_grad():
-                output = autoencoder.decoder(modality_latent)
-            
+                if modality_name == "spec":
+                    output = autoencoder.decoder(modality_latent)
+                else:
+                    output = autoencoder.decoder(modality_latent)
+
             outputs[modality_name] = output
             start_idx = end_idx
-        
+
         return outputs
     
     def create_modality_mask(self, batch_size, available_modalities):
@@ -1183,7 +1184,7 @@ class MultiModalLatentDiffusion:
                 print("")
             
             # Save checkpoint
-            if (epoch + 1) % 10 == 0:
+            if (epoch + 1) % 500 == 0:
                 torch.save({
                     "epoch": epoch,
                     "model_state_dict": self.diffusion_model.state_dict(),
@@ -1329,7 +1330,8 @@ def train_autoencoders(
         train_loader,
         device,
         epochs: int = 100,
-        lr: float = 5e-4
+        lr: float = 5e-4,
+        patience: int = 20
     ):
     """
     Trains the spectrogram and mask autoencoders separately.
@@ -1356,6 +1358,12 @@ def train_autoencoders(
         optimizer_mask, T_max=epochs
     )
 
+    best_spec_loss = float("inf")
+    best_mask_loss = float("inf")
+    patience = 20
+    patience_counter = 0
+
+
     for epoch in range(epochs):
         spec_autoencoder.train()
         mask_autoencoder.train()
@@ -1380,7 +1388,7 @@ def train_autoencoders(
                 orig_wave = seg_batch,           # (B, T, C) raw window
                 recon_spec = recon_spec)
             
-            loss_spec_total = loss_spec_mag + 0.1 * loss_time      # weight=0.1
+            loss_spec_total = loss_spec_mag + 0.2 * loss_time      # weight=0.2
             loss_spec_total.backward()
             optimizer_spec.step()
             spec_loss_sum += loss_spec_total.item()
@@ -1397,11 +1405,26 @@ def train_autoencoders(
         avg_spec_loss = spec_loss_sum / batch_counter
         avg_mask_loss = mask_loss_sum / batch_counter
         print(f"[Epoch {epoch+1:3d}/{epochs}]  "
-              f"spec={avg_spec_loss:.4f}  mask={avg_mask_loss:.4f}")
+            f"spec={avg_spec_loss:.4f}  mask={avg_mask_loss:.4f}")
 
-        # step the LR schedulers once per epoch
+        # step the LR schedulers
         scheduler_spec.step()
         scheduler_mask.step()
+
+        # Early stopping logic based on spec loss (or mask loss, or both)
+        if avg_spec_loss < best_spec_loss:
+            best_spec_loss = avg_spec_loss
+            best_mask_loss = avg_mask_loss
+            patience_counter = 0
+            # Save best model weights
+            torch.save(spec_autoencoder.state_dict(), "results_diff/autoencoders/spec_autoencoder_best.pt")
+            torch.save(mask_autoencoder.state_dict(), "results_diff/autoencoders/mask_autoencoder_best.pt")
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f"⏹️ Early stopping at epoch {epoch+1} after no improvement for {patience} epochs.")
+                break
+
 
 # ----- Visualization Functions and tests -----
 def visualize_training_history(history, save_path=None):
@@ -1470,7 +1493,8 @@ def save_visualizations_and_metrics(model, train_loader, val_loader, training_me
         latents = np.concatenate(latents, axis=0)
         ids = np.concatenate(ids, axis=0)
 
-        reducer = umap.UMAP(n_components=3, random_state=42, n_neighbors=100)
+        reducer = umap.UMAP(n_neighbors=15, min_dist=0.05, n_components=3, random_state=42)
+
         latent_3d = reducer.fit_transform(latents)
 
         return latent_3d, ids
@@ -1491,7 +1515,7 @@ def save_visualizations_and_metrics(model, train_loader, val_loader, training_me
     def latent_analysis(loader):
         model.eval()
         latents = []
-        for spec, _, _ in loader:
+        for spec, _, _, _ in loader:
             spec = spec.to(next(model.parameters()).device)
             with torch.no_grad():
                 _, z = model.autoencoders["spec"](spec)
@@ -1520,11 +1544,13 @@ def save_visualizations_and_metrics(model, train_loader, val_loader, training_me
 # ----- Main Function -----
 def main():
     # ─── Mode Control ───────────────────────────────────────────────
-    train_AE        = False                   # whether to train AE
+    train_AE        = True                   # whether to train AE
+    ae_epochs      = 500                   # epochs for autoencoder training
+    patience_ae     = 50                     # patience for autoencoder training
     recompute_data  = False                   # whether to recompute cache
-    dm_mode         = "continue"              # "scratch" or "continue"
-    dm_epochs       = 100                     # extra epochs for diffusion
-    learning_rate_dm = 1e-4
+    dm_mode         = "scratch"              # "scratch" or "continue"
+    dm_epochs       = 2500                     # extra epochs for diffusion
+    learning_rate_dm = 5e-4
     learning_rate_ae = 5e-4
     diff_ckpt       = "results_diff/diffusion/final_diffusion_model.pt"
 
@@ -1538,7 +1564,7 @@ def main():
     nperseg = 256
     noverlap = 224
     latent_dim = 256
-    batch_size = 50
+    batch_size = 200
 
     tag = f"{segment_duration:.2f}s_{nperseg}_{noverlap}"
     cache_dir = "cache"
@@ -1610,7 +1636,7 @@ def main():
 
     if train_AE:
         print("🚀 Training Autoencoders...")
-        train_autoencoders(spec_autoencoder, mask_autoencoder, train_loader, device, epochs=300, lr=learning_rate_ae)
+        train_autoencoders(spec_autoencoder, mask_autoencoder, train_loader, device, epochs=ae_epochs, lr=learning_rate_ae, patience=patience_ae)
         torch.save(spec_autoencoder.state_dict(), "results_diff/autoencoders/spec_autoencoder.pt")
         torch.save(mask_autoencoder.state_dict(), "results_diff/autoencoders/mask_autoencoder.pt")
     else:
