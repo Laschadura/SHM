@@ -232,5 +232,5 @@ def get_beta_schedule(epoch, max_epochs, schedule_type='cyclical', warmup=60, be
     return beta
 
 
-def get_time_weight(epoch, warmup=200, max_w=0.01):
+def get_time_weight(epoch, warmup=200, max_w=0.02):
     return max_w * tf.minimum(1.0, epoch / warmup)

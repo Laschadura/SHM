@@ -373,7 +373,10 @@ def test_reconstruction(model, cached, save_dir="reconstruction_tests"):
         phase_recon = tf.math.angle(S_recon)
 
         # Phase difference (wrapped to [-π, π])
-        phase_diff = tf.math.angle(tf.exp(1j * (phase_orig - phase_recon)))
+        phase_delta = phase_orig - phase_recon                          # (same dtype as inputs)
+        phase_diff  = tf.math.angle(
+            tf.exp( tf.complex(tf.zeros_like(phase_delta), phase_delta) )
+        )
 
         # Plot
         plt.figure(figsize=(12, 5))

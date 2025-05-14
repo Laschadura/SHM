@@ -4,18 +4,17 @@ import gc
 import psutil
 import GPUtil
 import numpy as np
-import random
-import cv2
+import csv
+import json
 
 import tensorflow as tf
 from tensorflow.keras import layers # type: ignore
 from tensorflow.keras.optimizers import AdamW # type: ignore
 from tensorflow.keras.optimizers.schedules import ExponentialDecay, CosineDecayRestarts # type: ignore
-from tensorflow.keras import mixed_precision  # type: ignore
 from tensorflow_addons.layers import GroupNormalization
 from tensorflow.keras import regularizers # type: ignore
 
-from sklearn.metrics import mean_squared_error, precision_score, recall_score, f1_score
+from sklearn.metrics.pairwise import cosine_similarity
 from scipy.stats import pearsonr
 from skimage.metrics import structural_similarity as ssim #type: ignore
 from scipy import signal
@@ -637,7 +636,7 @@ step_in_acc = None
 def train_step(model, optimizer,
                spec_mb, mask_mb, test_id_mb, wave_mb,
                beta, spec_weight, mask_weight,
-               modality_dropout_prob, time_weight, epoch,
+               modality_dropout_prob, time_weight, epoch, loss_weights,
                unfreeze_epoch=20):
     """One training step **per replica**.
 
@@ -694,16 +693,19 @@ def train_step(model, optimizer,
 
         recon_loss = mask_weight * mask_loss * mask_coeff
 
+        w = loss_weights
+
         total_loss = (
             recon_loss +
             beta * js_div +
             time_weight * L_time +
-            1.5 * L_mrstft +
-            0.3 * grad_loss +
-            0.3 * lap_loss +
-            0.3 * L_mag +
-            100.0 * loss_damage
+            w["mrstft"] * L_mrstft +
+            w["grad"]   * grad_loss +
+            w["lap"]    * lap_loss +
+            w["mag"]    * L_mag +
+            w["damage"] * loss_damage
         )
+
         loss = total_loss / ACC_STEPS
 
     # ---------------------------------------------------------------------
@@ -723,7 +725,7 @@ def train_step(model, optimizer,
         L_time, time_weight, L_mrstft, grad_loss, lap_loss, loss_damage, L_mag
     )
 
-def val_step(model, spec_in, mask_in, test_id_in, wave_in, beta, mask_weight, time_weight):
+def val_step(model, spec_in, mask_in, test_id_in, wave_in, beta, mask_weight, time_weight, loss_weights):
     """
     Performs a validation step for one batch.
     Returns individual losses for logging and early stopping.
@@ -750,16 +752,19 @@ def val_step(model, spec_in, mask_in, test_id_in, wave_in, beta, mask_weight, ti
     mask_l  = custom_mask_loss(mask_in, recon_mask)
     recon_l = mask_weight * mask_l
 
+    w = loss_weights
+
     tot_l = (
         recon_l +
         beta * js_div +
         time_weight * L_time_val +
-        1.5 * L_mrstft_val +
-        0.3 * grad_val +
-        0.3 * lap_val +
-        0.3 * mag_val +
-        100 * damage_val
+        w["mrstft"] * L_mrstft_val +
+        w["grad"]   * grad_val +
+        w["lap"]    * lap_val +
+        w["mag"]    * mag_val +
+        w["damage"] * damage_val
     )
+
 
     return {
         "total": tot_l,
@@ -775,43 +780,77 @@ def val_step(model, spec_in, mask_in, test_id_in, wave_in, beta, mask_weight, ti
 
 def train_spectral_mmvae(
     model,
+    output_dir,
     train_dataset,
     val_dataset,
     optimizer,
-    num_epochs        = 100,
-    patience          = 10,
-    beta_schedule     = "linear",
-    modality_dropout_prob = 0.10,
-    strategy          = None,
-    unfreeze_epoch   = 20,
-    beta_warmup_epochs      = 60,
-    max_beta         = 0.15,
+    num_epochs: int = 100,
+    patience: int = 10,
+    beta_schedule: str = "linear",
+    modality_dropout_prob: float = 0.10,
+    strategy=None,
+    unfreeze_epoch: int = 20,
+    beta_warmup_epochs: int = 60,
+    max_beta: float = 0.15,
+    loss_weights: dict | None = None,
     ):
+    """Spectral‑MMVAE training loop.
+
+    Everything is scoped to *output_dir* so each sweep run keeps its own
+    checkpoints and logs:
+
+    ``output_dir/
+        ├── best_spectral_mmvae.weights.h5
+        ├── best_model_spectral_mmvae.keras
+        ├── final_spectral_mmvae.weights.h5
+        ├── final_model_spectral_mmvae.keras
+        └── logs/beta_tracking.csv``
     """
-    Main training loop for the Spectral MMVAE model.
-    Handles multi-GPU execution, beta and time-weight schedules, early stopping, and metric tracking.
-    """
+
+    # ------------------------------------------------------------------
+    # 0)  per‑run paths & default loss weights
+    # ------------------------------------------------------------------
+    best_weights_path  = os.path.join(output_dir, "best_spectral_mmvae.weights.h5")
+    best_model_path    = os.path.join(output_dir, "best_model_spectral_mmvae.keras")
+    final_weights_path = os.path.join(output_dir, "final_spectral_mmvae.weights.h5")
+    final_model_path   = os.path.join(output_dir, "final_model_spectral_mmvae.keras")
+    metrics_path       = os.path.join(output_dir, "training_metrics.npy")
+
+    if loss_weights is None:
+        loss_weights = {
+            "mrstft": 1.0,
+            "grad": 0.3,
+            "lap": 0.3,
+            "mag": 0.3,
+            "damage": 150.0,
+        }
+
+    # ------------------------------------------------------------------
+    # 1)  bookkeeping
+    # ------------------------------------------------------------------
     metrics = {k: [] for k in (
         "train_total", "train_mask", "train_js", "train_time", "train_mrstft",
         "train_grad", "train_lap", "train_damage", "train_mag",
         "val_total", "val_mask", "val_js", "val_time", "val_mrstft",
-        "val_grad", "val_lap", "val_damage", "val_mag")}
+        "val_grad", "val_lap", "val_damage", "val_mag",
+    )}
 
-    best_val_loss = float("inf")
+    best_val_loss      = float("inf")
     no_improvement_cnt = 0
-    train_batches = sum(1 for _ in train_dataset)
-    val_batches = sum(1 for _ in val_dataset)
+    train_batches      = sum(1 for _ in train_dataset)
+    val_batches        = sum(1 for _ in val_dataset)
     print(f"🔄 Starting Training: {train_batches} train batches, {val_batches} val batches")
 
     beta_log = []
 
+    # gradient‑accumulation buffers
     global grad_accum, step_in_acc
-    grad_accum = [tf.Variable(tf.zeros_like(v), trainable=False)
-                  for v in model.trainable_variables]
+    grad_accum = [tf.Variable(tf.zeros_like(v), trainable=False) for v in model.trainable_variables]
     step_in_acc = tf.Variable(0, trainable=False, dtype=tf.int32)
 
-
-
+    # ------------------------------------------------------------------
+    # 2)  epoch loop
+    # ------------------------------------------------------------------
     for epoch in range(num_epochs):
         print(f"\n🔍 VRAM usage at start of epoch {epoch + 1}:")
         log_vram_usage()
@@ -832,13 +871,21 @@ def train_spectral_mmvae(
 
 
         for step, (spec_in, mask_in, test_id_in, wave_in) in enumerate(train_dataset):
+            # check if the latent collapsed
+            if step == 0:
+                mu_dbg, logvar_dbg = model.spec_encoder(spec_in, training=False)
+                tf.print("🧠 Epoch", epoch, "| μ.std =", tf.math.reduce_std(mu_dbg),
+                        " | log σ² mean =", tf.reduce_mean(logvar_dbg))
+
             results = distributed_train_step(
                 strategy, model, optimizer,
                 (spec_in, mask_in, test_id_in, wave_in),
                 tf.constant(beta,  tf.float32),
                 tf.constant(mask_weight, tf.float32),
                 tf.constant(time_weight, tf.float32),
-                tf.constant(epoch, tf.int32)
+                tf.constant(epoch, tf.int32),
+                tf.constant(modality_dropout_prob, tf.float32),
+                loss_weights
             )
 
             (tot, mask_l, js_d, recon_l, mask_c,
@@ -885,7 +932,8 @@ def train_spectral_mmvae(
             res = val_step(model, spec_in, mask_in, test_id_in, wave_in,
                            tf.constant(beta, tf.float32),
                            tf.constant(mask_weight, tf.float32),
-                           tf.constant(time_weight, tf.float32))
+                           tf.constant(time_weight, tf.float32),
+                           loss_weights)
 
             for k in res:
                 val_stats[k] += float(res[k].numpy())
@@ -900,22 +948,30 @@ def train_spectral_mmvae(
 
         current_val = metrics["val_total"][-1] if val_stats["steps"] else float("inf")
         if current_val < best_val_loss:
-            best_val_loss = current_val
+            best_val_loss     = current_val
             no_improvement_cnt = 0
-            model.save_weights("../results_mmvae/best_spectral_mmvae.weights.h5")
-            model.save("../results_mmvae/best_model_spectral_mmvae.keras")
-            pd.DataFrame(beta_log, columns=["epoch","step","mrstft","beta"]).to_csv("logs/beta_tracking.csv", index=False)
-            print("✅ Saved best weights and model.")
+
+            model.save_weights(best_weights_path)
+            model.save(best_model_path)
+
+            pd.DataFrame(beta_log, columns=["epoch", "step", "mrstft", "beta"]).to_csv(
+                os.path.join(output_dir, "logs", "beta_tracking.csv"), index=False
+            )
+            print("✅ Saved best weights and model →", os.path.relpath(best_weights_path, output_dir))
         else:
             no_improvement_cnt += 1
             print(f"🚨 No improvement for {no_improvement_cnt}/{patience}")
 
+        # ------------- EARLY‑STOPPING ----------------------------------
         if no_improvement_cnt >= patience:
             print(f"🛑 Early stopping at epoch {epoch + 1}.")
-            model.save_weights("results_mmvae/final_spectral_mmvae.weights.h5")
-            model.save("results_mmvae/final_model_spectral_mmvae.keras")
-            pd.DataFrame(beta_log, columns=["epoch","step","mrstft","beta"]).to_csv("logs/beta_tracking.csv", index=False)
-            print("📦 Saved model to:", os.path.abspath("../results_mmvae/final_model_spectral_mmvae.keras"))
+            model.save_weights(final_weights_path)
+            model.save(final_model_path)
+
+            pd.DataFrame(beta_log, columns=["epoch", "step", "mrstft", "beta"]).to_csv(
+                os.path.join(output_dir, "logs", "beta_tracking.csv"), index=False
+            )
+            print("📦 Saved final model to:", os.path.relpath(final_model_path, output_dir))
             break
 
     return metrics
@@ -932,21 +988,23 @@ def apply_accum_grads(optimizer, model):
 
 @tf.function
 def distributed_train_step(strategy, model, optimizer, batch,
-                           beta, mask_w, time_w, epoch):
+                           beta, mask_w, time_w, epoch, dropout_prob, loss_weights):
+
 
     spec_mb, mask_mb, test_id_mb, wave_mb = batch
 
     # ---- run on every replica ---------------------------------
+    print("⏱ Tracing... (first step)")
     per_replica = strategy.run(
-        train_step,
-        args=(
-            model, optimizer,
-            spec_mb, mask_mb, test_id_mb, wave_mb,
-            beta,          0.0,          # ← spec_weight (unused)
-            mask_w,        0.1,          # ← modality_dropout_prob
-            time_w,        epoch         # ←   ↙ these two were missing
+    train_step,
+    args=(model, optimizer,
+          spec_mb, mask_mb, test_id_mb, wave_mb,
+          beta, 0.0,                                # spec_weight (unused)
+          mask_w, dropout_prob,
+          time_w, epoch,
+          loss_weights)
         )
-    )
+    print("✅ Traced — now starts real training")
 
     # reduce *once* here – no extra reduction in the caller
     return [strategy.reduce(tf.distribute.ReduceOp.MEAN, t, axis=None)
@@ -1019,26 +1077,36 @@ def save_visualizations_and_metrics(model, train_dataset, val_dataset, training_
     #-----------------------------------------------------------------------
     # 2. 3D Latent Space Visualization
     def extract_and_reduce_latents(dataset):
-        # Extract latent vectors from the spectrogram encoder only
         latent_vectors = []
         test_ids = []
-        for spec_in, _, test_id_in, _wave_in in dataset:
-            # Use spectrogram encoder to get latent means.
-            mu, _ = model.spec_encoder(spec_in, training=False)
-            latent_vectors.append(mu.numpy())
-            # Ensure test IDs are flattened to a list
+        for spec_in, mask_in, test_id_in, _wave_in in dataset:
+            # Get latent means from both encoders
+            mu_spec, _ = model.spec_encoder(spec_in, training=False)
+            mu_mask, _ = model.mask_encoder(mask_in, training=False)
+
+            # Strategy A: concatenate
+            z = tf.concat([mu_spec, mu_mask], axis=-1)
+            # Alternatively, Strategy B (average): z = (mu_spec + mu_mask) / 2.0
+
+            latent_vectors.append(z.numpy())
+
+            # Test IDs
             if isinstance(test_id_in, tf.Tensor):
                 test_ids.append(test_id_in.numpy().flatten())
             else:
                 test_ids.append(np.array(test_id_in).flatten())
+
         latent_vectors = np.concatenate(latent_vectors, axis=0)
         test_ids = np.concatenate(test_ids, axis=0)
-        # Reduce dimensionality using UMAP.
+
+        # Dimensionality reduction with UMAP
         reducer = umap.UMAP(n_components=3, random_state=42, n_neighbors=15, min_dist=0.05)
-        latent_3d = reducer.fit_transform(latent_vectors.reshape(latent_vectors.shape[0], -1))
+        latent_3d = reducer.fit_transform(latent_vectors)
         return latent_3d, test_ids
 
+
     latent_3d, train_test_ids = extract_and_reduce_latents(train_dataset)
+
     def plot_latent_space_3d(latent_3d, test_ids):
         df = pd.DataFrame(latent_3d, columns=["UMAP_1", "UMAP_2", "UMAP_3"])
         df["Test ID"] = pd.to_numeric(test_ids, errors="coerce")
@@ -1048,61 +1116,100 @@ def save_visualizations_and_metrics(model, train_dataset, val_dataset, training_
         file_path = os.path.join(plots_dir, "latent_space_3d.html")
         pio.write_html(fig, file=file_path, auto_open=False)
         print(f"Saved 3D latent space plot to {file_path}")
+
     plot_latent_space_3d(latent_3d, train_test_ids)
 
     # 3. Latent Analysis: Compute and save cosine similarity and Euclidean distance histograms using validation data.
     def latent_analysis(dataset):
         latent_vectors = []
-        for spec_in, _, _, _ in dataset:
-            mu, _ = model.spec_encoder(spec_in, training=False)
-            latent_vectors.append(mu.numpy())
+
+        # Run over validation set
+        for spec_in, mask_in, _, _ in dataset:
+            mu, logvar = model.spec_encoder(spec_in, training=False)
+
+            # 🔍 Collapse diagnostic
+            print("μ std across batch:", tf.math.reduce_std(mu).numpy(),
+                "   log σ² mean:", tf.reduce_mean(logvar).numpy())
+
+            mu_mask, _ = model.mask_encoder(mask_in, training=False)
+            z = tf.concat([mu, mu_mask], axis=-1)
+            latent_vectors.append(z.numpy())
+
         latent_vectors = np.concatenate(latent_vectors, axis=0)
-        # For simplicity, compare each latent vector with itself (this is a proxy – in practice, you might compare across modalities)
-        norms = np.linalg.norm(latent_vectors, axis=1, keepdims=True)
-        normalized = latent_vectors / (norms + 1e-8)
-        cosine_similarities = np.dot(normalized, normalized.T).diagonal()
-        euclidean_distances = np.linalg.norm(latent_vectors - latent_vectors, axis=1)  # Will be zeros, so for demo we use a dummy.
-        # For demonstration, we create histograms for cosine similarities.
-        fig = go.Figure(data=go.Histogram(x=cosine_similarities, histnorm='probability density', marker_color='blue', opacity=0.7))
-        fig.update_layout(title="Cosine Similarity Distribution (Validation Latents)",
-                          xaxis_title="Cosine Similarity", yaxis_title="Probability Density", template="plotly_white")
+
+        # Cosine similarity (across pairs)
+        from sklearn.metrics.pairwise import cosine_similarity
+        cos_sim_matrix = cosine_similarity(latent_vectors)
+        upper = cos_sim_matrix[np.triu_indices_from(cos_sim_matrix, k=1)]
+
+        fig = go.Figure(data=go.Histogram(
+            x=upper,
+            histnorm='probability density',
+            marker_color='blue',
+            opacity=0.7))
+        fig.update_layout(
+            title="Cosine Similarity Distribution (Validation Latents)",
+            xaxis_title="Cosine Similarity",
+            yaxis_title="Probability Density",
+            template="plotly_white")
         file_path = os.path.join(plots_dir, "cosine_similarity_hist.html")
         pio.write_html(fig, file=file_path, auto_open=False)
         print(f"Saved cosine similarity histogram to {file_path}")
-        # (Similarly, you can plot other metrics if needed.)
-        return {"avg_cosine_similarity": float(np.mean(cosine_similarities))}
-    
+
+        return {"avg_cosine_similarity": float(np.mean(upper))}
+
     latent_metrics = latent_analysis(val_dataset)
     print("Latent analysis metrics:", latent_metrics)
 
+
     # 4. Latent Interpolation
-    def latent_interpolation(dataset):
+    def latent_interpolation(dataset, latent_dim=256):
         for spec_batch, mask_batch, _, _ in dataset.take(1):
             if spec_batch.shape[0] < 2:
                 print("Need at least 2 samples for interpolation")
                 return
-            source_spec = tf.expand_dims(spec_batch[0], 0)
-            target_spec = tf.expand_dims(spec_batch[1], 0)
-            mu_source, _ = model.spec_encoder(source_spec, training=False)
-            mu_target, _ = model.spec_encoder(target_spec, training=False)
-            source_z = mu_source
-            target_z = mu_target
+
+            # pick two samples
+            src_spec = tf.expand_dims(spec_batch[0], 0)
+            tgt_spec = tf.expand_dims(spec_batch[1], 0)
+            src_mask = tf.expand_dims(mask_batch[0], 0)
+            tgt_mask = tf.expand_dims(mask_batch[1], 0)
+
+            μ_spec_src, _ = model.spec_encoder(src_spec,  training=False)
+            μ_spec_tgt, _ = model.spec_encoder(tgt_spec,  training=False)
+            μ_mask_src, _ = model.mask_encoder(src_mask,  training=False)
+            μ_mask_tgt, _ = model.mask_encoder(tgt_mask,  training=False)
+
             num_steps = 8
             alphas = np.linspace(0, 1, num_steps)
-            plt.figure(figsize=(num_steps * 2, 4))
-            for i, alpha in enumerate(alphas):
-                interp_z = (1 - alpha) * source_z + alpha * target_z
-                interp_spec = model.spec_decoder(interp_z, training=False)
-                plt.subplot(1, num_steps, i+1)
-                plt.imshow(interp_spec[0, :, :, 0].numpy(), aspect='auto', cmap='viridis')
-                plt.title(f"α={alpha:.1f}")
+
+            plt.figure(figsize=(num_steps * 2, 6))
+            for i, a in enumerate(alphas):
+                z_spec = (1 - a) * μ_spec_src + a * μ_spec_tgt
+                z_mask = (1 - a) * μ_mask_src + a * μ_mask_tgt
+
+                recon_spec = model.spec_decoder(z_spec,  training=False)
+                recon_mask = model.mask_decoder(z_mask,  training=False)
+
+                # top row: spectrogram
+                plt.subplot(2, num_steps, i + 1)
+                plt.imshow(recon_spec[0, :, :, 0], aspect='auto', cmap='viridis')
+                plt.title(f"α={a:.1f}")
                 plt.axis('off')
+
+                # bottom row: mask
+                plt.subplot(2, num_steps, num_steps + i + 1)
+                plt.imshow(recon_mask[0, :, :, 0], cmap='gray')
+                plt.axis('off')
+
             plt.tight_layout()
-            interp_path = os.path.join(output_dir, "latent_interpolation.png")
-            plt.savefig(interp_path, dpi=300)
+            out = os.path.join(output_dir, "latent_interpolation.png")
+            plt.savefig(out, dpi=300)
             plt.close()
-            print(f"Saved latent interpolation plot to {interp_path}")
+            print(f"Saved latent interpolation plot to {out}")
             break
+
+    
     latent_interpolation(val_dataset)
 
     # 5. Save model weight statistics.
@@ -1120,7 +1227,63 @@ def save_visualizations_and_metrics(model, train_dataset, val_dataset, training_
         print("🔍 Weight stats saved →", out_path)
 
     
-    save_model_weights_stats()
+    save_model_weights_stats(model, os.path.join(output_dir, "weights_summary.txt"))
+
+
+    # 6. Print training summary
+    def summarize_training(metrics, out_path=None):
+        print("\n📊 Final Training Summary:")
+
+        def delta(final, first):
+            return f"{final:.4f} (Δ {final - first:+.4f})"
+
+        n_epochs = len(metrics['train_total'])
+        best_epoch = np.argmin(metrics['val_total']) + 1
+        best_val_total = np.min(metrics['val_total'])
+
+        summary = {
+            "epochs": n_epochs,
+            "best_val_loss": float(best_val_total),
+            "best_val_epoch": best_epoch,
+            "final": {},
+            "deltas": {}
+        }
+
+        def print_metric(key, name, train=True):
+            train_key = f"train_{key}"
+            val_key = f"val_{key}"
+
+            if train_key in metrics and val_key in metrics:
+                val_first, val_final = metrics[val_key][0], metrics[val_key][-1]
+                train_first, train_final = metrics[train_key][0], metrics[train_key][-1]
+                print(f"  {name:10} | "
+                    f"Train: {delta(train_final, train_first)}   "
+                    f"Val: {delta(val_final, val_first)}")
+
+                summary['final'][train_key] = float(train_final)
+                summary['final'][val_key] = float(val_final)
+                summary['deltas'][train_key] = float(train_final - train_first)
+                summary['deltas'][val_key] = float(val_final - val_first)
+
+        print(f"🧪 Epochs: {n_epochs}")
+        print(f"📌 Best Val Total Loss: {best_val_total:.4f} (Epoch {best_epoch})")
+        print()
+
+        print_metric("total", "Total Loss")
+        print_metric("mask",  "Mask Loss")
+        print_metric("js",    "JS Divergence")
+        print_metric("time",  "Time Loss")
+        print_metric("mrstft","MRSTFT")
+        print_metric("grad",  "Grad Loss")
+        print_metric("lap",   "Laplacian")
+        print_metric("damage","Damage")
+
+        if out_path:
+            with open(out_path, "w") as f:
+                json.dump(summary, f, indent=2)
+            print(f"\n📝 Summary saved to: {out_path}")
+        
+        summarize_training(training_metrics, out_path=os.path.join(output_dir, "training_summary.json"))
 
     # Optionally, you can return all gathered metrics:
     return {
@@ -1130,240 +1293,230 @@ def save_visualizations_and_metrics(model, train_dataset, val_dataset, training_
 
 # ----- Main Function -----
 def main():
-    # ------------------------------------------------------------------
-    # 0)  Params
-    # ------------------------------------------------------------------
-    debug_mode     = False
-    latent_dim     = 256
-    batch_size     = 128
-    total_epochs   = 1000
-    patience       = 300
-    resume_training = False
+    """Run a sweep over different β‑values and weight configurations.
+    Each configuration gets its own sub‑folder (e.g. `results_mmvae/beta_0_03_cfg_1/`).
+    After every run we append one line to `results_mmvae/beta_sweep_summary.csv`
+    so you can compare them later.
 
-    unfreeze_istft_epoch = 30
-    max_beta       = 0.2
-    beta_warmup_epochs = 100
-    beta_schedule   = "linear" # "linear", "cyclical", "constant"
+    If `resume_training` is **True** and a sub‑folder already contains
+    `training_metrics.npy` and model weights, the run will be resumed
+    instead of re‑trained from scratch.
+    """
+
+    # ------------------------------------------------------------------
+    # 0)  Sweep parameters & globals
+    # ------------------------------------------------------------------
+    debug_mode           = False
+    latent_dim           = 256
+    batch_size           = 128
+    total_epochs         = 2
+    patience             = 50
+    resume_training      = False
+
+    unfreeze_istft_epoch = 100
+    beta_warmup_epochs   = 60
+    beta_schedule        = "linear"
     modality_dropout_prob = 0.0
 
-    #spec_params
+    #  Dataset params
     segment_duration = 4.0
-    nperseg        = 256
-    noverlap       = 224
-    sample_rate    = 200
+    nperseg          = 256
+    noverlap         = 224
+    sample_rate      = 200
+
+    #  Sweep values
+    beta_sweep = [0.06, 0.10]
+    weight_configs = [
+        # A
+        {"mrstft": 1.0, "grad": 0.3, "lap": 0.3, "mag": 0.3, "damage": 150.0},
+        # B
+        {"mrstft": 0.7, "grad": 0.1, "lap": 0.1, "mag": 0.1, "damage": 300.0},
+        # C
+        {"mrstft": 1.3, "grad": 0.5, "lap": 0.5, "mag": 0.5, "damage":  75.0},
+        # D
+        {"mrstft": 1.0, "grad": 0.8, "lap": 0.8, "mag": 0.3, "damage": 150.0},
+        # E
+        {"mrstft": 1.0, "grad": 0.3, "lap": 0.3, "mag": 0.8, "damage": 150.0},
+        # F (ablation)
+        {"mrstft": 1.0, "grad": 0.3, "lap": 0.3, "mag": 0.3, "damage":   0.0},
+    ]
 
 
-    # output folders ---------------------------------------------------
-    os.makedirs("logs", exist_ok=True)
-    os.makedirs("../results_mmvae",               exist_ok=True)
-    os.makedirs("../results_mmvae/model_checkpoints", exist_ok=True)
-    os.makedirs("../results_mmvae/latent_analysis",   exist_ok=True)
-    os.makedirs("../results_mmvae/cross_modal",       exist_ok=True)
+    #  Base directory
+    project_root = os.path.abspath(os.path.dirname(__file__))
+    base_dir = os.path.abspath(os.path.join(project_root, ".."))
 
-    # Cache paths 
-    tag = f"{segment_duration:.2f}s_{nperseg}_{noverlap}"
-    cache_dir = "cache"
-    os.makedirs(cache_dir, exist_ok=True)
+    #  One summary file for the whole sweep
+    sweep_log_path = os.path.join(base_dir, "results_mmvae", "beta_sweep_summary.csv")
+    os.makedirs(os.path.join(base_dir, "results_mmvae"), exist_ok=True)
 
-    final_path = os.path.join(cache_dir, f"specs_{tag}.npy")
-    heatmaps_path = os.path.join(cache_dir, f"masks_{tag}.npy")
-    ids_path = os.path.join(cache_dir, f"segIDs_{tag}.npy")
-    segments_path = os.path.join(cache_dir, f"segments_{tag}.npy")
+    with open(sweep_log_path, "w", newline="") as log_file:
+        writer = csv.writer(log_file)
+        writer.writerow(["beta", "cfg", "best_val_total", "final_val_total", "final_val_js", "final_val_mrstft"])
 
-    # ------------------------------------------------------------------
-    # 1)  LOAD PROCESSED FEATURES
-    # ------------------------------------------------------------------
-    all_cached = (os.path.exists(final_path) and
-                os.path.exists(heatmaps_path) and
-                os.path.exists(ids_path) and
-                os.path.exists(segments_path))
+        for max_beta in beta_sweep:
+            for cfg_idx, weights in enumerate(weight_configs):
+                run_name = f"beta_{max_beta:.2f}_cfg_{cfg_idx}".replace(".", "_")
+                output_dir = os.path.join(base_dir, "results_mmvae", run_name)
+                os.makedirs(output_dir, exist_ok=True)
 
-    if all_cached:
-        print("✅  Loading cached NumPy arrays …")
-        spectral_features = np.load(final_path,    mmap_mode="r")
-        mask_segments     = np.load(heatmaps_path, mmap_mode="r")
-        test_ids          = np.load(ids_path,      mmap_mode="r")
-        segments          = np.load(segments_path, mmap_mode="r")
+                for sub in ("logs", "model_checkpoints", "latent_analysis", "cross_modal", "plots"):
+                    os.makedirs(os.path.join(output_dir, sub), exist_ok=True)
 
-    else:
-        print("⚠️  Cache missing – computing everything from raw data …")
-        # ------------- call the unified loader -------------
-        (_,       # accel_dict (not needed here)
-        _,       # binary_masks
-        heatmaps,
-        segments,
-        spectrograms,      # (N, F, T, 2C)         – log‑mag | phase
-        test_ids
-        ) = data_loader.load_data(
-                segment_duration = segment_duration,
-                nperseg          = nperseg,
-                noverlap         = noverlap,
-                sample_rate      = sample_rate,
-                recompute        = False,
-                cache_dir        = cache_dir 
-            )
+                # 1)  Load / compute cached input tensors
+                tag = f"{segment_duration:.2f}s_{nperseg}_{noverlap}"
+                cache_dir       = os.path.join(base_dir, "cache")
+                os.makedirs(cache_dir, exist_ok=True)
+                final_path      = os.path.join(cache_dir, f"specs_{tag}.npy")
+                heatmaps_path   = os.path.join(cache_dir, f"masks_{tag}.npy")
+                ids_path        = os.path.join(cache_dir, f"segIDs_{tag}.npy")
+                segments_path   = os.path.join(cache_dir, f"segments_{tag}.npy")
 
-        # the loader already returns spectrograms in (N, F, T, 2C)
-        spectral_features = spectrograms
-        mask_segments     = np.stack([heatmaps[tid] for tid in test_ids], axis=0)
+                if all(map(os.path.exists, [final_path, heatmaps_path, ids_path, segments_path])):
+                    print("✅  Loading cached NumPy arrays …")
+                    spectral_features = np.load(final_path, mmap_mode="r")
+                    mask_segments = np.load(heatmaps_path, mmap_mode="r")
+                    test_ids = np.load(ids_path, mmap_mode="r")
+                    segments = np.load(segments_path, mmap_mode="r")
+                else:
+                    print("⚠️  Cache missing – computing everything from raw data …")
+                    (_, _, heatmaps, segments, spectrograms, test_ids) = data_loader.load_data(
+                        segment_duration=segment_duration,
+                        nperseg=nperseg,
+                        noverlap=noverlap,
+                        sample_rate=sample_rate,
+                        recompute=False,
+                        cache_dir=cache_dir)
+                    spectral_features = spectrograms
+                    mask_segments = np.stack([heatmaps[tid] for tid in test_ids], axis=0)
+                    np.save(final_path, spectral_features)
+                    np.save(heatmaps_path, mask_segments)
+                    np.save(ids_path, test_ids)
+                    np.save(segments_path, segments)
+                    print("✅  Written new cache files.")
 
-        # ---- write them to the “global” cache for next run -------------
-        np.save(final_path,    spectral_features)
-        np.save(heatmaps_path, mask_segments)
-        np.save(ids_path,      test_ids)
-        np.save(segments_path, segments)
-        print("✅  Written new cache files.")
+                # 2)  Train / Val split + tf.data
+                N = spectral_features.shape[0]
+                perm = np.random.permutation(N)
+                train_size = int(0.8 * N)
+                train_idx, val_idx = perm[:train_size], perm[train_size:]
 
-    print(f"Spectrograms : {spectral_features.shape}")
-    print(f"Masks        : {mask_segments.shape}")
-    print(f"Test‑IDs     : {test_ids.shape}")
-    print(f"Segments     : {segments.shape}")
+                train_ds = create_tf_dataset(spectral_features[train_idx], mask_segments[train_idx],
+                                            test_ids[train_idx], segments[train_idx],
+                                            batch_size, debug_mode, augment=True)
+                val_ds = create_tf_dataset(spectral_features[val_idx], mask_segments[val_idx],
+                                        test_ids[val_idx], segments[val_idx],
+                                        batch_size, debug_mode, augment=False)
 
+                print(f"✅  Train batches: {sum(1 for _ in train_ds)}  |  Val batches: {sum(1 for _ in val_ds)}")
 
-    # ------------------------------------------------------------------
-    # 2)  TRAIN / VAL split
-    # ------------------------------------------------------------------
-    N           = spectral_features.shape[0]
-    perm        = np.random.permutation(N)
-    train_size  = int(0.8 * N)
-    train_idx   = perm[:train_size]
-    val_idx     = perm[train_size:]
+                strategy = tf.distribute.MirroredStrategy()
 
-    train_spec  = spectral_features[train_idx]
-    val_spec    = spectral_features[val_idx]
-    train_mask  = mask_segments[train_idx]
-    val_mask    = mask_segments[val_idx]
-    train_ids   = test_ids[train_idx]
-    val_ids     = test_ids[val_idx]
-    train_seg   = segments[train_idx]
-    val_seg     = segments[val_idx]
+                with strategy.scope():
+                    spec_shape = spectral_features.shape[1:]
+                    mask_shape = (32, 96, 1)
 
-    print(f"Train set : {train_spec.shape[0]}  |  Val set : {val_spec.shape[0]}")
+                    model = SpectralMMVAE(latent_dim, spec_shape, mask_shape, nperseg, noverlap)
+                    _ = model(tf.zeros((1, *spec_shape)), tf.zeros((1, *mask_shape)), training=True)
 
-    # ------------------------------------------------------------------
-    # 3)  Build tf.data Datasets
-    # ------------------------------------------------------------------
-    train_dataset = create_tf_dataset(train_spec, train_mask, train_ids, train_seg,
-                                      batch_size, debug_mode=debug_mode)
-    val_dataset   = create_tf_dataset(val_spec,   val_mask,  val_ids, val_seg,
-                                      batch_size, debug_mode=debug_mode)
+                    dummy_time_len = tf.constant(int(segment_duration * sample_rate), tf.int32)
+                    _ = model.istft_layer(tf.zeros((1, *spec_shape)), dummy_time_len)
 
-    print(f"✅  Train batches: {sum(1 for _ in train_dataset)}")
-    print(f"✅  Val   batches: {sum(1 for _ in val_dataset)}")
+                    lr_schedule = ExponentialDecay(5e-5, decay_steps=10_000, decay_rate=0.9, staircase=True)
+                    optimizer = AdamW(learning_rate=lr_schedule, weight_decay=1e-4)
+                    init_accumulators(model)
 
-    # ------------------------------------------------------------------
-    # 4)  Training‑loop
-    # ------------------------------------------------------------------
-    best_weights_path  = "results_mmvae/best_spectral_mmvae.weights.h5"
-    final_weights_path = "results_mmvae/final_spectral_mmvae.weights.h5"
+                    metrics_path = os.path.join(output_dir, "training_metrics.npy")
+                    final_weights_path = os.path.join(output_dir, "final_spectral_mmvae.weights.h5")
 
-    metrics_path = "results_mmvae/training_metrics.npy"
-    if resume_training and os.path.exists(metrics_path):
-        all_metrics = np.load(metrics_path, allow_pickle=True).item()
-        print("✅  Loaded previous metrics for resuming.")
-    else:
-        all_metrics = {
-            'train_total': [], 'train_mask': [], 'train_js': [], 'train_time': [], 'train_mrstft': [],
-            'train_grad': [], 'train_lap': [], 'train_damage': [],
-            'val_total':   [], 'val_mask':   [], 'val_js':   [], 'val_time': [], 'val_mrstft': [],
-            'val_grad':   [], 'val_lap':   [], 'val_damage': []
-        }
+                    if resume_training and os.path.exists(metrics_path) and os.path.exists(final_weights_path):
+                        print("🔄  Resuming previous run …")
+                        model.load_weights(final_weights_path)
+                        metrics = np.load(metrics_path, allow_pickle=True).item()
+                        start_epoch_offset = len(metrics["train_total"])
+                    else:
+                        metrics = {k: [] for k in (
+                            "train_total", "train_mask", "train_js", "train_time", "train_mrstft",
+                            "train_grad", "train_lap", "train_damage", "train_mag",     # <-- NEW
+                            "val_total",   "val_mask",   "val_js",   "val_time", "val_mrstft",
+                            "val_grad",   "val_lap",   "val_damage", "val_mag"          # <-- NEW
+                        )}
 
+                        start_epoch_offset = 0
 
-    start_epoch = len(all_metrics['train_total'])
-    early_stopped = False
+                    new_metrics = train_spectral_mmvae(
+                        model, output_dir, train_ds, val_ds, optimizer,
+                        num_epochs=total_epochs - start_epoch_offset,
+                        patience=patience,
+                        beta_schedule=beta_schedule,
+                        modality_dropout_prob=modality_dropout_prob,
+                        strategy=strategy,
+                        unfreeze_epoch=unfreeze_istft_epoch,
+                        beta_warmup_epochs=beta_warmup_epochs,
+                        max_beta=max_beta,
+                        loss_weights=weights  # <-- NEW ARGUMENT
+                    )
 
-    strategy = tf.distribute.MirroredStrategy()
+                    for k in metrics:
+                        metrics[k].extend(new_metrics[k])
 
-    with strategy.scope():
-        spec_shape = spectral_features.shape[1:]          # (F, T, 2C)
-        mask_shape = (32, 96, 1)
+                    model.save_weights(final_weights_path)
+                    np.save(metrics_path, metrics)
 
-        model = SpectralMMVAE(latent_dim, spec_shape, mask_shape, nperseg, noverlap)
+                    try:
+                        save_visualizations_and_metrics(model, train_ds, val_ds, metrics, output_dir=output_dir)
+                    except Exception as e:
+                        print("❌ Visualization failed:", e)
 
-        # build graph
-        dummy_spec = tf.zeros((1, *spec_shape))
-        dummy_mask = tf.zeros((1, *mask_shape))
-        _ = model(dummy_spec, dummy_mask, training=True)
+                    # ----------------------------------------------------------
+                    # 4)  Log summary rows
+                    # ----------------------------------------------------------
+                    best_val_total  = float(np.min(metrics['val_total']))
+                    final_val_total = float(metrics['val_total'][-1])
+                    writer.writerow([
+                        max_beta, cfg_idx,  # <-- add cfg_idx here
+                        best_val_total,
+                        final_val_total,
+                        float(np.min(metrics['val_js'])),
+                        float(np.min(metrics['val_mrstft'])),
+                    ])
+                    log_file.flush()
 
-        lr_schedule = ExponentialDecay(
-            initial_learning_rate=5e-5,
-            decay_steps=10_000,
-            decay_rate=0.9,
-            staircase=True)
+                    # ---------- NEW: per-loss summary ----------
+                    loss_csv = os.path.join(base_dir, "results_mmvae", "loss_sweep_summary.csv")
+                    header = [
+                        "beta", "cfg",
+                        "cfg_mrstft", "cfg_grad", "cfg_lap", "cfg_mag", "cfg_damage",  # 🆕
+                        "best_total", "best_mask", "best_js",
+                        "best_time", "best_mrstft", "best_grad", "best_lap", "best_mag", "best_damage"
+                    ]
+                    write_header = not os.path.exists(loss_csv)
 
-        # AdamW
-        base_optimizer = AdamW(
-            learning_rate=lr_schedule,
-            weight_decay=1e-4,
-            beta_1=0.9,
-            beta_2=0.999,
-            epsilon=1e-6)
+                    def _best(lst):
+                        return float(np.min(lst)) if lst else ''
 
-        optimizer      = base_optimizer
+                    with open(loss_csv, "a", newline="") as f_loss:
+                        w = csv.writer(f_loss)
+                        if write_header:
+                            w.writerow(header)
+                        w.writerow([
+                            max_beta, cfg_idx,
+                            weights["mrstft"], weights["grad"], weights["lap"], weights["mag"], weights["damage"],
+                            _best(metrics['val_total']),
+                            _best(metrics['val_mask']),
+                            _best(metrics['val_js']),
+                            _best(metrics['val_time']),
+                            _best(metrics['val_mrstft']),
+                            _best(metrics['val_grad']),
+                            _best(metrics['val_lap']),
+                            _best(metrics['val_mag']),
+                            _best(metrics['val_damage']),
+                        ])
 
-        init_accumulators(model)     
+                print(f"🎉  Finished run for β = {max_beta:.3f} — results in '{output_dir}'")
 
-        if start_epoch > 0:
-            if os.path.exists(best_weights_path):
-                model.load_weights(best_weights_path)
-                print(f"✅ Loaded best weights (epoch {start_epoch}).")
-            elif os.path.exists(final_weights_path):
-                model.load_weights(final_weights_path)
-                print(f"✅ Loaded final weights (epoch {start_epoch}).")
-            else:
-                print(f"🚨 WARNING: No weights file found to resume from at epoch {start_epoch}!")
-        else:
-            print("✨ Starting training from scratch.")
-
-        metrics = train_spectral_mmvae(
-            model,
-            train_dataset,
-            val_dataset,
-            optimizer,
-            num_epochs           = total_epochs, 
-            patience             = patience,
-            beta_schedule        = beta_schedule,
-            modality_dropout_prob= modality_dropout_prob,
-            strategy             = strategy,
-            unfreeze_epoch       = unfreeze_istft_epoch,
-            beta_warmup_epochs   = beta_warmup_epochs,
-            max_beta            = max_beta,
-        )
-
-        for k in all_metrics:
-            all_metrics[k].extend(metrics[k])
-
-        if not early_stopped:
-            model.save_weights("results_mmvae/final_spectral_mmvae.weights.h5")
-            model.save("results_mmvae/final_model_spectral_mmvae.keras")
-            assert os.path.exists("results_mmvae/final_model_spectral_mmvae.keras"), "❌ Model save failed — file not found"
-            print("📦 Saved model to:", os.path.abspath("../results_mmvae/final_model_spectral_mmvae.keras"))
-            print("✅ Saved final model (full run, no early stopping)")
-
-        np.save("results_mmvae/training_metrics.npy", all_metrics)
-
-    # --- CLEAN-UP: free VRAM & graph ---------------------------------
-    tf.keras.backend.clear_session()
-    gc.collect()
-
-    print("\n✅  Training finished.")
-
-    # ------------------------------------------------------------------
-    # 5)  Save metrics & visualisations
-    # ------------------------------------------------------------------
-    np.save("results_mmvae/training_metrics.npy", all_metrics)
-
-    vis_metrics = save_visualizations_and_metrics(
-        model,
-        train_dataset,
-        val_dataset,
-        all_metrics,
-        output_dir="results_mmvae"
-    )
-
-    print("🎉  Everything done – results in  'results_mmvae/'")
-
+                tf.keras.backend.clear_session()
+                gc.collect()
 
 
 if __name__ == "__main__":

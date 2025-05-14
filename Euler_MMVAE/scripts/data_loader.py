@@ -78,8 +78,8 @@ def augment_fn(spec, mask, tid, wave):
     mag  = spec[..., 0::2] * gain               # scale magnitude only
     spec = tf.concat([mag, spec[..., 1::2]], -1)
 
-    # 3. sensor-axis sign-flip  (50 %)
-    flip = tf.random.uniform([]) > 0.5
+    # 3. sensor-axis sign-flip  (25 %)
+    flip = tf.random.uniform([]) > 0.25
     wave = tf.where(flip, -wave, wave)
     phase = spec[..., 1::2] + tf.where(flip, np.pi, 0.0)
     spec  = tf.concat([spec[..., 0::2], phase], -1)
@@ -88,15 +88,17 @@ def augment_fn(spec, mask, tid, wave):
     noise = _make_pink(tf.shape(wave)) * 0.005
     wave  = wave + noise
 
-    # 5. SpecAug-style frequency drop (1-3 bins)
-    f_drop = tf.random.uniform([], 1, 4, tf.int32)
-    f0     = tf.random.uniform([], 0, tf.shape(spec)[0] - f_drop, tf.int32)
-    zeros  = tf.zeros_like(spec[f0:f0+f_drop, :, 0::2])
-    spec = tf.tensor_scatter_nd_update(
-              spec,
-              indices=tf.range(f0, f0+f_drop)[:,None],
-              updates=tf.concat([zeros,
-                                 spec[f0:f0+f_drop,:,1::2]], -1))
+    # 5. SpecAug-style frequency drop (1–3 bins), applied with 30% probability
+    if tf.random.uniform([]) < 0.3:
+        f_drop = tf.random.uniform([], 1, 4, tf.int32)
+        f0     = tf.random.uniform([], 0, tf.shape(spec)[0] - f_drop, tf.int32)
+        zeros  = tf.zeros_like(spec[f0:f0+f_drop, :, 0::2])
+        spec = tf.tensor_scatter_nd_update(
+            spec,
+            indices=tf.range(f0, f0 + f_drop)[:, None],
+            updates=tf.concat([zeros,
+                               spec[f0:f0 + f_drop, :, 1::2]], -1))
+
 
     return spec, mask, tid, wave
 # ─────────────────────────────────────────────────────────────────
@@ -535,13 +537,18 @@ class TFInverseISTFT(tf.keras.layers.Layer):
             frame_step,
             forward_window_fn=tf.signal.hann_window
         )
-        # Add learnable scalar for magnitude scaling
-        self.beta = self.add_weight(
-            name="beta",
-            shape=(),
-            initializer=tf.keras.initializers.Ones(),
-            trainable=True,
-        )
+       
+        self.beta = None                            # placeholder
+
+    def build(self, input_shape):
+        if self.beta is None:                       # create only once
+            self.beta = self.add_weight(
+                name="beta",
+                shape=(),
+                initializer=tf.keras.initializers.Ones(),
+                trainable=True,
+            )
+    # ----------------------------------------------------------------
 
     def call(self, spec_logits, length):
         B = tf.shape(spec_logits)[0]
@@ -564,7 +571,7 @@ class TFInverseISTFT(tf.keras.layers.Layer):
         imag = tf.cast(imag, tf.float32)
 
         complex_spec = tf.complex(real, imag)
-        complex_spec = tf.transpose(complex_spec, [0,2,1])  # [B*C, T, F]
+        complex_spec = tf.transpose(complex_spec, [0, 2, 1])  # [B*C, T, F]
 
         wav = tf.signal.inverse_stft(
             complex_spec,
@@ -575,13 +582,13 @@ class TFInverseISTFT(tf.keras.layers.Layer):
 
         # pad or crop
         wav = wav[:, :length]
-        wav = tf.pad(wav, [[0,0], [0, tf.maximum(0, length - tf.shape(wav)[1])]])
+        wav = tf.pad(wav, [[0, 0], [0, tf.maximum(0, length - tf.shape(wav)[1])]])
 
         # [B*C, L] → [B, L, C]
         wav = tf.reshape(wav, [B, C, length])
-        wav = tf.transpose(wav, [0,2,1])
+        wav = tf.transpose(wav, [0, 2, 1])
         return wav
-    
+
     def get_config(self):
         config = super().get_config()
         config.update({
@@ -593,71 +600,6 @@ class TFInverseISTFT(tf.keras.layers.Layer):
     @classmethod
     def from_config(cls, config):
         return cls(**config)
-
-
-# class TFInverseISTFT(tf.keras.layers.Layer):
-#     def __init__(self, frame_length=256, frame_step=32, **kwargs):
-#         super().__init__(**kwargs)
-#         self.frame_length = frame_length
-#         self.frame_step   = frame_step
-#         self.window_fn = tf.signal.inverse_stft_window_fn(
-#             frame_step,
-#             forward_window_fn=tf.signal.hann_window
-#         )
-#         # Add learnable scalar for magnitude scaling
-#         self.beta = self.add_weight(
-#             name="beta",
-#             shape=(),
-#             initializer=tf.keras.initializers.Ones(),
-#             trainable=True,
-#         )
-
-#     def call(self, spec_logits, length):
-#         B = tf.shape(spec_logits)[0]
-#         D = tf.shape(spec_logits)[3]
-#         C = D // 2
-
-#         # Clip to prevent extreme values before exp
-#         log_mag = tf.clip_by_value(spec_logits[..., 0::2], -8.0, 5.0)
-#         phase   = spec_logits[..., 1::2]
-
-#         # Learnable exp for magnitude
-#         mag = tf.exp(self.beta * log_mag)
-
-#         # Wrap phase to [-pi, pi] using angle(exp(i*phase))
-#         phase = tf.math.angle(tf.exp(tf.complex(tf.zeros_like(phase), phase)))
-
-#         mag   = tf.reshape(mag,   [B*C, tf.shape(mag)[1], tf.shape(mag)[2]])
-#         phase = tf.reshape(phase, [B*C, tf.shape(phase)[1], tf.shape(phase)[2]])
-
-#         tf.print("🌀 Phase range:", tf.reduce_min(phase), tf.reduce_max(phase))
-#         tf.print("📈 Mag range:", tf.reduce_min(mag), tf.reduce_max(mag))
-
-
-#         real = mag * tf.cos(phase)
-#         imag = mag * tf.sin(phase)
-#         real = tf.cast(real, tf.float32)
-#         imag = tf.cast(imag, tf.float32)
-
-#         complex_spec = tf.complex(real, imag)
-#         complex_spec = tf.transpose(complex_spec, [0,2,1])  # [B*C, T, F]
-
-#         wav = tf.signal.inverse_stft(
-#             complex_spec,
-#             self.frame_length,
-#             self.frame_step,
-#             window_fn=self.window_fn
-#         )
-
-#         # pad or crop
-#         wav = wav[:, :length]
-#         wav = tf.pad(wav, [[0,0], [0, tf.maximum(0, length - tf.shape(wav)[1])]])
-
-#         # [B*C, L] → [B, L, C]
-#         wav = tf.reshape(wav, [B, C, length])
-#         wav = tf.transpose(wav, [0,2,1])
-#         return wav   
-
 
 ######################################
 # Mask pre- and postprocessing
