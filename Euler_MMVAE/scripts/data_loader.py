@@ -473,59 +473,6 @@ def inverse_spectrogram(
 
     return time_series.numpy()
 
-# trainable ISTFT for PyTorch
-class DifferentiableISTFT(nn.Module):
-    def __init__(self, nperseg=256, noverlap=128):
-        super().__init__()
-        self.nperseg   = nperseg
-        self.hop_len   = nperseg - noverlap
-        # register the window as a buffer so it moves with .to(device)
-        self.register_buffer('window',
-            torch.hann_window(nperseg), persistent=False)
-
-    def forward(self, spec, length):
-        # spec: (B, F, T, 2*C)
-        B, F, T, D = spec.shape
-        C = D // 2
-
-        # reshape so we can batch‐proces all channels at once:
-        # → (B*C, F, T), interleaving the channel dims
-        spec = spec.view(B, F, T, C, 2)
-        log_mag = spec[..., 0]              # (B, F, T, C)
-        phase   = spec[..., 1]
-
-        # to (B*C,  F,  T)
-        log_mag = log_mag.permute(0,3,1,2).reshape(-1, F, T)
-        phase   = phase.permute(0,3,1,2).reshape(-1, F, T)
-
-        # back to linear magnitude
-        mag = torch.expm1(log_mag)
-
-        # complex STFT bins: (B*C, F, T) → (B*C, F, T, 2)
-        real = mag * torch.cos(phase)
-        imag = mag * torch.sin(phase)
-        complex_spec = torch.stack([real, imag], dim=-1)
-
-        # istft wants shape (..., freq, frame, 2)
-        # so our complex_spec is already (..., F, T, 2)
-        wav = torch.istft(
-            complex_spec,
-            n_fft=self.nperseg,
-            hop_length=self.hop_len,
-            win_length=self.nperseg,
-            window=self.window,
-            center=False,
-            normalized=False,
-            onesided=True,
-            length=length
-        )
-        # wav: (B*C, length)
-        # reshape → (B, C, length) → (B, length, C)
-        wav = wav.view(B, C, -1).permute(0,2,1)
-        return wav
-    
-    import tensorflow as tf
-
 # trainable TensorFlow inverse stft for MMVAE
 @tf.keras.saving.register_keras_serializable('mmvae')
 class TFInverseISTFT(tf.keras.layers.Layer):
@@ -632,27 +579,30 @@ def compute_binary_mask(combined_image):
     mask2 = cv2.inRange(hsv, np.array([170, 70, 50]), np.array([180, 255, 255]))
     return cv2.bitwise_or(mask1, mask2).astype(np.uint8)
 
-def mask_to_heatmap(orig_mask, target_size=(32, 96), apply_blur=False, blur_kernel=(3,3)):
+def mask_to_heatmap(orig_mask,
+                    target_size=(32, 96),
+                    interpolation=cv2.INTER_AREA,
+                    apply_blur=False,
+                    blur_kernel=(3,3),
+                    binarize=False,
+                    threshold=0.0001):
     """
-    Converts a high-res binary mask (H×W) to a coarse heatmap (target_size).
-    Each pixel of the heatmap ~ fraction_of_masked_pixels_in_that_region.
+    Converts a high-res binary mask (H×W) to a coarse or binary downsampled mask.
     """
-    # If mask is in {0,255}, convert to {0,1}
     if orig_mask.max() > 1:
         orig_mask = (orig_mask > 0).astype(np.float32)
-    
-    # Downsample using INTER_AREA (area averaging)
+
     newH, newW = target_size
-    heatmap = cv2.resize(orig_mask.astype(np.float32),
-                         (newW, newH),
-                         interpolation=cv2.INTER_AREA)
-    
-    # Optional smoothing
+    heatmap = cv2.resize(orig_mask, (newW, newH), interpolation=interpolation)
+
     if apply_blur:
         heatmap = cv2.GaussianBlur(heatmap, blur_kernel, sigmaX=0)
-    
-    # Ensure in [0,1]
+
     heatmap = np.clip(heatmap, 0.0, 1.0)
+
+    if binarize:
+        heatmap = (heatmap > threshold).astype(np.float32)
+
     return heatmap
 
 def mask_recon(downsampled_masks, target_size=(256, 768), interpolation=cv2.INTER_LINEAR):
@@ -762,7 +712,13 @@ def load_data(segment_duration: float = 4.0,
         comb = load_combined_label(tid, LABELS_DIR, IMAGE_SHAPE)
         bin_mask = compute_binary_mask(comb)
         binary_masks[tid] = bin_mask
-        heatmap = mask_to_heatmap(bin_mask, (32, 96), True, (3, 3))
+        heatmap = mask_to_heatmap(
+            bin_mask,
+            target_size=(32, 96),
+            interpolation=cv2.INTER_AREA,  # soft downsampling
+            binarize=True,                 # binarize afterward
+            threshold=0.03                 # or adjust if needed
+        )
         heatmaps[tid] = heatmap[..., None]                 # (32,96,1)
     # -----------------------------------------------------------------
     # ---- caching ----
@@ -807,134 +763,163 @@ def load_data(segment_duration: float = 4.0,
 # For testing and visualization
 ######################################
 def main():
-    print("🚀 Starting main()...")
+    _, binary_masks, _, *_ = load_data(recompute=False)
 
-    # ---------------------------------------------------------------
-    # 0.  Hyper‑parameters for windowing / STFT
-    # ---------------------------------------------------------------
-    SEG_LEN   = 4.0      # [s] – window length used in the global cache
-    NPERSEG   = 256
-    NOVERLAP  = 224
-    fs        = 200      # [Hz] – sampling rate
+    # Pick a test ID
+    test_id = 25
+    highres_mask = binary_masks[test_id]  # shape (256, 768)
 
-    # ---------------------------------------------------------------
-    # 1.  Load everything (accel_dict + masks + *optionally* segments)
-    # ---------------------------------------------------------------
-    (accel_dict, binary_masks, heatmaps,
-    segments, specs, segIDs) = load_data(
-            segment_duration = SEG_LEN,
-            nperseg          = NPERSEG,
-            noverlap         = NOVERLAP,
-            recompute        = False)      # True → overwrite cache
+    # Downsample using 3 strategies
+    heatmap_soft = mask_to_heatmap(highres_mask, (32, 96), interpolation=cv2.INTER_AREA)
+    heatmap_bin  = mask_to_heatmap(highres_mask, (32, 96), interpolation=cv2.INTER_NEAREST)
+    heatmap_thresh = mask_to_heatmap(highres_mask, (32, 96),
+                                    interpolation=cv2.INTER_AREA,
+                                    binarize=True,
+                                    threshold=0.03)
 
-    print("✅ Data loaded.")
-    print(f"   • accel_dict tests .......... {len(accel_dict):>5}")
-    print(f"   • cached segments  .......... {segments.shape}")
-    print(f"   • cached spectrograms ....... {specs.shape}")
+    # Add channel dimension for upsampling
+    heatmap_thresh_exp = heatmap_thresh[None, ..., None]
+    up_thresh = mask_recon(heatmap_thresh_exp)[0]
 
-    # ---------------------------------------------------------------
-    # 2.  Pick one random raw trace  (unchanged code below)
-    # ---------------------------------------------------------------
-    tid    = random.choice(list(accel_dict.keys()))
-    ts_raw = random.choice(accel_dict[tid])
-    n_chan = ts_raw.shape[1]
-    print(f"🧪 Using Test {tid} – trace with shape {ts_raw.shape}")
+    # Plot all
+    fig, ax = plt.subplots(1, 4, figsize=(18, 4))
+    ax[0].imshow(highres_mask,    cmap="gray");  ax[0].set_title("High-res GT")
+    ax[1].imshow(heatmap_soft,    cmap="gray");  ax[1].set_title("Soft Heatmap (↓ INTER_AREA)")
+    ax[2].imshow(heatmap_thresh,  cmap="gray");  ax[2].set_title("Thresholded AREA (↓ & bin)")
+    ax[3].imshow(up_thresh,       cmap="gray");  ax[3].set_title("Upsampled (↑ INTER_LINEAR)")
 
-    # ---------------------------------------------------------------
-    # 3.  Full‑trace RMS to find the loudest instant
-    # ---------------------------------------------------------------
-    rms      = np.sqrt(np.mean(highpass_filter(ts_raw, 2.0, fs, 4)**2,
-                               axis=1))
-    thresh   = np.percentile(rms, 99.5)
-    peak_idx = int(np.argmax(rms))                            # global max
-
-    # ---------------------------------------------------------------
-    # 4.  Extract 5‑s window centred on that peak
-    # ---------------------------------------------------------------
-    win      = int(fs * 5.0)                                  # samples
-    half_win = win // 2
-    start    = max(0, peak_idx - half_win)
-    end      = start + win
-    if end > ts_raw.shape[0]:                                 # shift if needed
-        end   = ts_raw.shape[0]
-        start = end - win
-    segment  = ts_raw[start:end, :]                           # (win, C)
-
-    # ---------------------------------------------------------------
-    # 5.  Pre‑processing chain for visual inspection
-    # ---------------------------------------------------------------
-    seg_zero = segment - segment.mean(axis=0, keepdims=True)       # demean
-    seg_hp   = highpass_filter(seg_zero, cutoff=10.0, fs=fs,
-                               order=6)                            # HP 10 Hz
-    seg_proc = preprocess_segment(segment, fs=fs,
-                                  hp_cut=10.0, rms_norm=True)      # final
-
-    stages  = [segment, seg_zero, seg_hp, seg_proc]
-    labels  = ["Original",
-               "Zero‑mean",
-               "HP > 10 Hz",
-               "HP + σ‑norm (final)"]
-    
-    # ------------------------- NEW  --------------------------------
-    # Compute STFT of the final‑processed window for demo purposes
-    spec_demo = compute_complex_spectrogram(
-                    seg_proc[None, ...],     # add batch‑dim
-                    fs       = fs,
-                    nperseg  = NPERSEG,
-                    noverlap = NOVERLAP)[0]   # (F,T,2C) → remove batch
-
-    F, T, _ = spec_demo.shape
-    mag_demo = spec_demo[:, :, 0]            # log‑mag of channel 0
-
-    # ---------------------------------------------------------------
-    # 6.  FIG 1 – RMS over full trace with chosen window highlighted
-    # ---------------------------------------------------------------
-    t_full = np.arange(len(rms)) / fs
-    fig1, ax1 = plt.subplots(figsize=(12, 3))
-    ax1.plot(t_full, rms, label="RMS")
-    ax1.axhline(thresh, color="crimson", ls="--",
-                label="99.5‑percentile")
-    ax1.axvspan(start / fs, end / fs, color="gold", alpha=.25,
-                label="chosen 5 s window")
-    ax1.set(title=f"RMS – Test {tid}", xlabel="Time [s]", ylabel="RMS")
-    ax1.grid(alpha=.3); ax1.legend()
-    plt.show()
-
-    # ---------------------------------------------------------------
-    # 7.  FIG 2 – Evolution of the 5‑s window through the pipeline
-    # ---------------------------------------------------------------
-    t_seg = np.arange(win) / fs
-    fig2, axes = plt.subplots(len(stages), 1,
-                              figsize=(12, 2.4 * len(stages)))
-
-    for ax, data, lbl in zip(axes, stages, labels):
-        for c in range(n_chan):
-            ax.plot(t_seg, data[:, c], lw=.8, alpha=.7)
-        ax.set_title(lbl, loc="left", fontsize=11)
-        ax.set_ylabel("Amplitude")
-        ax.set_xlabel("Time [s]")
-        ax.grid(alpha=.3)
-
-    fig2.suptitle(f"All {n_chan} channels – 5‑s window centred on max‑RMS "
-                  f"(Test {tid})",
-                  y=1.02, fontsize=14)
-    fig2.tight_layout()
-    plt.show()
-
-    # ---------------------------------------------------------------
-    # 8.  FIG 3 –  log‑magnitude spectrogram of processed window
-    # ---------------------------------------------------------------
-    plt.figure(figsize=(8, 4))
-    plt.imshow(mag_demo,
-            origin="lower",
-            aspect="auto",
-            cmap="viridis")
-    plt.colorbar(label="log(1 + |STFT|)")
-    plt.title("Channel 0  •  log‑magnitude spectrogram "
-            f"(win={SEG_LEN:.1f} s, nperseg={NPERSEG})")
-    plt.xlabel("Time bins");  plt.ylabel("Frequency bins")
+    for a in ax: a.axis("off")
     plt.tight_layout()
     plt.show()
+
+    # print("🚀 Starting main()...")
+
+    # # ---------------------------------------------------------------
+    # # 0.  Hyper‑parameters for windowing / STFT
+    # # ---------------------------------------------------------------
+    # SEG_LEN   = 4.0      # [s] – window length used in the global cache
+    # NPERSEG   = 256
+    # NOVERLAP  = 224
+    # fs        = 200      # [Hz] – sampling rate
+
+    # # ---------------------------------------------------------------
+    # # 1.  Load everything (accel_dict + masks + *optionally* segments)
+    # # ---------------------------------------------------------------
+    # (accel_dict, binary_masks, heatmaps,
+    # segments, specs, segIDs) = load_data(
+    #         segment_duration = SEG_LEN,
+    #         nperseg          = NPERSEG,
+    #         noverlap         = NOVERLAP,
+    #         recompute        = False)      # True → overwrite cache
+
+    # print("✅ Data loaded.")
+    # print(f"   • accel_dict tests .......... {len(accel_dict):>5}")
+    # print(f"   • cached segments  .......... {segments.shape}")
+    # print(f"   • cached spectrograms ....... {specs.shape}")
+
+    # # ---------------------------------------------------------------
+    # # 2.  Pick one random raw trace  (unchanged code below)
+    # # ---------------------------------------------------------------
+    # tid    = random.choice(list(accel_dict.keys()))
+    # ts_raw = random.choice(accel_dict[tid])
+    # n_chan = ts_raw.shape[1]
+    # print(f"🧪 Using Test {tid} – trace with shape {ts_raw.shape}")
+
+    # # ---------------------------------------------------------------
+    # # 3.  Full‑trace RMS to find the loudest instant
+    # # ---------------------------------------------------------------
+    # rms      = np.sqrt(np.mean(highpass_filter(ts_raw, 2.0, fs, 4)**2,
+    #                            axis=1))
+    # thresh   = np.percentile(rms, 99.5)
+    # peak_idx = int(np.argmax(rms))                            # global max
+
+    # # ---------------------------------------------------------------
+    # # 4.  Extract 5‑s window centred on that peak
+    # # ---------------------------------------------------------------
+    # win      = int(fs * 5.0)                                  # samples
+    # half_win = win // 2
+    # start    = max(0, peak_idx - half_win)
+    # end      = start + win
+    # if end > ts_raw.shape[0]:                                 # shift if needed
+    #     end   = ts_raw.shape[0]
+    #     start = end - win
+    # segment  = ts_raw[start:end, :]                           # (win, C)
+
+    # # ---------------------------------------------------------------
+    # # 5.  Pre‑processing chain for visual inspection
+    # # ---------------------------------------------------------------
+    # seg_zero = segment - segment.mean(axis=0, keepdims=True)       # demean
+    # seg_hp   = highpass_filter(seg_zero, cutoff=10.0, fs=fs,
+    #                            order=6)                            # HP 10 Hz
+    # seg_proc = preprocess_segment(segment, fs=fs,
+    #                               hp_cut=10.0, rms_norm=True)      # final
+
+    # stages  = [segment, seg_zero, seg_hp, seg_proc]
+    # labels  = ["Original",
+    #            "Zero‑mean",
+    #            "HP > 10 Hz",
+    #            "HP + σ‑norm (final)"]
+    
+    # # ------------------------- NEW  --------------------------------
+    # # Compute STFT of the final‑processed window for demo purposes
+    # spec_demo = compute_complex_spectrogram(
+    #                 seg_proc[None, ...],     # add batch‑dim
+    #                 fs       = fs,
+    #                 nperseg  = NPERSEG,
+    #                 noverlap = NOVERLAP)[0]   # (F,T,2C) → remove batch
+
+    # F, T, _ = spec_demo.shape
+    # mag_demo = spec_demo[:, :, 0]            # log‑mag of channel 0
+
+    # # ---------------------------------------------------------------
+    # # 6.  FIG 1 – RMS over full trace with chosen window highlighted
+    # # ---------------------------------------------------------------
+    # t_full = np.arange(len(rms)) / fs
+    # fig1, ax1 = plt.subplots(figsize=(12, 3))
+    # ax1.plot(t_full, rms, label="RMS")
+    # ax1.axhline(thresh, color="crimson", ls="--",
+    #             label="99.5‑percentile")
+    # ax1.axvspan(start / fs, end / fs, color="gold", alpha=.25,
+    #             label="chosen 5 s window")
+    # ax1.set(title=f"RMS – Test {tid}", xlabel="Time [s]", ylabel="RMS")
+    # ax1.grid(alpha=.3); ax1.legend()
+    # plt.show()
+
+    # # ---------------------------------------------------------------
+    # # 7.  FIG 2 – Evolution of the 5‑s window through the pipeline
+    # # ---------------------------------------------------------------
+    # t_seg = np.arange(win) / fs
+    # fig2, axes = plt.subplots(len(stages), 1,
+    #                           figsize=(12, 2.4 * len(stages)))
+
+    # for ax, data, lbl in zip(axes, stages, labels):
+    #     for c in range(n_chan):
+    #         ax.plot(t_seg, data[:, c], lw=.8, alpha=.7)
+    #     ax.set_title(lbl, loc="left", fontsize=11)
+    #     ax.set_ylabel("Amplitude")
+    #     ax.set_xlabel("Time [s]")
+    #     ax.grid(alpha=.3)
+
+    # fig2.suptitle(f"All {n_chan} channels – 5‑s window centred on max‑RMS "
+    #               f"(Test {tid})",
+    #               y=1.02, fontsize=14)
+    # fig2.tight_layout()
+    # plt.show()
+
+    # # ---------------------------------------------------------------
+    # # 8.  FIG 3 –  log‑magnitude spectrogram of processed window
+    # # ---------------------------------------------------------------
+    # plt.figure(figsize=(8, 4))
+    # plt.imshow(mag_demo,
+    #         origin="lower",
+    #         aspect="auto",
+    #         cmap="viridis")
+    # plt.colorbar(label="log(1 + |STFT|)")
+    # plt.title("Channel 0  •  log‑magnitude spectrogram "
+    #         f"(win={SEG_LEN:.1f} s, nperseg={NPERSEG})")
+    # plt.xlabel("Time bins");  plt.ylabel("Frequency bins")
+    # plt.tight_layout()
+    # plt.show()
 
 
 
@@ -1002,10 +987,5 @@ def main():
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except Exception as e:
-        import traceback
-        print("❌ Uncaught exception:", e)
-        traceback.print_exc()
+    main()
 

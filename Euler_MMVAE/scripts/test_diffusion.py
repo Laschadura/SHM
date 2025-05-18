@@ -60,6 +60,34 @@ def dice_iou_scores(target: torch.Tensor, pred: torch.Tensor, thr: float = 0.5):
     iou   = (inter + 1e-8) / (union - inter + 1e-8)
     return dice.cpu().numpy(), iou.cpu().numpy()
 
+def dice_score(gt: np.ndarray, pred: np.ndarray, eps: float = 1e-8) -> float:
+    """
+    Computes the Dice score between two binary or soft masks.
+
+    Args:
+        gt (np.ndarray): ground-truth mask
+        pred (np.ndarray): predicted mask
+        eps (float): epsilon for numerical stability
+
+    Returns:
+        float: Dice coefficient
+    """
+    gt_flat   = gt.flatten()
+    pred_flat = pred.flatten()
+    intersection = np.sum(gt_flat * pred_flat)
+    return (2.0 * intersection + eps) / (np.sum(gt_flat) + np.sum(pred_flat) + eps)
+
+def damage_amount(mask: np.ndarray) -> float:
+    """
+    Computes total 'damage amount' as sum of pixel values in a (soft) mask.
+
+    Args:
+        mask (np.ndarray): predicted or ground-truth mask
+
+    Returns:
+        float: Total damage estimate
+    """
+    return float(mask.sum()) / mask.size  # normalize by area
 
 def latent_fid(real: np.ndarray, fake: np.ndarray) -> float:
     """Lightweight Fréchet distance in latent space (μ/Σ only)."""
@@ -69,7 +97,6 @@ def latent_fid(real: np.ndarray, fake: np.ndarray) -> float:
     covmean = torch.from_numpy(cov_r + eps) @ torch.from_numpy(cov_f + eps)
     covmean = torch.linalg.matrix_power(covmean, 1//2).numpy()
     return float(np.sum((mu_r - mu_f) ** 2) + np.trace(cov_r + cov_f - 2 * covmean))
-
 
 def spectrograms_to_timeseries(spec_batch: torch.Tensor,
                                *, fs=200, nperseg=256, noverlap=224):
@@ -103,7 +130,6 @@ def spectrograms_to_timeseries(spec_batch: torch.Tensor,
         spec_np, time_length=time_len,
         fs=fs, nperseg=nperseg, noverlap=noverlap)
 
-
 def masks_to_fullsize(mask_batch: torch.Tensor, *, target=(256, 768)):
     """Convert 32×96 float masks ➜ full 256×768."""
     mk_np = mask_batch.detach().cpu().numpy().squeeze(1)   # (N,H,W)
@@ -127,50 +153,39 @@ def evaluate_synthesis(
     import matplotlib.pyplot as plt
     from collections import defaultdict
     from pathlib import Path
-    # ────────────────────────────────────────────────────────────────────
-    # 0. folders
-    # ────────────────────────────────────────────────────────────────────
+
+
     root_dir  = Path(out_dir)
     synth_dir = root_dir / "synthesis"
-    synth_dir.mkdir(parents=True, exist_ok=True)        # only this one
+    synth_dir.mkdir(parents=True, exist_ok=True)
 
     ae_spec, ae_mask = mld.autoencoders["spec"].eval(), mld.autoencoders["mask"].eval()
 
-    # ────────────────────────────────────────────────────────────────────
-    # 1. collect latents + ids for every batch
-    # ────────────────────────────────────────────────────────────────────
     lat_spec, lat_mask, id_all = [], [], []
     with torch.no_grad():
         for spec, mask, ids in loader:
-            z_s = ae_spec.encoder(spec.to(device))  # Unpack both
+            z_s = ae_spec.encoder(spec.to(device))
             z_m = ae_mask.encoder(mask.to(device))
             lat_spec.append(z_s.cpu())
             lat_mask.append(z_m.cpu())
             id_all.extend(ids.cpu().numpy())
 
-    lat_spec = torch.cat(lat_spec, 0)          # (N , d)
+    lat_spec = torch.cat(lat_spec, 0)
     lat_mask = torch.cat(lat_mask, 0)
     joint_lat = torch.cat([lat_spec, lat_mask], 1).numpy()
     id_all    = np.asarray(id_all, dtype=int)
 
-    # ────────────────────────────────────────────────────────────────────
-    # 2. one representative window per test-ID  →   centroid_ts
-    # ────────────────────────────────────────────────────────────────────
     id2idx = defaultdict(list)
     for i, tid in enumerate(id_all):
         id2idx[tid].append(i)
 
-    rep_idx = [ max(idxs, key=lambda x: 0) for idxs in id2idx.values() ]  # arbitrary pick
+    rep_idx = [ max(idxs, key=lambda x: 0) for idxs in id2idx.values() ]
     reps_real = loader.dataset.tensors[0][rep_idx].float().to(device)
-    reps_ts   = spectrograms_to_timeseries(ae_spec(reps_real)[0])          # (n_IDs, T, C)
+    reps_ts   = spectrograms_to_timeseries(ae_spec(reps_real)[0])
     centroid_ts = { int(id_all[i]): reps_ts[j][:,0] for j,i in enumerate(rep_idx) }
 
-    # latent centroids (for interpolation)
     centroid_lat = { tid: joint_lat[id_all == tid].mean(0) for tid in np.unique(id_all) }
 
-    # ────────────────────────────────────────────────────────────────────
-    # 3. centroid-to-centroid interpolation + 5-step snap-back
-    # ────────────────────────────────────────────────────────────────────
     hops   = [(pair_ids[i], pair_ids[i+1]) for i in range(len(pair_ids)-1)]
     alphas = np.linspace(0,1, steps_per_pair+2, endpoint=True)[1:-1]
 
@@ -180,7 +195,6 @@ def evaluate_synthesis(
         zB = torch.tensor(centroid_lat[B], device=device).float()
         for a in alphas:
             z_mid = a*zA + (1-a)*zB
-            # snap-back (last 5 steps)
             z_ref = z_mid[None].clone()
             for t in range(mld.noise_scheduler.num_timesteps-5,
                            mld.noise_scheduler.num_timesteps):
@@ -194,46 +208,46 @@ def evaluate_synthesis(
     ts_syn  = spectrograms_to_timeseries(syn["spec"])
     mk_up   = masks_to_fullsize(syn["mask"])
 
-
-    #  We want everything roughly in [-1,1] so we can see the shape,
-    #  not the absolute amplitude.
     for tid, trace in centroid_ts.items():
         rms = trace.std()
-        centroid_ts[tid] = trace / (rms + 1e-8)          # RMS-norm ❶
+        centroid_ts[tid] = trace / (rms + 1e-8)
 
-    # do the same normalisation for each synthetic window just before plotting
-    # (store scale factors once if you need the originals later)
-    ts_syn_norm = ts_syn / (ts_syn.std(axis=1, keepdims=True) + 1e-8)  # ❷
+    ts_syn_norm = ts_syn / (ts_syn.std(axis=1, keepdims=True) + 1e-8)
 
-
-
-    # ────────────────────────────────────────────────────────────────────
-    # 4. quick-check panels
-    # ────────────────────────────────────────────────────────────────────
     max_vis = min(6, ts_syn.shape[0])
     for k in range(max_vis):
         A,B,a = lab_A[k], lab_B[k], lab_alpha[k]
-        fig = plt.figure(figsize=(10,4)); gs = fig.add_gridspec(2,3,width_ratios=[2,1,1])
+        fig = plt.figure(figsize=(10,5)); gs = fig.add_gridspec(2,4,width_ratios=[2,1,1,1])
 
-        # plot time-series
         ax = fig.add_subplot(gs[:,0])
         t  = np.linspace(0, 4, ts_syn.shape[1])
         ax.plot(t, centroid_ts[A], color="#1f77b4", lw=.8, alpha=.6, label=f"T{A}")
         ax.plot(t, centroid_ts[B], color="#ff7f0e", lw=.8, alpha=.6, label=f"T{B}")
-        ax.plot(t, ts_syn_norm[k,:,0], color="#d62728", lw=.9, label="synthetic")  # ❸
-        ax.set(title=f"α = {a:.2f}   •   T{A} → T{B}",
-            xlabel="t [s]", ylabel="norm. amp")
+        ax.plot(t, ts_syn_norm[k,:,0], color="#d62728", lw=.9, label="synthetic")
+        ax.set(title=f"α = {a:.2f}   •   T{A} → T{B}", xlabel="t [s]", ylabel="norm. amp")
         ax.legend(framealpha=.8, fontsize=8)
         ax.grid(alpha=.3)
 
-
-        # masks
         fig.add_subplot(gs[0,1]).imshow(syn["mask"][k,0].cpu(), cmap="gray"); plt.axis("off"); plt.title("32×96")
-        fig.add_subplot(gs[1,1]).imshow(mk_up[k],            cmap="gray"); plt.axis("off"); plt.title("256×768")
+        fig.add_subplot(gs[1,1]).imshow(mk_up[k], cmap="gray"); plt.axis("off"); plt.title("256×768")
 
         if heats is not None:
             fig.add_subplot(gs[0,2]).imshow(heats[A][...,0], cmap="gray"); plt.axis("off"); plt.title(f"T{A} GT", fontsize=8)
             fig.add_subplot(gs[1,2]).imshow(heats[B][...,0], cmap="gray"); plt.axis("off"); plt.title(f"T{B} GT", fontsize=8)
+
+        # quantitative scores
+        mask_pred = syn["mask"][k,0].cpu().numpy()
+        gt_mask_A = heats[A][...,0] if heats is not None else None
+        gt_mask_B = heats[B][...,0] if heats is not None else None
+
+        if gt_mask_A is not None and gt_mask_B is not None:
+            alpha = lab_alpha[k]
+            gt_interp = (1-alpha)*gt_mask_A + alpha*gt_mask_B
+            dice = dice_score(gt_interp, mask_pred)
+            dmg_true = damage_amount(gt_interp)
+            dmg_pred = damage_amount(mask_pred)
+            err = abs(dmg_pred - dmg_true)
+            fig.suptitle(f"Dice: {dice:.3f}  |  Δdamage: {err:.4f}", fontsize=10)
 
         fig.tight_layout()
         fig.savefig(synth_dir/f"quickcheck_{k}.png", dpi=150); plt.close(fig)
@@ -322,6 +336,15 @@ def evaluate_reconstruction(mld: dm.MultiModalLatentDiffusion,
     
     # sort for reproducible order, crop to gen_samples
     chosen_indices = sorted(chosen_indices)[:gen_samples]
+
+    if gen_samples == 0 or len(chosen_indices) == 0:
+        print("✅ Skipping visual + sample reconstructions (gen_samples=0 or empty).")
+        print(f"rec_spec_loss: {np.mean(rec_s_loss):.4f}")
+        print(f"rec_mask_loss: {np.mean(rec_m_loss):.4f}")
+        print(f"dice:          {np.mean(dices):.4f}")
+        print(f"iou:           {np.mean(ious):.4f}")
+        return
+
 
     # ─────────────────── visual recon (real → recon) ──────────────────────
     spec_real = loader.dataset.tensors[0][chosen_indices].float().to(device)
@@ -472,23 +495,48 @@ def evaluate_reconstruction(mld: dm.MultiModalLatentDiffusion,
         plt.savefig(spec_dir / f"testid_{test_id}_spectrograms.png", dpi=300)
         plt.close()
 
-        # 5) mask comparison -----------------------------------------------------
+        # 4b) visualize raw decoder mask (no upsampling)
+        raw_mask_lowres = rec_mask[plot_id, 0].cpu().numpy()  # (32,96)
+
+        plt.figure(figsize=(4, 3))
+        plt.imshow(raw_mask_lowres, cmap="gray")
+        plt.title(f"Raw Decoder Output • Test ID {test_id}")
+        plt.axis("off")
+        plt.tight_layout()
+        plt.savefig(mask_dir / f"testid_{test_id}_mask_lowres_raw.png", dpi=200)
+        plt.close()
+
+        # 5) mask comparison + print raw values ---------------------------------------
         if heats is not None:
-            # use heatmaps[test_id] as the true low-res mask
+            # --- define masks first ---
             lowres_gt  = heats[test_id]               # (32,96,1)
             lowres_rec = mask_fake                    # (32,96)
+
+            lowres_gt_vals  = lowres_gt[..., 0]       # squeeze channel
+            lowres_rec_vals = lowres_rec
+
+            # --- print raw values ---
+            print(f"\n🧾 Raw values of low-res masks for Test ID {test_id}:")
+            print("Original low-res (GT) mask slice [16:20, 40:50]:")
+            print(np.array_str(lowres_gt_vals[16:20, 40:50], precision=3, suppress_small=True))
+
+            print("Reconstructed low-res mask slice [16:20, 40:50]:")
+            print(np.array_str(lowres_rec_vals[16:20, 40:50], precision=3, suppress_small=True))
+
+            # --- upsample and visualize ---
             highres_gt  = data_loader.mask_recon(lowres_gt.transpose(2, 0, 1))[0]  # → (256,768)
             highres_rec = data_loader.mask_recon(lowres_rec[None])[0]             # → (256,768)
 
             fig, ax = plt.subplots(2, 2, figsize=(12, 8))
-            ax[0, 0].imshow(lowres_gt[..., 0], cmap="gray");  ax[0, 0].set_title("Original (low-res)")
-            ax[0, 1].imshow(lowres_rec,     cmap="gray");     ax[0, 1].set_title("Reconstructed (low-res)")
-            ax[1, 0].imshow(highres_gt,     cmap="gray");     ax[1, 0].set_title("Original upsampled")
-            ax[1, 1].imshow(highres_rec,    cmap="gray");     ax[1, 1].set_title("Reconstructed upsampled")
+            ax[0, 0].imshow(lowres_gt_vals, cmap="gray");  ax[0, 0].set_title("Original (low-res)")
+            ax[0, 1].imshow(lowres_rec,     cmap="gray");  ax[0, 1].set_title("Reconstructed (low-res)")
+            ax[1, 0].imshow(highres_gt,     cmap="gray");  ax[1, 0].set_title("Original upsampled")
+            ax[1, 1].imshow(highres_rec,    cmap="gray");  ax[1, 1].set_title("Reconstructed upsampled")
             for a in ax.ravel(): a.axis("off")
             plt.tight_layout()
             plt.savefig(mask_dir / f"testid_{test_id}_mask_comparison.png", dpi=300)
             plt.close()
+
 
 
 # ---------------------------------------------------------------------------
@@ -500,6 +548,8 @@ def main():
     p.add_argument("--ckpt_dir", default="results_diff")
     p.add_argument("--batch",    type=int, default=32)
     p.add_argument("--samples",  type=int, default=8)
+    p.add_argument("--no_diffusion", action="store_true",
+               help="Only run encoder/decoder reconstruction; skip diffusion sampling.")
     args = p.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -554,23 +604,35 @@ def main():
 
 
     # ── run evaluation ──────────────────────────────────────────────────────
-    evaluate_synthesis(
-        mld, loader, device,
-        pair_ids=PAIR_IDS,
-        steps_per_pair=STEPS_PER_PAIR,
-        out_dir="Diff_eval",
-        segments=segments,
-        heats=heats)
+    # evaluate_synthesis(
+    #     mld, loader, device,
+    #     pair_ids=PAIR_IDS,
+    #     steps_per_pair=STEPS_PER_PAIR,
+    #     out_dir="Diff_eval",
+    #     segments=segments,
+    #     heats=heats)
     
     # ── run evaluation ──────────────────────────────────────────────────────
-    evaluate_reconstruction(mld,
-            loader,
-            device,
-            gen_samples=23,
-            out_dir="Diff_eval",
-            segments=segments,       
-            test_ids=ids,                
-            heats=heats)    
+    if args.no_diffusion:
+        print("✅ Running reconstruction without diffusion...")
+        evaluate_reconstruction(mld,
+                loader,
+                device,
+                gen_samples=0,              # skip generation
+                out_dir="Diff_eval",
+                segments=segments,       
+                test_ids=ids,                
+                heats=heats)
+    else:
+        evaluate_reconstruction(mld,
+                loader,
+                device,
+                gen_samples=args.samples,
+                out_dir="Diff_eval",
+                segments=segments,       
+                test_ids=ids,                
+                heats=heats)
+ 
 
 
 

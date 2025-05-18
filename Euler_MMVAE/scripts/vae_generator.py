@@ -1309,7 +1309,7 @@ def main():
     debug_mode           = False
     latent_dim           = 256
     batch_size           = 128
-    total_epochs         = 2
+    total_epochs         = 500
     patience             = 50
     resume_training      = False
 
@@ -1326,19 +1326,25 @@ def main():
 
     #  Sweep values
     beta_sweep = [0.06, 0.10]
+
     weight_configs = [
-        # A
+        # A (second-best baseline)
         {"mrstft": 1.0, "grad": 0.3, "lap": 0.3, "mag": 0.3, "damage": 150.0},
-        # B
+
+        # B (best baseline)
         {"mrstft": 0.7, "grad": 0.1, "lap": 0.1, "mag": 0.1, "damage": 300.0},
-        # C
-        {"mrstft": 1.3, "grad": 0.5, "lap": 0.5, "mag": 0.5, "damage":  75.0},
-        # D
-        {"mrstft": 1.0, "grad": 0.8, "lap": 0.8, "mag": 0.3, "damage": 150.0},
-        # E
-        {"mrstft": 1.0, "grad": 0.3, "lap": 0.3, "mag": 0.8, "damage": 150.0},
-        # F (ablation)
-        {"mrstft": 1.0, "grad": 0.3, "lap": 0.3, "mag": 0.3, "damage":   0.0},
+
+        # B-variant 1: a bit more magnitude emphasis
+        {"mrstft": 0.7, "grad": 0.1, "lap": 0.1, "mag": 0.2, "damage": 300.0},
+
+        # B-variant 2: slightly stronger gradient & laplacian terms
+        {"mrstft": 0.7, "grad": 0.2, "lap": 0.2, "mag": 0.1, "damage": 300.0},
+
+        # B-variant 3: reduce the damage weight from 300 → 250
+        {"mrstft": 0.7, "grad": 0.1, "lap": 0.1, "mag": 0.1, "damage": 250.0},
+
+        # A-variant: keep A but lower damage loss to 100
+        {"mrstft": 1.0, "grad": 0.3, "lap": 0.3, "mag": 0.3, "damage": 100.0},
     ]
 
 

@@ -52,6 +52,24 @@ configure_gpu()
 sys.path.append(os.path.dirname(__file__))
 import data_loader
 
+from utils import (
+    dynamic_weighting,
+    betas_for_alpha_bar,
+    sinusoidal_time_embedding,
+    energy_sigma,
+    complex_spectrogram_loss,
+    multi_channel_mrstft_loss,
+    gradient_loss_phase_only,
+    laplacian_loss_phase_only,
+    damage_amount_loss,
+    energy_sigma,
+    magnitude_l1_loss,
+    waveform_si_l1_loss,
+    custom_mask_loss,
+    focal_tversky_loss,
+    DifferentiableISTFT
+)
+
 
 # ----- Recource Monitoring and Usage -----
 def print_memory_stats():
@@ -160,99 +178,28 @@ def spectro_time_consistency_loss(orig_wave, recon_spec,
     wav_rec *= scale
     return weight * F.l1_loss(wav_rec, orig_wave)
 
-def custom_mask_loss(y_true, y_pred,
-                     weight_bce=0.1,
-                     weight_dice=0.4,
-                     weight_focal=0.5,
-                     gamma=2.0,
-                     alpha=0.25):
+def _quick_mask_stats(mask_true, mask_logits, mask_prob):
     """
-    Combined BCE + Dice + Focal loss for mask segmentation.
-
-    Args:
-        y_true: [batch, 1, height, width]
-        y_pred: [batch, 1, height, width]
+    Prints one-line stats for masks.
+    mask_true   : (B,1,H,W) float 0–1
+    mask_logits : (B,1,H,W) pre-sigmoid
+    mask_prob   : (B,1,H,W) after sigmoid
     """
-    eps = 1e-7
+    with torch.no_grad():
+        dice = (2 * (mask_true * (mask_prob > 0.5)).sum(dim=(-2,-1))
+                / (mask_true.sum(dim=(-2,-1)) + (mask_prob > 0.5).sum(dim=(-2,-1)) + 1e-6))
+        print(f"   GT mean={mask_true.mean():.4f} ┃ "
+              f"logit μ={mask_logits.mean():+.2f} σ={mask_logits.std():.2f} ┃ "
+              f"prob μ={mask_prob.mean():.4f} ┃ "
+              f"Dice[0]={dice[0].item():.3f}")
 
-    # Clamp predictions for numerical stability
-    y_pred = torch.clamp(y_pred, eps, 1.0 - eps)
-
-    # BCE Loss with positive weighting
-    pos_weight_value = 250
-    pos_weight = torch.tensor(pos_weight_value, device=y_true.device, dtype=y_true.dtype)
-    weight_map = y_true * pos_weight + (1.0 - y_true)
-    bce = F.binary_cross_entropy(y_pred, y_true, weight=weight_map)
-    bce_loss = torch.mean(bce)
-
-    # Dice Loss
-    # Flatten only spatial dimensions, keep batch
-    y_true_flat = y_true.reshape(y_true.size(0), -1)
-    y_pred_flat = y_pred.reshape(y_pred.size(0), -1)
-    intersection = torch.sum(y_true_flat * y_pred_flat, dim=1)
-    union = torch.sum(y_true_flat, dim=1) + torch.sum(y_pred_flat, dim=1)
-    dice_loss = 1.0 - torch.mean((2.0 * intersection + 1.0) / (union + 1.0))
-
-    # Focal Loss
-    pt = torch.where(y_true == 1, y_pred, 1 - y_pred)
-    focal_weight = (1.0 - pt) ** gamma
-    alpha_weight = torch.where(y_true == 1, alpha, 1 - alpha)
-    focal_loss = torch.mean(alpha_weight * focal_weight * -torch.log(pt + eps))
-
-    # Combined loss
-    return weight_bce * bce_loss + weight_dice * dice_loss + weight_focal * focal_loss
-
-def dynamic_weighting(epoch, max_epochs, min_weight=0.3, max_weight=1.0):
-    """
-    Gradually adjusts the weight between spectrogram and mask losses.
-    
-    Args:
-        epoch: Current epoch
-        max_epochs: Total epochs
-        min_weight: Starting weight
-        max_weight: Maximum weight
-        
-    Returns:
-        Current weight
-    """
-    # Linear increase over time
-    progress = min(1.0, epoch / (max_epochs * 0.1))  # Reach max_weight halfway through training
-    return min_weight + progress * (max_weight - min_weight)
-
-def betas_for_alpha_bar(num_timesteps, max_beta=0.999):
-    ts = torch.linspace(0, num_timesteps, num_timesteps, dtype=torch.float64)
-    
-    # Convert the constant angle to a torch.Tensor:
-    angle_const = torch.tensor(
-        (0.008 / 1.008) * math.pi * 0.5,
-        dtype=ts.dtype,
-        device=ts.device
+# ----- Helpers -----
+def _upsample_block(in_ch, out_ch):
+    return nn.Sequential(
+        nn.Upsample(scale_factor=2, mode="nearest"),
+        nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
+        nn.LeakyReLU(0.1)
     )
-
-    # Now both cos() calls receive torch.Tensor arguments
-    numerator = torch.cos(((ts / num_timesteps) + 0.008) / 1.008 * math.pi * 0.5) ** 2
-    denominator = torch.cos(angle_const) ** 2
-
-    alphas_cumprod = numerator / denominator
-    alphas = alphas_cumprod / alphas_cumprod.roll(1, 0)
-    betas = 1.0 - alphas
-    betas[0] = 1e-8
-    return torch.clip(betas, 0, max_beta)
-
-def sinusoidal_time_embedding(timesteps, dim):
-    # timesteps: (batch_size,) or (batch_size,1)
-    # This returns an embedding of shape (batch_size, dim)
-    import math
-    half_dim = dim // 2
-    embeddings = torch.exp(
-        torch.arange(half_dim, dtype=torch.float32, device=timesteps.device)
-        * (-math.log(10000) / half_dim)
-    )
-    # If timesteps is (B,1), flatten it:
-    timesteps = timesteps.view(-1)
-    embeddings = timesteps[:, None] * embeddings[None, :]
-    embeddings = torch.cat([torch.sin(embeddings), torch.cos(embeddings)], dim=1)
-    return embeddings
 
 # ----- Encoders -----
 class SpectrogramEncoder(nn.Module):
@@ -480,58 +427,41 @@ class MaskDecoder(nn.Module):
     """
     def __init__(self, latent_dim, output_shape=(32, 96)):
         super().__init__()
-        self.latent_dim = latent_dim
-        # output_shape should be (height, width) tuple
-        self.out_height, self.out_width = output_shape[0], output_shape[1]
-        
-        # Determine minimum dimensions (ensure they're at least 1)
-        self.min_height = max(1, self.out_height // 8)
-        self.min_width = max(1, self.out_width // 8)
-        
-        # Initial dense layer and reshape
-        self.fc = nn.Linear(latent_dim, self.min_height * self.min_width * 128)
-        self.relu1 = nn.LeakyReLU(0.1)
-        
-        # Transposed convolution layers
-        self.conv_t1 = nn.ConvTranspose2d(128, 64, kernel_size=3, stride=2, padding=1, output_padding=1)
-        self.relu2 = nn.LeakyReLU(0.1)
-        
-        self.conv_t2 = nn.ConvTranspose2d(64, 32, kernel_size=3, stride=2, padding=1, output_padding=1)
-        self.relu3 = nn.LeakyReLU(0.1)
-        
-        self.conv_t3 = nn.ConvTranspose2d(32, 16, kernel_size=3, stride=2, padding=1, output_padding=1)
-        self.relu4 = nn.LeakyReLU(0.1)
-        
-        # Final layer
-        self.output_layer = nn.Conv2d(16, 1, kernel_size=3, padding=1)
+        H_out, W_out = output_shape
+        H_min = max(1, H_out // 8)
+        W_min = max(1, W_out // 8)
 
-        nn.init.xavier_uniform_(self.output_layer.weight, gain=0.01)
-        nn.init.zeros_(self.output_layer.bias)
+        # dense → (128, H_min, W_min)
+        self.fc = nn.Linear(latent_dim, H_min * W_min * 128)
+        self.act = nn.LeakyReLU(0.1)
 
-        self.sigmoid = nn.Sigmoid()
+        # three 2× upsample stages
+        self.up1 = _upsample_block(128, 64)
+        self.up2 = _upsample_block(64,  32)
+        self.up3 = _upsample_block(32,  16)
+
+        # final 3×3 conv + sigmoid
+        self.out_conv = nn.Conv2d(16, 1, kernel_size=3, padding=1)
+        self.sigmoid  = nn.Sigmoid()
+
+        nn.init.xavier_uniform_(self.out_conv.weight, gain=0.01)
+        nn.init.constant_(self.out_conv.bias, 0.0)
+
+        self.H_out, self.W_out = H_out, W_out
     
     def forward(self, z):
-        # Initial projection and reshape
-        x = self.relu1(self.fc(z))
-        x = x.view(-1, 128, self.min_height, self.min_width)
-        
-        # Upsampling path
-        x = self.relu2(self.conv_t1(x))
-        x = self.relu3(self.conv_t2(x))
-        x = self.relu4(self.conv_t3(x))
-        
-        # Ensure the output has the exact desired dimensions
-        x = F.interpolate(
-            x, 
-            size=(self.out_height, self.out_width),
-            mode='bilinear',
-            align_corners=False
-        )
-        
-        # Final output
-        x = self.output_layer(x)
-        x = self.sigmoid(x)
-        
+        x = self.act(self.fc(z))
+        x = x.view(-1, 128, self.H_out // 8, self.W_out // 8)
+
+        x = self.up1(x)
+        x = self.up2(x)
+        x = self.up3(x)
+
+        # last, precise resize (handles odd sizes)
+        x = F.interpolate(x, size=(self.H_out, self.W_out),
+                          mode="bilinear", align_corners=False)
+
+        x = self.sigmoid(self.out_conv(x))
         return x
 
 # ----- Autoencoders -----
@@ -1084,6 +1014,11 @@ class MultiModalLatentDiffusion:
         
         # Training loop
         for epoch in range(num_epochs):
+            # Dynamic loss weights
+            damage_weight = 0.5 if epoch >= 200 else 2.0
+            focal_gamma = 1.5 if epoch >= 250 else 1.0
+            contrast_weight = min(0.3, epoch / 100 * 0.3)
+
             # Training
             self.diffusion_model.train()
             train_losses = []
@@ -1119,14 +1054,74 @@ class MultiModalLatentDiffusion:
                 
                 if joint_latent is None:
                     continue
-                
-                # Sample random timesteps
-                batch_size = joint_latent.shape[0]
-                t = torch.randint(0, self.noise_scheduler.num_timesteps, (batch_size,), device=self.device)
-                
-                # Calculate diffusion loss
-                loss, _, _ = self.noise_scheduler.get_loss(self.diffusion_model, joint_latent, t)
-                
+
+                # Compute σ from spec magnitude
+                spec = modality_data["spec"].to(self.device)
+                real, imag = spec[:, 0::2], spec[:, 1::2]
+                mag = torch.sqrt(real**2 + imag**2)
+                sigma_t = energy_sigma(mag)                          # (B, T)
+                sigma_mean = sigma_t.mean(dim=1, keepdim=True)       # (B, 1)
+
+                # Sample z0 from adaptive prior
+                z0 = torch.randn_like(joint_latent) * sigma_mean     # (B, D)
+
+
+                # ---------------- flow-matching targets -------------------------
+                batch_size = joint_latent.size(0)
+                t_int  = torch.randint(0, self.noise_scheduler.num_timesteps,
+                                    (batch_size,), device=self.device)
+                tau    = t_int.view(-1,1).float() / (self.noise_scheduler.num_timesteps-1)
+
+                x_t    = tau * joint_latent + (1. - tau) * z0
+                v_tgt  = joint_latent - z0
+                v_pred = self.diffusion_model(x_t, tau)
+
+                # --- FLOW-MATCH loss ---
+                loss_fm = F.mse_loss(v_pred, v_tgt)
+
+
+                # ---------------- spectrogram auxiliaries ----------------------
+                # Decode
+                z_recon = v_pred + z0
+                outputs = self.decode_modalities(z_recon)
+
+                spec_pred = outputs["spec"]
+                spec_true = modality_data["spec"].to(self.device)
+
+                loss_complex   = complex_spectrogram_loss(spec_true, spec_pred)
+                loss_phase_g   = gradient_loss_phase_only(spec_true, spec_pred)
+                loss_phase_l   = laplacian_loss_phase_only(spec_true, spec_pred)
+                loss_mag_l1    = magnitude_l1_loss(spec_true, spec_pred)
+
+                if hasattr(self, 'istft'):
+                    wav_pred = self.istft(spec_pred, length=spec_true.size(2) * 4)
+                    wav_true = self.istft(spec_true, length=spec_true.size(2) * 4)
+                    loss_wave_si = waveform_si_l1_loss(wav_true, wav_pred)
+                else:
+                    loss_wave_si = torch.tensor(0.0, device=spec_true.device)
+
+                mask_pred  = outputs["mask"]
+                mask_true  = modality_data["mask"].to(self.device)
+                loss_mask_px = focal_tversky_loss(mask_true, mask_pred, alpha=0.3, beta=0.8, gamma=focal_gamma)
+                loss_damage  = damage_amount_loss(
+                        mask_true,
+                        mask_pred,
+                        contrast_weight=contrast_weight,
+                        margin=0.005
+                        )
+
+                # Combined loss
+                loss = (
+                    1               * loss_fm + 
+                    0.1             * loss_complex +
+                    0               * loss_phase_g +
+                    0               * loss_phase_l +
+                    0               * loss_mag_l1 +
+                    0               * loss_wave_si +
+                    1               * loss_mask_px + 
+                    damage_weight   * loss_damage
+                )
+
                 # Update model
                 optimizer.zero_grad()
                 loss.backward()
@@ -1144,38 +1139,88 @@ class MultiModalLatentDiffusion:
             if val_dataloader:
                 self.diffusion_model.eval()
                 val_losses = []
-                
+
                 with torch.no_grad():
                     for batch in tqdm(val_dataloader, desc="Validation"):
-                        # Get data for each modality
+                        # Unpack modal inputs
                         modality_data = {
                             name: batch[i] if i < len(batch) else None 
                             for i, name in enumerate(self.modality_names)
                         }
-                        
-                        # Encode each modality to get latent representations
+
                         latents, joint_latent = self.encode_modalities(modality_data)
-                        
                         if joint_latent is None:
                             continue
-                        
-                        # Sample random timesteps
-                        batch_size = joint_latent.shape[0]
-                        t = torch.randint(0, self.noise_scheduler.num_timesteps, (batch_size,), device=self.device)
-                        
-                        # Calculate diffusion loss
-                        loss, _, _ = self.noise_scheduler.get_loss(self.diffusion_model, joint_latent, t)
-                        val_losses.append(loss.item())
-                
-                # Calculate average validation loss
+
+                        batch_size = joint_latent.size(0)
+
+                        # --- Adaptive prior noise ---
+                        spec = modality_data["spec"].to(self.device)
+                        real, imag = spec[:, 0::2], spec[:, 1::2]
+                        mag = torch.sqrt(real**2 + imag**2)
+                        sigma_t = energy_sigma(mag)
+                        sigma_mean = sigma_t.mean(dim=1, keepdim=True)
+                        z0 = torch.randn_like(joint_latent) * sigma_mean
+
+                        # --- Flow-matching targets ---
+                        t_int = torch.randint(0, self.noise_scheduler.num_timesteps, (batch_size,), device=self.device)
+                        tau   = t_int.view(-1, 1).float() / (self.noise_scheduler.num_timesteps - 1)
+                        x_t   = tau * joint_latent + (1 - tau) * z0
+                        v_tgt = joint_latent - z0
+                        v_pred = self.diffusion_model(x_t, tau)
+
+                        loss_fm = F.mse_loss(v_pred, v_tgt)
+
+                        # --- Decode and add auxiliary losses ---
+                        z_recon = v_pred + z0
+                        outputs = self.decode_modalities(z_recon)
+
+                        spec_pred = outputs["spec"]
+                        spec_true = modality_data["spec"].to(self.device)
+
+                        loss_spec   =  complex_spectrogram_loss(spec_true, spec_pred)
+                        loss_p_g    =  gradient_loss_phase_only(spec_true, spec_pred)
+                        loss_p_l    =  laplacian_loss_phase_only(spec_true, spec_pred)
+                        loss_mag    =  magnitude_l1_loss(spec_true, spec_pred)
+
+                        if hasattr(self, 'istft'):
+                            wav_pred = self.istft(spec_pred, length=spec_true.size(2) * 4)
+                            wav_true = self.istft(spec_true, length=spec_true.size(2) * 4)
+                            loss_wave_si = waveform_si_l1_loss(wav_true, wav_pred)
+                        else:
+                            loss_wave_si = torch.tensor(0.0, device=spec_true.device)
+
+                        mask_pred = outputs["mask"]
+                        mask_true = modality_data["mask"].to(self.device)
+
+                        loss_mask = focal_tversky_loss(mask_true, mask_pred, alpha=0.3, beta=0.8, gamma=focal_gamma)
+                        loss_damage = damage_amount_loss(
+                            mask_true,
+                            mask_pred,
+                            contrast_weight=contrast_weight,
+                            margin=0.005
+                        )
+
+                        Loss = (
+                            1               * loss_fm + 
+                            0.1             * loss_spec +
+                            0               * loss_p_g +
+                            0               * loss_p_l +
+                            0               * loss_mag +
+                            0               * loss_wave_si +
+                            1               * loss_mask + 
+                            damage_weight   * loss_damage
+                        )
+
+                        val_losses.append(Loss.item())
+
                 avg_val_loss = sum(val_losses) / len(val_losses)
                 history["val_loss"].append(avg_val_loss)
-                
-                # Save best model
+
                 if avg_val_loss < best_val_loss:
                     best_val_loss = avg_val_loss
                     torch.save(self.diffusion_model.state_dict(), f"{save_dir}/best_diffusion_model.pt")
-            
+
             # Print epoch results
             print(f"Epoch {epoch+1}/{num_epochs} - Train Loss: {avg_train_loss:.4f}", end="")
             if val_dataloader:
@@ -1248,12 +1293,15 @@ class MultiModalLatentDiffusion:
                     x_T=x_T
                 )
         else:
-            # Unconditional generation
+            # Unconditional generation using fixed σ (WaveFM prior fallback)
+            default_sigma = 0.4
             with torch.no_grad():
+                z0 = torch.randn((batch_size, self.total_latent_dim), device=self.device) * default_sigma
                 joint_latent = self.noise_scheduler.p_sample_loop(
                     self.diffusion_model,
                     shape=(batch_size, self.total_latent_dim),
-                    device=self.device
+                    device=self.device,
+                    x_T=z0
                 )
         
         # Decode the joint latent back to each modality
@@ -1328,6 +1376,7 @@ def train_autoencoders(
         spec_autoencoder,
         mask_autoencoder,
         train_loader,
+        val_loader,
         device,
         epochs: int = 100,
         lr: float = 5e-4,
@@ -1360,11 +1409,29 @@ def train_autoencoders(
 
     best_spec_loss = float("inf")
     best_mask_loss = float("inf")
-    patience = 20
     patience_counter = 0
+
+    #track losses for plotting
+    spec_history = {"train_loss": [], "val_loss": []}
+    mask_history = {"train_loss": [], "val_loss": []}
 
 
     for epoch in range(epochs):
+        # --- Dynamic hyperparameters ---
+        damage_weight = 0.3 if epoch >= 200 else 2          # (1) ↓ loss_damage weight
+        focal_gamma   = 1.5 if epoch >= 250 else 1.0        # (2) ↑ gamma focality
+        contrast_weight = min(0.3, epoch / 100 * 0.3)       # (3) adaptive ramp-up
+        
+        # Custom mask loss weights: schedule
+        if epoch < 200:
+            weight_bce   = 0.4
+            weight_dice  = 0.5
+            weight_focal = 0.1
+        else:
+            weight_bce   = 0.1
+            weight_dice  = 0.8
+            weight_focal = 0.1
+        # ------------------------------------------------
         spec_autoencoder.train()
         mask_autoencoder.train()
 
@@ -1379,33 +1446,144 @@ def train_autoencoders(
             mask_batch = mask_batch.to(device)
             seg_batch  = seg_batch.to(device)
 
-            # ---- spectrogram AE ----
+            # ────────────────────── SPECTROGRAM AUTOENCODER ──────────────────────
             optimizer_spec.zero_grad()
             recon_spec, _ = spec_autoencoder(spec_batch)
 
-            loss_spec_mag = complex_spectrogram_loss(spec_batch, recon_spec)
-            loss_time = spectro_time_consistency_loss(
-                orig_wave = seg_batch,           # (B, T, C) raw window
-                recon_spec = recon_spec)
-            
-            loss_spec_total = loss_spec_mag + 0.2 * loss_time      # weight=0.2
+            loss_spec_mag  = complex_spectrogram_loss(spec_batch, recon_spec)         # main spec loss
+            loss_time      = spectro_time_consistency_loss(seg_batch, recon_spec)     # waveform ↔ STFT alignment
+            loss_mag_l1    = magnitude_l1_loss(spec_batch, recon_spec)                # adds sharpness to mag
+            loss_laplacian = laplacian_loss_phase_only(spec_batch, recon_spec)        # improves phase structure
+
+            # Reconstruct waveform and apply waveform-domain loss (optional)
+            if hasattr(spec_autoencoder, 'istft'):
+                wav_recon = spec_autoencoder.istft(recon_spec, length=seg_batch.size(1))  # (B, T, C)
+                loss_wave_si = waveform_si_l1_loss(seg_batch, wav_recon)
+            else:
+                loss_wave_si = torch.tensor(0.0, device=spec_batch.device) # zero if not using istft
+
+            loss_spec_total = (
+                loss_spec_mag +
+                0.0 * loss_time +
+                0.1 * loss_mag_l1 +
+                0.1 * loss_laplacian + 
+                5 * loss_wave_si
+            )
+
             loss_spec_total.backward()
             optimizer_spec.step()
             spec_loss_sum += loss_spec_total.item()
 
-            # ---- mask AE ----
+            # ─────────────────────── MASK AUTOENCODER ─────────────────────────────
             optimizer_mask.zero_grad()
             recon_mask, _ = mask_autoencoder(mask_batch)
-            loss_mask = custom_mask_loss(mask_batch, recon_mask)
-            loss_mask.backward()
+
+            # ── diagnostics (first batch each epoch) ──────────────────────────────
+            if batch_counter == 1:
+                mask_logits = torch.logit(recon_mask.clamp(1e-4, 1-1e-4))
+                _quick_mask_stats(mask_batch, mask_logits, recon_mask)
+            # ---------------------------------------------------------------------
+
+
+            loss_mask_px = focal_tversky_loss(mask_batch, recon_mask, alpha=0.3, beta=0.8, gamma=focal_gamma)
+
+            loss_damage = damage_amount_loss(
+                mask_batch,
+                recon_mask,
+                contrast_weight=contrast_weight,
+                margin=0.005
+            )
+
+            loss_dice = custom_mask_loss(
+                    mask_batch, recon_mask,
+                    weight_bce=weight_bce,
+                    weight_dice=weight_dice,
+                    weight_focal=weight_focal,
+                    gamma= 2.0,
+                    alpha= 0.3
+            )
+
+            loss_mask_total = (
+                0               * loss_mask_px +
+                damage_weight   * loss_damage +
+                1               * loss_dice
+            )
+
+            loss_mask_total.backward()
             optimizer_mask.step()
-            mask_loss_sum += loss_mask.item()
+            mask_loss_sum += loss_mask_total.item()
 
         # -------- end of epoch: compute means & log --------
         avg_spec_loss = spec_loss_sum / batch_counter
         avg_mask_loss = mask_loss_sum / batch_counter
         print(f"[Epoch {epoch+1:3d}/{epochs}]  "
             f"spec={avg_spec_loss:.4f}  mask={avg_mask_loss:.4f}")
+        
+        # AE Validation (mirrors training structure)
+        spec_autoencoder.eval()
+        mask_autoencoder.eval()
+        val_loss_spec, val_loss_mask = [], []
+
+        with torch.no_grad():
+            for spec_batch_val, mask_batch_val, seg_batch_val, _ in val_loader:
+                spec_batch_val = spec_batch_val.to(device)
+                mask_batch_val = mask_batch_val.to(device)
+                seg_batch_val  = seg_batch_val.to(device)
+
+                recon_spec_val, _ = spec_autoencoder(spec_batch_val)
+                loss_spec_mag  = complex_spectrogram_loss(spec_batch_val, recon_spec_val)
+                loss_time      = spectro_time_consistency_loss(seg_batch_val, recon_spec_val)
+                loss_mag_l1    = magnitude_l1_loss(spec_batch_val, recon_spec_val)
+                loss_laplacian = laplacian_loss_phase_only(spec_batch_val, recon_spec_val)
+
+                if hasattr(spec_autoencoder, 'istft'):
+                    wav_recon_val = spec_autoencoder.istft(recon_spec_val, length=seg_batch_val.size(1))
+                    loss_wave_si = waveform_si_l1_loss(seg_batch_val, wav_recon_val)
+                else:
+                    loss_wave_si = torch.tensor(0.0, device=spec_batch_val.device)
+
+                loss_spec_val_total = (
+                    loss_spec_mag +
+                    0.0 * loss_time +
+                    0.1 * loss_mag_l1 +
+                    0.1 * loss_laplacian +
+                    5 * loss_wave_si
+                )
+                val_loss_spec.append(loss_spec_val_total.item())
+
+                recon_mask_val, _ = mask_autoencoder(mask_batch_val)
+                loss_mask_px = focal_tversky_loss(mask_batch_val, recon_mask_val, alpha=0.3, beta=0.8, gamma=focal_gamma)
+
+                loss_damage  = damage_amount_loss(
+                        mask_batch_val,
+                        recon_mask_val,
+                        contrast_weight=contrast_weight,
+                        margin=0.005
+                )
+                
+                loss_dice = custom_mask_loss(
+                    mask_batch_val, recon_mask_val,
+                    weight_bce=weight_bce,
+                    weight_dice=weight_dice,
+                    weight_focal=weight_focal,
+                    gamma= 2.0,
+                    alpha= 0.3
+                )
+
+                loss_mask_val_total = (
+                    0               * loss_mask_px +
+                    damage_weight   * loss_damage +
+                    1               * loss_dice
+                )
+                val_loss_mask.append(loss_mask_val_total.item())
+
+        print(f"AE Val Spec Loss: {np.mean(val_loss_spec):.4f}, AE Val Mask Loss: {np.mean(val_loss_mask):.4f}")
+
+        #track losses for plotting
+        spec_history["train_loss"].append(avg_spec_loss)
+        spec_history["val_loss"].append(np.mean(val_loss_spec))
+        mask_history["train_loss"].append(avg_mask_loss)
+        mask_history["val_loss"].append(np.mean(val_loss_mask))
 
         # step the LR schedulers
         scheduler_spec.step()
@@ -1424,6 +1602,10 @@ def train_autoencoders(
             if patience_counter >= patience:
                 print(f"⏹️ Early stopping at epoch {epoch+1} after no improvement for {patience} epochs.")
                 break
+        
+        return spec_history, mask_history
+
+
 
 
 # ----- Visualization Functions and tests -----
@@ -1549,7 +1731,7 @@ def main():
     patience_ae     = 50                     # patience for autoencoder training
     recompute_data  = False                   # whether to recompute cache
     dm_mode         = "scratch"              # "scratch" or "continue"
-    dm_epochs       = 2500                     # extra epochs for diffusion
+    dm_epochs       = 1                    # extra epochs for diffusion
     learning_rate_dm = 5e-4
     learning_rate_ae = 5e-4
     diff_ckpt       = "results_diff/diffusion/final_diffusion_model.pt"
@@ -1634,9 +1816,21 @@ def main():
     spec_autoencoder = SpectrogramAutoencoder(latent_dim, channels, freq_bins, time_bins).to(device)
     mask_autoencoder = MaskAutoencoder(latent_dim, (mask_height, mask_width)).to(device)
 
+    spec_autoencoder.istft = DifferentiableISTFT(nperseg=256, noverlap=224).to(device)
+
+
+
     if train_AE:
         print("🚀 Training Autoencoders...")
-        train_autoencoders(spec_autoencoder, mask_autoencoder, train_loader, device, epochs=ae_epochs, lr=learning_rate_ae, patience=patience_ae)
+        spec_history, mask_history = train_autoencoders(
+            spec_autoencoder, mask_autoencoder,
+            train_loader, val_loader,
+            device, epochs=ae_epochs,
+            lr=learning_rate_ae, patience=patience_ae
+        )
+        visualize_training_history(spec_history, save_path="results_diff/autoencoders/spec_autoencoder_loss.png")
+        visualize_training_history(mask_history, save_path="results_diff/autoencoders/mask_autoencoder_loss.png")
+
         torch.save(spec_autoencoder.state_dict(), "results_diff/autoencoders/spec_autoencoder.pt")
         torch.save(mask_autoencoder.state_dict(), "results_diff/autoencoders/mask_autoencoder.pt")
     else:
@@ -1645,6 +1839,9 @@ def main():
         mask_autoencoder.load_state_dict(torch.load("results_diff/autoencoders/mask_autoencoder.pt", map_location=device))
 
     mld = MultiModalLatentDiffusion(spec_autoencoder, mask_autoencoder, latent_dim, ["spec", "mask"], device)
+
+    mld.istft = DifferentiableISTFT(nperseg=256, noverlap=224).to(device)
+
 
     # ─── Diffusion training control ─────────────────────────────────
     if dm_mode == "continue":

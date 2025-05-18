@@ -3,7 +3,7 @@
 #SBATCH --output=diff_run.out
 #SBATCH --error=diff_run.err
 #SBATCH -A es_chatzi
-#SBATCH --gpus=v100:1
+#SBATCH --gpus=rtx_4090:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem-per-cpu=16G
 #SBATCH --time=18:00:00

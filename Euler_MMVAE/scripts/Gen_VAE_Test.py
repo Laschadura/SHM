@@ -2,7 +2,7 @@
 """
 synthesize_mmvae.py
 
-Generate synthetic samples from a trained SpectralMMVAE, using the
+Generate synthetic samples from all trained SpectralMMVAE configurations, using
 (pre‑computed) data returned by data_loader.load_data().
 """
 
@@ -15,6 +15,7 @@ import matplotlib.pyplot as plt
 from tensorflow.keras import mixed_precision  # type: ignore
 import cv2
 from pathlib import Path
+import glob
 
 # ------------------------------------------------------------------ #
 #  project‑local imports
@@ -25,7 +26,6 @@ import data_loader
 from data_loader import TFInverseISTFT, mask_recon, inspect_frequency_content
 from vae_generator import SpectralMMVAE
 
-
 # ------------------------------------------------------------------ #
 #  0)  convenience – fetch ALL cached arrays in one call
 # ------------------------------------------------------------------ #
@@ -35,10 +35,6 @@ def get_cached_data(*,
                     noverlap: int       = 224,
                     sample_rate: int    = 200,
                     recompute: bool     = False):
-    """
-    Wrapper around data_loader.load_data() that returns cached arrays
-    and all 3 dictionaries.
-    """
     (
         accel_dict,
         binary_masks,
@@ -66,29 +62,19 @@ def get_cached_data(*,
 # ------------------------------------------------------------------ #
 #  1)  model loader –  **now uses shapes from the cache**
 # ------------------------------------------------------------------ #
-def load_trained_mmvae(model_path: str,
-                       spec_shape,
-                       mask_shape):
-    """
-    Load a fully-serialized SpectralMMVAE model from a .keras archive
-    without letting Keras build it prematurely.
-    """
+def load_trained_mmvae(model_path: str, spec_shape, mask_shape):
     model = tf.keras.models.load_model(
         model_path,
         custom_objects={"SpectralMMVAE": SpectralMMVAE},
-        compile=False,      # don’t try to restore the optimizer
-        safe_mode=False     # <- ***key line***  skips automatic build()
+        compile=False,
+        safe_mode=False
     )
 
-    # ---- manual one-shot build ------------------------------------
     dummy_spec = tf.zeros((1, *spec_shape), dtype=tf.float32)
     dummy_mask = tf.zeros((1, *mask_shape), dtype=tf.float32)
     _ = model(dummy_spec, dummy_mask, training=False)
     print(f"✅ Loaded SpectralMMVAE from {model_path}")
     return model
-
-
-
 
 # ------------------------------------------------------------------ #
 #  2)  ----  synthesis helpers  ------------------------------------ #
@@ -452,13 +438,15 @@ def test_reconstruction(model, cached, save_dir="reconstruction_tests"):
 # ------------------------------------------------------------------ #
 #  4)  main
 # ------------------------------------------------------------------ #
-def main():
-    weights_path = "results_mmvae/final_spectral_mmvae.weights.h5"
-    out_dir = "synthesis_results_mmvae"
-    os.makedirs(out_dir, exist_ok=True)
-    print("📄 Loading weights from:", os.path.abspath(weights_path))
 
-    # ---- load cached data --------------------------------------------------
+def main():
+    print("🔍 Looking for all config runs…")
+    base_dir   = Path(__file__).parent.parent
+    results_dir = base_dir / "results_mmvae"
+    out_dir     = base_dir / "synthesis_results_all_configs"
+    out_dir.mkdir(exist_ok=True)
+
+    # ---- load cached data once ----------------------------------
     cached = get_cached_data(
         recompute=False,
         segment_duration=4.0,
@@ -466,36 +454,40 @@ def main():
         noverlap=224
     )
 
-    print("📐  Cached shapes loaded from disk")
-
-    # shapes come from the cached arrays you just loaded
-    spec_shape = cached["specs"].shape[1:]   # (F, T, 2C)
+    spec_shape = cached["specs"].shape[1:]
     mask_shape = cached["heatmaps"][next(iter(cached["heatmaps"]))].shape
 
-    model = load_trained_mmvae(
-        "results_mmvae/final_model_spectral_mmvae.keras",
-        spec_shape,
-        mask_shape
-    )
+    # ---- collect all of your saved models (.keras AND .h5) ------
+    keras_paths = []
+    for run_dir in results_dir.glob("beta_*"):
+        # look for both your “best” and “final” checkpoints
+        for pattern in ("*model_spectral_mmvae.keras", "*model_spectral_mmvae.h5"):
+            for p in run_dir.glob(pattern):
+                keras_paths.append(str(p))
+    keras_paths.sort()
 
-    # --- choose any synthesis routine you need -----------------------------
-    try:
-        generate_conditional_samples(
-            model,
-            cached,
-            save_dir=os.path.join(out_dir, "conditional_samples"),
-        )
+    if not keras_paths:
+        print("❌ No trained models found!")
+        return
 
-        test_reconstruction(
-            model,
-            cached,
-            save_dir=os.path.join(out_dir, "reconstruction_tests"),
-        )
+    # ---- loop over every model you found -----------------------
+    for model_path in keras_paths:
+        run_dir  = Path(model_path).parent
+        run_name = run_dir.name
+        print(f"\n🔁 Testing reconstruction for: {run_name}")
 
-        print(f"\n✅  All synthesis tasks finished – see '{out_dir}'")
-    except Exception as e:
-        print(f"❌ Error during synthesis or reconstruction: {e}")
+        model = load_trained_mmvae(model_path, spec_shape, mask_shape)
+        this_out = out_dir / run_name
 
+        try:
+            test_reconstruction(
+                model,
+                cached,
+                save_dir=this_out / "reconstruction_tests"
+            )
+        except Exception as e:
+            print(f"❌ Error reconstructing for {run_name}: {e}")
 
+    print(f"\n✅  All reconstructions complete — see '{out_dir}'")
 if __name__ == "__main__":
     main()
