@@ -412,7 +412,7 @@ def inverse_spectrogram(
     time_length,
     fs=200,
     nperseg=256,
-    noverlap=128,
+    noverlap=224,
     batch_processing_size=100
     ):
     """
@@ -685,7 +685,7 @@ def inspect_frequency_content(
 #######################################
 def load_data(segment_duration: float = 4.0,
               nperseg: int        = 256,
-              noverlap: int       = 192,
+              noverlap: int       = 224,
               sample_rate: int    = 200,
               recompute: bool     = False,
               cache_dir: str      = "cache"):

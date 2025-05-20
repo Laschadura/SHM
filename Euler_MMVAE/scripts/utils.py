@@ -226,6 +226,18 @@ def waveform_si_l1_loss(wav_true: torch.Tensor,
     denom = torch.mean(torch.abs(wav_true)) + eps
     return diff / denom
 
+def scheduler(start_epoch, end_epoch, curent_epoch, min_weight=0.3, max_weight=1.0):
+    """
+    A simple linear scheduler for a weight.
+    """
+    if curent_epoch < start_epoch:
+        return min_weight
+    elif start_epoch <= curent_epoch < end_epoch:
+        progress = (curent_epoch - start_epoch) / (end_epoch - start_epoch)
+        return min_weight + progress * (max_weight - min_weight)
+    else:
+        return max_weight
+
 # -----------------------------------------------------------------------------
 def energy_sigma(mag: torch.Tensor, eps=1e-6, clip=(0.1, 1.0)) -> torch.Tensor:
     """

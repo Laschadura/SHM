@@ -116,46 +116,8 @@ def monitor_resources():
     for gpu in gpus:
         print(f"🚀 GPU {gpu.id} ({gpu.name}): {gpu.memoryUsed:.1f}MB / {gpu.memoryTotal:.1f}MB "
               f"| Load: {gpu.load * 100:.1f}%")
-        
+
 # ----- Loss Functions and schedules -----
-def complex_spectrogram_loss(y_true, y_pred):
-    """
-    Spectrogram loss handling magnitude and phase separately.
-    
-    Args:
-        y_true: Tensor of shape [batch, freq, time, channels*2]
-        y_pred: Same shape as y_true
-
-    Returns:
-        Scalar tensor loss
-    """
-    # Separate magnitude and phase
-    mag_true   = y_true[:, 0::2, :, :]
-    mag_pred   = y_pred[:, 0::2, :, :]
-
-    phase_true = y_true[:, 1::2, :, :]
-    phase_pred = y_pred[:, 1::2, :, :]
-
-    # Magnitude loss (log-MSE)
-    eps = 1e-6
-    mag_pred_safe = torch.clamp(mag_pred, min=0.0)
-    log_mag_true  = torch.log(mag_true + eps)
-    log_mag_pred  = torch.log(mag_pred_safe + eps)
-    mag_loss = F.mse_loss(log_mag_true, log_mag_pred)
-
-
-    # Relative magnitude error (optional, replace or add)
-    rel_mag_err = ((mag_true - mag_pred) ** 2 / (mag_true**2 + 1e-6)).mean()
-
-    # Phase loss (cosine similarity)
-    phase_true_complex = torch.complex(torch.cos(phase_true), torch.sin(phase_true))
-    phase_pred_complex = torch.complex(torch.cos(phase_pred), torch.sin(phase_pred))
-    phase_diff_cos = torch.real(phase_true_complex * torch.conj(phase_pred_complex))
-    phase_loss = torch.mean(1.0 - phase_diff_cos)
-
-    # Total weighted
-    return 0.6 * mag_loss + 0.2 * rel_mag_err + 0.2 * phase_loss
-
 def spectro_time_consistency_loss(orig_wave, recon_spec,
                                   fs=200, nperseg=256, noverlap=224,
                                   weight=1.0):
@@ -1380,7 +1342,7 @@ def train_autoencoders(
         device,
         epochs: int = 100,
         lr: float = 5e-4,
-        patience: int = 20
+        patience: int = 50
     ):
     """
     Trains the spectrogram and mask autoencoders separately.
@@ -1464,10 +1426,10 @@ def train_autoencoders(
 
             loss_spec_total = (
                 loss_spec_mag +
-                0.0 * loss_time +
-                0.1 * loss_mag_l1 +
-                0.1 * loss_laplacian + 
-                5 * loss_wave_si
+                0.2 * loss_time +
+                0.5 * loss_mag_l1 +
+                0.3 * loss_laplacian + 
+                1 * loss_wave_si
             )
 
             loss_spec_total.backward()
@@ -1544,10 +1506,10 @@ def train_autoencoders(
 
                 loss_spec_val_total = (
                     loss_spec_mag +
-                    0.0 * loss_time +
-                    0.1 * loss_mag_l1 +
-                    0.1 * loss_laplacian +
-                    5 * loss_wave_si
+                    0.2 * loss_time +
+                    0.5 * loss_mag_l1 +
+                    0.3 * loss_laplacian +
+                    1 * loss_wave_si
                 )
                 val_loss_spec.append(loss_spec_val_total.item())
 
@@ -1603,10 +1565,7 @@ def train_autoencoders(
                 print(f"⏹️ Early stopping at epoch {epoch+1} after no improvement for {patience} epochs.")
                 break
         
-        return spec_history, mask_history
-
-
-
+    return spec_history, mask_history
 
 # ----- Visualization Functions and tests -----
 def visualize_training_history(history, save_path=None):
@@ -1698,7 +1657,7 @@ def save_visualizations_and_metrics(model, train_loader, val_loader, training_me
         model.eval()
         latents = []
         for spec, _, _, _ in loader:
-            spec = spec.to(next(model.parameters()).device)
+            spec = spec.to(model.device)
             with torch.no_grad():
                 _, z = model.autoencoders["spec"](spec)
             latents.append(z.cpu().numpy())
@@ -1721,6 +1680,28 @@ def save_visualizations_and_metrics(model, train_loader, val_loader, training_me
         "latent_metrics": latent_metrics,
         "latent_space_3d": latent_3d
     }
+
+def save_plotly_loss_curve(metrics, save_path, title="Loss vs Epochs"):
+    import plotly.graph_objs as go
+    import plotly.io as pio
+    import os
+
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+    epochs = list(range(1, len(metrics['train_loss']) + 1))
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=epochs, y=metrics['train_loss'],
+                             mode='lines+markers', name="Train Loss", line=dict(color='blue')))
+    if metrics['val_loss']:
+        fig.add_trace(go.Scatter(x=epochs, y=metrics['val_loss'],
+                                 mode='lines+markers', name="Val Loss", line=dict(color='red')))
+
+    fig.update_layout(title=title,
+                      xaxis_title="Epoch", yaxis_title="Loss",
+                      template="plotly_white")
+
+    pio.write_html(fig, file=save_path, auto_open=False)
+    print(f"✅ Saved Plotly loss curve to {save_path}")
 
 
 # ----- Main Function -----
@@ -1816,7 +1797,7 @@ def main():
     spec_autoencoder = SpectrogramAutoencoder(latent_dim, channels, freq_bins, time_bins).to(device)
     mask_autoencoder = MaskAutoencoder(latent_dim, (mask_height, mask_width)).to(device)
 
-    spec_autoencoder.istft = DifferentiableISTFT(nperseg=256, noverlap=224).to(device)
+    spec_autoencoder.istft = DifferentiableISTFT(nperseg=nperseg, noverlap=noverlap).to(device)
 
 
 
@@ -1828,8 +1809,8 @@ def main():
             device, epochs=ae_epochs,
             lr=learning_rate_ae, patience=patience_ae
         )
-        visualize_training_history(spec_history, save_path="results_diff/autoencoders/spec_autoencoder_loss.png")
-        visualize_training_history(mask_history, save_path="results_diff/autoencoders/mask_autoencoder_loss.png")
+        save_plotly_loss_curve(spec_history, "results_diff/autoencoders/spec_loss.html", title="Spectrogram AE Loss")
+        save_plotly_loss_curve(mask_history, "results_diff/autoencoders/mask_loss.html", title="Mask AE Loss")
 
         torch.save(spec_autoencoder.state_dict(), "results_diff/autoencoders/spec_autoencoder.pt")
         torch.save(mask_autoencoder.state_dict(), "results_diff/autoencoders/mask_autoencoder.pt")
@@ -1840,7 +1821,7 @@ def main():
 
     mld = MultiModalLatentDiffusion(spec_autoencoder, mask_autoencoder, latent_dim, ["spec", "mask"], device)
 
-    mld.istft = DifferentiableISTFT(nperseg=256, noverlap=224).to(device)
+    mld.istft = DifferentiableISTFT(nperseg=nperseg, noverlap=noverlap).to(device)
 
 
     # ─── Diffusion training control ─────────────────────────────────

@@ -11,6 +11,7 @@ evaluation_plots/
 best_params_validation/
 correlation_results/
 Euler_MMVAE/data
+Euler_MMVAE/synthesis_results_all_configs
 clean_env_mirror/
 DataGenMethods/
 polyline_reconstruction_results/
