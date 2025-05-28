@@ -23,5 +23,7 @@ DataSynthSHM/data/
 DataSynthSHM/eval/
 DataSynthSHM/eval/synthesis_results_all_configs/
 synthesis_results_all_configs/
-
+evaluate.py
+data_analysis.py
+corrolation_analysis.py
 
