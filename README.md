@@ -8,6 +8,7 @@ It combines two complementary approaches:
 
 1. **Spectral MMVAE** – A Multimodal Variational Autoencoder for realistic data synthesis.
 2. **Multi-Modal Latent Diffusion (MLD)** – A generative diffusion-based model for realistic data synthesis.
+
 Both try to archieve the same goal. Learn, in a multimodal way, to generate synthetic vabriational data and corresponding damage scenarios as pairs based on real world data from a masonry arch bridge.
 
 ---
