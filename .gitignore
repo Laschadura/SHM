@@ -19,9 +19,8 @@ reconstruction_results/
 results_diff/
 synthesis_results_mmvae/
 results_mmvae/
-DataSynthSHM/data
-DataSynthSHM/eval
-DataSynthSHM/synthesis_results_all_configs
-eval/
+DataSynthSHM/data/
+DataSynthSHM/eval/
+synthesis_results_all_configs/
 
 
