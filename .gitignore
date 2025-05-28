@@ -21,6 +21,7 @@ synthesis_results_mmvae/
 results_mmvae/
 DataSynthSHM/data/
 DataSynthSHM/eval/
+DataSynthSHM/eval/synthesis_results_all_configs/
 synthesis_results_all_configs/
 
 
