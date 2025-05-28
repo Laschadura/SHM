@@ -10,8 +10,6 @@ debug_images/
 evaluation_plots/
 best_params_validation/
 correlation_results/
-Euler_MMVAE/data
-Euler_MMVAE/synthesis_results_all_configs
 clean_env_mirror/
 DataGenMethods/
 polyline_reconstruction_results/
@@ -21,3 +19,8 @@ reconstruction_results/
 results_diff/
 synthesis_results_mmvae/
 results_mmvae/
+DataSynthSHM/data
+DataSynthSHM/eval
+DataSynthSHM/synthesis_results_all_configs
+eval/
+
