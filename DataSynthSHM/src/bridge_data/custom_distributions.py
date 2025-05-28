@@ -175,7 +175,6 @@ def compute_js_divergence(mus, logvars):
 
     return tf.clip_by_value(js_div, 0.0, 1000.0)
 
-
 def sample_from_mixture_prior(mus, logvars):
     """
     Sample from the mixture-of-experts prior.

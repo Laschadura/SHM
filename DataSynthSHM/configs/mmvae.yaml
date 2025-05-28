@@ -1,0 +1,37 @@
+defaults:
+  - default.yaml
+
+model_name: "SpectralMMVAE"
+
+mmvae:
+  # 🧠 Core model settings
+  latent_dim: 256
+  batch_size: 128
+  num_epochs: 500
+  patience: 50
+
+  # 🔁 Modal training control
+  debug_mode: false
+  resume_training: false
+  unfreeze_istft_epoch: 100
+  dropout_prob: 0.0           # aka modality_dropout_prob
+
+  # 🔢 Beta schedule
+  beta_schedule: "linear"
+  beta_warmup_epochs: 60
+  beta_sweep: [0.06, 0.10]
+
+  # 🎚️ Loss Weights — only 1 config here (others can be separate files)
+  loss_weights:
+    mrstft: 0.7
+    grad: 0.1
+    lap: 0.1
+    mag: 0.1
+    damage: 300.0
+
+# 🧩 Autoencoder dimensions
+ae:
+  spec_channels: 24
+  freq_bins: 129
+  time_bins: 24
+  mask_shape: [32, 96]

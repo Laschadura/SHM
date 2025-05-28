@@ -1,0 +1,23 @@
+# default.yaml
+seed: 42
+device: "cuda"
+
+# Shared paths
+project_root: /cluster/scratch/scansimo/DataSynthSHM
+cache_dir: ${project_root}/cache
+output_dir: ${project_root}/results
+data_dir: ${project_root}/data
+
+# spectogram parameters
+fs: 200
+segment_duration: 4.0
+nperseg: 256
+noverlap: 224
+tag: "${segment_duration}s_${nperseg}_${noverlap}"
+
+# Cached file paths
+spectrograms_path: ${cache_dir}/specs_${tag}.npy
+masks_path: ${cache_dir}/masks_${tag}.npy
+segments_path: ${cache_dir}/segments_${tag}.npy
+ids_path: ${cache_dir}/segIDs_${tag}.npy
+

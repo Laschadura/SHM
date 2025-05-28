@@ -12,23 +12,27 @@
 echo "🔄 Job started on $(hostname) at $(date)"
 echo "🧠 Using $SLURM_CPUS_ON_NODE CPU cores"
 
-# ✅ Load modules with CUDA & Pytorch support
+# ✅ Load required modules
 module load stack/2024-06
 module load gcc/12.2.0
 module load python_cuda/3.11.6
 
-# ✅ Set CUDA environment (required for XLA)
+# ✅ Set CUDA env (required for some packages)
 export XLA_FLAGS=--xla_gpu_cuda_data_dir=$CUDA_EULER_ROOT
 export CUDA_DIR=$CUDA_EULER_ROOT
 
-# ✅ (Optional) Confirm GPU availability from within job
+# ✅ Debug GPU availability
 python -c "import torch; print(f'🟢 CUDA Available: {torch.cuda.is_available()} | Device: {torch.cuda.get_device_name(0)}')"
-
-echo "🔍 Checking GPU device..."
 nvidia-smi
 
-# ✅ Run your model
-python -u scripts/diffusion_model.py
+# ✅ Change into the project root (parent of src/)
+cd /cluster/scratch/scansimo/DataSynthSHM
+
+# ✅ Set PYTHONPATH so `diff_pt` is discoverable
+export PYTHONPATH=$PYTHONPATH:/cluster/scratch/scansimo/DataSynthSHM/src
+
+# ✅ Run the training entrypoint
+python -u src/diff_pt/run.py
+
 
 echo "✅ Job finished at $(date)"
-

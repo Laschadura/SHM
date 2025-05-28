@@ -1,0 +1,42 @@
+defaults:
+  - default.yaml
+
+model_name: "MultiModalLatentDiffusion"
+
+diffusion:
+  # ============ General flags ============
+  train_autoencoders: true
+  recompute_data: false
+  dm_mode: "scratch"            # or "continue"
+
+  # ============ Checkpoints ============
+  ckpt_path: "${paths.output_dir}/diffusion/final_diffusion_model.pt"
+  ae_ckpt_dir: "${paths.output_dir}/autoencoders"
+
+  # ============ Latent / AE settings ============
+  latent_dim: 256
+  batch_size: 200
+
+  ae_epochs: 500
+  ae_patience: 50
+  ae_learning_rate: 5e-4
+
+  # ============ Diffusion training ============
+  num_epochs: 500         # (dm_epochs)
+  learning_rate: 5e-4     # (dm_lr)
+  beta_start: 0.0001
+  beta_end: 0.02
+  num_timesteps: 1000
+
+  # ============ Loss Weights ============
+  flow_matching_weight: 1.0
+  mask_loss_weight: 1.0
+  damage_loss_weight: 1.0
+  spec_loss_weight: 0.1
+
+# Optional AE output shapes (can be inferred but listed for clarity)
+ae:
+  spec_channels: 24
+  freq_bins: 129
+  time_bins: 24
+  mask_shape: [32, 96]

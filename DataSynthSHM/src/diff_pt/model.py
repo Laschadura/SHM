@@ -1,159 +1,28 @@
 import os
-import platform
-import sys
-import gc
-import psutil
-import numpy as np
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
-
-import math
-from scipy import signal
-import matplotlib.pyplot as plt
+from torch import optim
+import numpy as np
 from tqdm import tqdm
-import plotly.graph_objects as go
-from plotly.subplots import make_subplots
-import plotly.io as pio
-import plotly.express as px
-from tqdm import tqdm
-import pandas as pd
-import umap
-import GPUtil
 
-# Set working directory based on platform
-if platform.system() == "Windows":
-    os.chdir("c:/SP-Master-Local/SP_DamageLocalization-MasonryArchBridge_SimonScandella/ProbabilisticApproach/Euler_MMVAE")
-else:
-    os.chdir("/cluster/scratch/scansimo/Euler_MMVAE")
-print("✅ Script has started executing")
-
-# GPU Configuration
-def configure_gpu():
-    if torch.cuda.is_available():
-        num_gpus = torch.cuda.device_count()
-        print(f"✅ CUDA is available. {num_gpus} GPU(s) detected.")
-        for i in range(num_gpus):
-            print(f"   🔹 GPU {i}: {torch.cuda.get_device_name(i)}")
-    else:
-        print("⚠️ No GPU devices found — this script will run on CPU.")
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"🔍 PyTorch will run on: {device}")
-
-configure_gpu()
-
-# Ensure access to sibling files
-sys.path.append(os.path.dirname(__file__))
-import data_loader
-
-from utils import (
-    dynamic_weighting,
-    betas_for_alpha_bar,
-    sinusoidal_time_embedding,
-    energy_sigma,
+from .losses import (
     complex_spectrogram_loss,
-    multi_channel_mrstft_loss,
-    gradient_loss_phase_only,
-    laplacian_loss_phase_only,
-    damage_amount_loss,
-    energy_sigma,
     magnitude_l1_loss,
+    laplacian_loss_phase_only,
+    gradient_loss_phase_only,
     waveform_si_l1_loss,
-    custom_mask_loss,
     focal_tversky_loss,
-    DifferentiableISTFT
+    damage_amount_loss,
+    custom_mask_loss,
 )
 
-
-# ----- Recource Monitoring and Usage -----
-def print_memory_stats():
-    process = psutil.Process()
-    print(f"RAM Memory Use: {process.memory_info().rss / 1024 / 1024:.2f} MB")
-    gpus = GPUtil.getGPUs()
-    for gpu in gpus:
-        print(f"GPU {gpu.id} Memory Use: {gpu.memoryUsed}MB / {gpu.memoryTotal}MB")
-
-def clear_gpu_memory():
-    torch.cuda.empty_cache()
-    gc.collect()
-    print("🧹 Cleared GPU memory and ran garbage collector.")
-
-def print_detailed_memory():
-    process = psutil.Process()
-    
-    # RAM details
-    ram_info = process.memory_info()
-    print(f"RAM Usage:")
-    print(f"  RSS (Resident Set Size): {ram_info.rss / 1024 / 1024:.2f} MB")
-    print(f"  VMS (Virtual Memory Size): {ram_info.vms / 1024 / 1024:.2f} MB")
-    
-    # GPU details
-    gpus = GPUtil.getGPUs()
-    for gpu in gpus:
-        print(f"\nGPU {gpu.id} ({gpu.name}):")
-        print(f"  Memory Use: {gpu.memoryUsed}MB / {gpu.memoryTotal}MB")
-        print(f"  GPU Load: {gpu.load*100:.1f}%")
-        print(f"  Memory Free: {gpu.memoryFree}MB")
-
-def monitor_resources():
-    """Prints CPU, RAM, and GPU usage stats."""
-    # CPU & RAM Usage
-    cpu_usage = psutil.cpu_percent()
-    ram_usage = psutil.virtual_memory().percent
-    ram_used = psutil.virtual_memory().used / (1024**3)  # Convert bytes to GB
-    ram_total = psutil.virtual_memory().total / (1024**3)  # Convert bytes to GB
-
-    print(f"🖥️ CPU Usage: {cpu_usage:.1f}% | 🏗️ RAM: {ram_used:.2f}/{ram_total:.2f} GB ({ram_usage:.1f}%)")
-
-    # GPU Usage
-    gpus = GPUtil.getGPUs()
-    for gpu in gpus:
-        print(f"🚀 GPU {gpu.id} ({gpu.name}): {gpu.memoryUsed:.1f}MB / {gpu.memoryTotal:.1f}MB "
-              f"| Load: {gpu.load * 100:.1f}%")
-
-# ----- Loss Functions and schedules -----
-def spectro_time_consistency_loss(orig_wave, recon_spec,
-                                  fs=200, nperseg=256, noverlap=224,
-                                  weight=1.0):
-    """
-    orig_wave : (B, T, C)    pre-processed window
-    recon_spec: (B, 2C, F, T) decoder output (log-mag | phase)
-
-    Computes ISTFT of recon_spec, aligns RMS to orig_wave, and
-    returns L1 distance; multiply by `weight` before adding.
-    """
-    with torch.no_grad():
-        spec_np = recon_spec.detach().cpu().numpy().transpose(0, 2, 3, 1)
-        wav_rec = data_loader.inverse_spectrogram(
-            spec_np, time_length=orig_wave.shape[1],
-            fs=fs, nperseg=nperseg, noverlap=noverlap)
-        wav_rec = torch.tensor(wav_rec, device=orig_wave.device)
-
-    # RMS-match before L1/L2
-    scale = orig_wave.std(dim=1, keepdim=True) / (wav_rec.std(dim=1, keepdim=True) + 1e-8)
-    wav_rec *= scale
-    return weight * F.l1_loss(wav_rec, orig_wave)
-
-def _quick_mask_stats(mask_true, mask_logits, mask_prob):
-    """
-    Prints one-line stats for masks.
-    mask_true   : (B,1,H,W) float 0–1
-    mask_logits : (B,1,H,W) pre-sigmoid
-    mask_prob   : (B,1,H,W) after sigmoid
-    """
-    with torch.no_grad():
-        dice = (2 * (mask_true * (mask_prob > 0.5)).sum(dim=(-2,-1))
-                / (mask_true.sum(dim=(-2,-1)) + (mask_prob > 0.5).sum(dim=(-2,-1)) + 1e-6))
-        print(f"   GT mean={mask_true.mean():.4f} ┃ "
-              f"logit μ={mask_logits.mean():+.2f} σ={mask_logits.std():.2f} ┃ "
-              f"prob μ={mask_prob.mean():.4f} ┃ "
-              f"Dice[0]={dice[0].item():.3f}")
+from .utils import (
+    energy_sigma,
+    sinusoidal_time_embedding,
+    betas_for_alpha_bar,
+    dynamic_weighting,
+)
 
 # ----- Helpers -----
 def _upsample_block(in_ch, out_ch):
@@ -162,6 +31,61 @@ def _upsample_block(in_ch, out_ch):
         nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
         nn.LeakyReLU(0.1)
     )
+
+# ----- Custom Layers -----
+class DifferentiableISTFT(nn.Module):
+    def __init__(self, nperseg=256, noverlap=224, epsilon=1e-5):
+        super().__init__()
+        self.nperseg = nperseg
+        self.hop_len = nperseg - noverlap  # → 32
+        self.epsilon = epsilon
+        self.register_buffer(
+            'window',
+            torch.hann_window(nperseg),
+            persistent=False
+        )
+
+    def forward(self, spec, length):
+        # Accepts (B, 2C, F, T)
+        spec = spec.permute(0, 2, 3, 1).contiguous()  # → (B, F, T, 2C)
+
+        B, F, T, D = spec.shape
+        C = D // 2
+
+        # Separate log-magnitude and phase
+        spec = spec.view(B, F, T, C, 2)
+        log_mag = spec[..., 0]        # (B, F, T, C)
+        phase   = spec[..., 1]
+
+        # Flatten for batch ISTFT: (B*C, F, T)
+        log_mag = log_mag.permute(0, 3, 1, 2).reshape(-1, F, T)
+        phase   = phase.permute(0, 3, 1, 2).reshape(-1, F, T)
+
+        # Reconstruct magnitude
+        mag = torch.exp(log_mag) - self.epsilon
+        mag = torch.clamp(mag, min=0.)
+
+        # Form complex spectrogram
+        real = mag * torch.cos(phase)
+        imag = mag * torch.sin(phase)
+        complex_spec = torch.complex(real, imag)  # shape: (B*C, F, T)
+
+        # Apply ISTFT
+        wav = torch.istft(
+            complex_spec,
+            n_fft=self.nperseg,
+            hop_length=self.hop_len,
+            win_length=self.nperseg,
+            window=self.window,
+            center=True,
+            normalized=False,
+            onesided=True,
+            length=length
+        )
+
+        # Reshape back to (B, length, C)
+        wav = wav.view(B, C, -1).permute(0, 2, 1)
+        return wav
 
 # ----- Encoders -----
 class SpectrogramEncoder(nn.Module):
@@ -349,6 +273,8 @@ class SpectrogramDecoder(nn.Module):
         # Output projection 
         self.conv_out = nn.Conv2d(in_channels=32, out_channels=channels, kernel_size=3, padding=1)
 
+        self.output_gain = nn.Parameter(torch.tensor(1.0))
+
     def forward(self, z):
         # Initial projection and reshape
         x = self.relu1(self.fc(z))
@@ -370,7 +296,7 @@ class SpectrogramDecoder(nn.Module):
         x  = self.drop3(x)
         
         # Final projection
-        x = self.conv_out(x)
+        x = self.output_gain * self.conv_out(x)
         
         # Ensure the output has the exact desired dimensions
         if (x.size(2) != self.freq_bins) or (x.size(3) != self.time_bins):
@@ -568,7 +494,6 @@ class DiffusionModel(nn.Module):
         start_idx = self.cumulative_dims[modality_idx]
         end_idx = self.cumulative_dims[modality_idx + 1]
         return slice(start_idx, end_idx)
-
 
 # ===== Noise Schedulers =====
 class NoiseScheduler:
@@ -791,7 +716,6 @@ class NoiseScheduler:
         
         return loss, x_t, pred_noise
 
-
 # ===== Multi-Modal Latent Diffusion Implementation =====
 class MultiModalLatentDiffusion:
     """
@@ -807,7 +731,9 @@ class MultiModalLatentDiffusion:
         mask_autoencoder,
         latent_dim=128,
         modality_names=["spec", "mask"],
-        device="cuda" if torch.cuda.is_available() else "cpu"
+        device="cuda" if torch.cuda.is_available() else "cpu",
+        mu_spec=None,
+        sig_spec=None
         ):
         """
         Initialize the MLD system.
@@ -822,6 +748,9 @@ class MultiModalLatentDiffusion:
         self.device = device
         self.modality_names = modality_names
         self.num_modalities = len(modality_names)
+
+        self.mu_spec  = mu_spec.to(device) if mu_spec is not None else None
+        self.sig_spec = sig_spec.to(device) if sig_spec is not None else None
         
         # Store the pretrained autoencoders
         self.autoencoders = {
@@ -862,83 +791,6 @@ class MultiModalLatentDiffusion:
         self.diffusion_model.train(mode)
         return self
 
-    def encode_modalities(self, modality_data):
-        latents = {}
-
-        for modality_name, data in modality_data.items():
-            if data is not None:
-
-                # Defensive fix for spec shape
-                if modality_name == "spec" and data.shape[1] != 24:
-                    print(f"⚠️ WARNING: Expected spec channel=48 but got {data.shape[1]}, transposing...")
-                    data = data.permute(0, 2, 3, 1)
-
-                data = data.to(self.device)
-                autoencoder = self.autoencoders[modality_name]
-                with torch.no_grad():
-                    _, latent = autoencoder(data)
-                latents[modality_name] = latent
-            else:
-                latents[modality_name] = None
-
-        joint_latent = torch.cat(
-            [latents[name] for name in self.modality_names if latents[name] is not None], dim=1
-        ) if any(latents[name] is not None for name in self.modality_names) else None
-
-        return latents, joint_latent
-
-    def decode_modalities(self, joint_latent):
-        """
-        Decode a joint latent representation back to each modality.
-        
-        Args:
-            joint_latent: Joint latent representation
-        
-        Returns:
-            Dict of decoded outputs for each modality
-        """
-        outputs = {}
-        
-        # Split the joint latent into individual modality latents
-        start_idx = 0
-        for i, modality_name in enumerate(self.modality_names):
-            end_idx = start_idx + self.modality_dims[i]
-            modality_latent = joint_latent[:, start_idx:end_idx]
-
-            autoencoder = self.autoencoders[modality_name]
-            with torch.no_grad():
-                if modality_name == "spec":
-                    output = autoencoder.decoder(modality_latent)
-                else:
-                    output = autoencoder.decoder(modality_latent)
-
-            outputs[modality_name] = output
-            start_idx = end_idx
-
-        return outputs
-    
-    def create_modality_mask(self, batch_size, available_modalities):
-        """
-        Create a mask tensor for conditional generation.
-        
-        Args:
-            batch_size: Batch size
-            available_modalities: List of available modality names
-        
-        Returns:
-            Binary mask tensor (1 for known elements, 0 for elements to predict)
-        """
-        mask = torch.zeros((batch_size, self.total_latent_dim), device=self.device)
-        
-        start_idx = 0
-        for i, modality_name in enumerate(self.modality_names):
-            if modality_name in available_modalities:
-                end_idx = start_idx + self.modality_dims[i]
-                mask[:, start_idx:end_idx] = 1.0
-            start_idx += self.modality_dims[i]
-        
-        return mask
-    
     def train_diffusion_model(
         self,
         train_dataloader,
@@ -1019,8 +871,11 @@ class MultiModalLatentDiffusion:
 
                 # Compute σ from spec magnitude
                 spec = modality_data["spec"].to(self.device)
-                real, imag = spec[:, 0::2], spec[:, 1::2]
+                # invert global normalization
+                spec_dn = spec * self.sig_spec + self.mu_spec
+                real, imag = spec_dn[:, 0::2], spec_dn[:, 1::2]
                 mag = torch.sqrt(real**2 + imag**2)
+
                 sigma_t = energy_sigma(mag)                          # (B, T)
                 sigma_mean = sigma_t.mean(dim=1, keepdim=True)       # (B, 1)
 
@@ -1055,12 +910,21 @@ class MultiModalLatentDiffusion:
                 loss_phase_l   = laplacian_loss_phase_only(spec_true, spec_pred)
                 loss_mag_l1    = magnitude_l1_loss(spec_true, spec_pred)
 
-                if hasattr(self, 'istft'):
-                    wav_pred = self.istft(spec_pred, length=spec_true.size(2) * 4)
-                    wav_true = self.istft(spec_true, length=spec_true.size(2) * 4)
+                # robust .istft access
+                core = getattr(self, "module", self)
+                istft_layer = getattr(core, "istft", None)
+
+                if istft_layer is not None:
+                    spec_pred_dn = spec_pred.clone()
+                    C = spec_pred_dn.shape[1] // 2
+                    spec_pred_dn[:, :C] = spec_pred_dn[:, :C] * self.sig_spec + self.mu_spec
+                    # spec_pred_dn[:, C:] stays untouched (raw phase)
+                    wav_pred = istft_layer(spec_pred_dn, length=spec_true.size(2) * 4)
+                    wav_true = istft_layer(spec_true, length=spec_true.size(2) * 4)
                     loss_wave_si = waveform_si_l1_loss(wav_true, wav_pred)
                 else:
                     loss_wave_si = torch.tensor(0.0, device=spec_true.device)
+
 
                 mask_pred  = outputs["mask"]
                 mask_true  = modality_data["mask"].to(self.device)
@@ -1075,11 +939,11 @@ class MultiModalLatentDiffusion:
                 # Combined loss
                 loss = (
                     1               * loss_fm + 
-                    0.1             * loss_complex +
+                    0.5             * loss_complex +
                     0               * loss_phase_g +
                     0               * loss_phase_l +
                     0               * loss_mag_l1 +
-                    0               * loss_wave_si +
+                    0.5               * loss_wave_si +
                     1               * loss_mask_px + 
                     damage_weight   * loss_damage
                 )
@@ -1145,12 +1009,21 @@ class MultiModalLatentDiffusion:
                         loss_p_l    =  laplacian_loss_phase_only(spec_true, spec_pred)
                         loss_mag    =  magnitude_l1_loss(spec_true, spec_pred)
 
-                        if hasattr(self, 'istft'):
-                            wav_pred = self.istft(spec_pred, length=spec_true.size(2) * 4)
-                            wav_true = self.istft(spec_true, length=spec_true.size(2) * 4)
+                        # robust .istft access (wrapped or not)
+                        core = getattr(self, "module", self)
+                        istft_layer = getattr(core, "istft", None)
+
+                        if istft_layer is not None:
+                            spec_pred_dn = spec_pred.clone()
+                            C = spec_pred_dn.shape[1] // 2
+                            spec_pred_dn[:, :C] = spec_pred_dn[:, :C] * self.sig_spec + self.mu_spec
+                            # spec_pred_dn[:, C:] stays untouched (raw phase)
+                            wav_pred = istft_layer(spec_pred_dn, length=spec_true.size(2) * 4)
+                            wav_true = istft_layer(spec_true, length=spec_true.size(2) * 4)
                             loss_wave_si = waveform_si_l1_loss(wav_true, wav_pred)
                         else:
                             loss_wave_si = torch.tensor(0.0, device=spec_true.device)
+
 
                         mask_pred = outputs["mask"]
                         mask_true = modality_data["mask"].to(self.device)
@@ -1165,11 +1038,11 @@ class MultiModalLatentDiffusion:
 
                         Loss = (
                             1               * loss_fm + 
-                            0.1             * loss_spec +
+                            0.5             * loss_spec +
                             0               * loss_p_g +
                             0               * loss_p_l +
                             0               * loss_mag +
-                            0               * loss_wave_si +
+                            0.5               * loss_wave_si +
                             1               * loss_mask + 
                             damage_weight   * loss_damage
                         )
@@ -1203,7 +1076,150 @@ class MultiModalLatentDiffusion:
         torch.save(self.diffusion_model.state_dict(), f"{save_dir}/final_diffusion_model.pt")
         
         return history
+
+    def encode_modalities(self, modality_data):
+        latents = {}
+
+        for modality_name, data in modality_data.items():
+            if data is not None:
+
+                # Defensive fix for spec shape
+                if modality_name == "spec" and data.shape[1] != 24:
+                    print(f"⚠️ WARNING: Expected spec channel=48 but got {data.shape[1]}, transposing...")
+                    data = data.permute(0, 2, 3, 1)
+
+                data = data.to(self.device)
+                autoencoder = self.autoencoders[modality_name]
+                with torch.no_grad():
+                    _, latent = autoencoder(data)
+                latents[modality_name] = latent
+            else:
+                latents[modality_name] = None
+
+        joint_latent = torch.cat(
+            [latents[name] for name in self.modality_names if latents[name] is not None], dim=1
+        ) if any(latents[name] is not None for name in self.modality_names) else None
+
+        return latents, joint_latent
+
+    def decode_modalities(self, joint_latent):
+        """
+        Decode a joint latent representation back to each modality.
+        
+        Args:
+            joint_latent: Joint latent representation
+        
+        Returns:
+            Dict of decoded outputs for each modality
+        """
+        outputs = {}
+        
+        # Split the joint latent into individual modality latents
+        start_idx = 0
+        for i, modality_name in enumerate(self.modality_names):
+            end_idx = start_idx + self.modality_dims[i]
+            modality_latent = joint_latent[:, start_idx:end_idx]
+
+            autoencoder = self.autoencoders[modality_name]
+            with torch.no_grad():
+                if modality_name == "spec":
+                    output = autoencoder.decoder(modality_latent)
+                else:
+                    output = autoencoder.decoder(modality_latent)
+
+            outputs[modality_name] = output
+            start_idx = end_idx
+
+        return outputs
     
+    def create_modality_mask(self, batch_size, available_modalities):
+        """
+        Create a mask tensor for conditional generation.
+        
+        Args:
+            batch_size: Batch size
+            available_modalities: List of available modality names
+        
+        Returns:
+            Binary mask tensor (1 for known elements, 0 for elements to predict)
+        """
+        mask = torch.zeros((batch_size, self.total_latent_dim), device=self.device)
+        
+        start_idx = 0
+        for i, modality_name in enumerate(self.modality_names):
+            if modality_name in available_modalities:
+                end_idx = start_idx + self.modality_dims[i]
+                mask[:, start_idx:end_idx] = 1.0
+            start_idx += self.modality_dims[i]
+        
+        return mask
+    
+    @staticmethod
+    def from_checkpoint(
+        ae_dir: str,
+        diff_ckpt_path: str,
+        spec_norm_path: str,
+        latent_dim: int,
+        device: str = "cuda" if torch.cuda.is_available() else "cpu"
+        ):
+        """
+        Loads a full MultiModalLatentDiffusion system from disk:
+        - Autoencoders
+        - Diffusion model
+        - Normalisation constants
+        """
+        # 1. Load normalization constants
+        norm = np.load(spec_norm_path)
+        mu_spec = torch.tensor(norm["mu"], dtype=torch.float32).to(device)
+        sig_spec = torch.tensor(norm["sigma"], dtype=torch.float32).to(device)
+
+        # 2. Rebuild autoencoders (must match dimensions from training)
+        spec_autoencoder = SpectrogramAutoencoder(
+            latent_dim, channels=12, freq_bins=129, time_bins=18
+        ).to(device)
+        mask_autoencoder = MaskAutoencoder(
+            latent_dim, output_shape=(32, 96)
+        ).to(device)
+
+        # spec_autoencoder.load_state_dict(torch.load(os.path.join(ae_dir, "spec_autoencoder_best.pt"), map_location=device))
+
+
+        spec_ckpt_path = os.path.join(ae_dir, "spec_autoencoder_best.pt")
+        state_dict = torch.load(spec_ckpt_path, map_location=device)
+
+        missing, unexpected = spec_autoencoder.load_state_dict(state_dict, strict=False)
+        print(f"✅ Loaded AE from {spec_ckpt_path}")
+        print("‼️  Missing keys:", missing)
+        print("‼️  Unexpected keys:", unexpected)
+        print("✅ adjust_conv.weight norm:", spec_autoencoder.encoder.adjust_conv.weight.norm().item())
+
+        print("✅ Loaded spec autoencoder state dict")
+        print("‣ adjust_conv.weight norm:", spec_autoencoder.encoder.adjust_conv.weight.norm().item())
+
+        mask_autoencoder.load_state_dict(torch.load(os.path.join(ae_dir, "mask_autoencoder_best.pt"), map_location=device))
+        print("‣ mask encoder norm:", mask_autoencoder.encoder.adjust_conv.weight.norm().item())
+
+
+        # 3. Construct MLD wrapper
+        mld = MultiModalLatentDiffusion(
+            spec_autoencoder,
+            mask_autoencoder,
+            latent_dim=latent_dim,
+            modality_names=["spec", "mask"],
+            device=device,
+            mu_spec=mu_spec,
+            sig_spec=sig_spec
+        )
+
+        # 4. Load diffusion weights
+        mld.diffusion_model.load_state_dict(torch.load(diff_ckpt_path, map_location=device))
+        mld.diffusion_model.to(device)
+        mld.eval()
+
+        print("Final weight norm:", mld.autoencoders["spec"].encoder.adjust_conv.weight.norm().item())
+
+        return mld
+
     def sample(self, batch_size=1, condition_on=None, condition_data=None):
         """
         Generate samples using the diffusion model.
@@ -1271,589 +1287,4 @@ class MultiModalLatentDiffusion:
 
         return outputs
     
-    def save_autoencoders(self, save_dir="./results/autoencoders"):
-        """Save the autoencoders"""
-        os.makedirs(save_dir, exist_ok=True)
-        
-        for name, ae in self.autoencoders.items():
-            torch.save(ae.state_dict(), f"{save_dir}/{name}_autoencoder.pt")
-    
-    def load_autoencoders(self, load_dir="./results/autoencoders"):
-        """Load the autoencoders"""
-        for name, ae in self.autoencoders.items():
-            path = f"{load_dir}/{name}_autoencoder.pt"
-            if os.path.exists(path):
-                ae.load_state_dict(torch.load(path, map_location=self.device))
-                print(f"Loaded {name} autoencoder from {path}")
-    
-    def save_diffusion_model(self, path="./results/diffusion/diffusion_model.pt"):
-        """Save the diffusion model"""
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        torch.save(self.diffusion_model.state_dict(), path)
-    
-    def load_diffusion_model(self, path="./results/diffusion/diffusion_model.pt"):
-        """Load the diffusion model"""
-        if os.path.exists(path):
-            self.diffusion_model.load_state_dict(torch.load(path, map_location=self.device))
-            print(f"Loaded diffusion model from {path}")
 
-
-# ===== Helper Function for Creating Datasets =====
-def create_torch_dataset(spec_data, mask_data, seg_data, test_ids, batch_size, shuffle=True):
-    """
-    Create a PyTorch DataLoader from the spectrogram and mask data.
-    
-    Args:
-        spec_data: Spectrogram data as a numpy array
-        mask_data: Mask data as a numpy array
-        batch_size: Batch size for the DataLoader
-        shuffle: Whether to shuffle the data
-    
-    Returns:
-        PyTorch DataLoader
-    """
-    # Convert numpy arrays to PyTorch tensors
-    spec    = torch.tensor(spec_data, dtype=torch.float32)
-    mask    = torch.tensor(mask_data, dtype=torch.float32)
-    seg     = torch.tensor(seg_data,  dtype=torch.float32)
-    ids     = torch.tensor(test_ids, dtype=torch.int32)
-    
-    # Create TensorDataset
-    dataset = TensorDataset(spec, mask, seg, ids)
-    
-    # Create DataLoader
-    dataloader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=shuffle,
-        drop_last=False,
-        num_workers=4,
-        pin_memory=True
-    )
-    
-    return dataloader
-
-# ===== Training Functions =====
-def train_autoencoders(
-        spec_autoencoder,
-        mask_autoencoder,
-        train_loader,
-        val_loader,
-        device,
-        epochs: int = 100,
-        lr: float = 5e-4,
-        patience: int = 50
-    ):
-    """
-    Trains the spectrogram and mask autoencoders separately.
-
-    Args
-    ----
-    spec_autoencoder : SpectrogramAutoencoder
-    mask_autoencoder : MaskAutoencoder
-    train_loader     : DataLoader yielding (spec, mask, seg, id)
-    device           : torch.device
-    epochs           : int  – number of epochs
-    lr               : float – learning‑rate
-    """
-    spec_autoencoder.to(device)
-    mask_autoencoder.to(device)
-
-    optimizer_spec = optim.AdamW(spec_autoencoder.parameters(), lr=lr)
-    optimizer_mask = optim.AdamW(mask_autoencoder.parameters(), lr=lr)
-
-    scheduler_spec = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer_spec, T_max=epochs
-    )
-    scheduler_mask = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer_mask, T_max=epochs
-    )
-
-    best_spec_loss = float("inf")
-    best_mask_loss = float("inf")
-    patience_counter = 0
-
-    #track losses for plotting
-    spec_history = {"train_loss": [], "val_loss": []}
-    mask_history = {"train_loss": [], "val_loss": []}
-
-
-    for epoch in range(epochs):
-        # --- Dynamic hyperparameters ---
-        damage_weight = 0.3 if epoch >= 200 else 2          # (1) ↓ loss_damage weight
-        focal_gamma   = 1.5 if epoch >= 250 else 1.0        # (2) ↑ gamma focality
-        contrast_weight = min(0.3, epoch / 100 * 0.3)       # (3) adaptive ramp-up
-        
-        # Custom mask loss weights: schedule
-        if epoch < 200:
-            weight_bce   = 0.4
-            weight_dice  = 0.5
-            weight_focal = 0.1
-        else:
-            weight_bce   = 0.1
-            weight_dice  = 0.8
-            weight_focal = 0.1
-        # ------------------------------------------------
-        spec_autoencoder.train()
-        mask_autoencoder.train()
-
-        spec_loss_sum  = 0.0     # running *sum* for this epoch
-        mask_loss_sum  = 0.0
-        batch_counter  = 0
-
-        for spec_batch, mask_batch, seg_batch, _ in train_loader:
-            batch_counter += 1
-
-            spec_batch = spec_batch.to(device)
-            mask_batch = mask_batch.to(device)
-            seg_batch  = seg_batch.to(device)
-
-            # ────────────────────── SPECTROGRAM AUTOENCODER ──────────────────────
-            optimizer_spec.zero_grad()
-            recon_spec, _ = spec_autoencoder(spec_batch)
-
-            loss_spec_mag  = complex_spectrogram_loss(spec_batch, recon_spec)         # main spec loss
-            loss_time      = spectro_time_consistency_loss(seg_batch, recon_spec)     # waveform ↔ STFT alignment
-            loss_mag_l1    = magnitude_l1_loss(spec_batch, recon_spec)                # adds sharpness to mag
-            loss_laplacian = laplacian_loss_phase_only(spec_batch, recon_spec)        # improves phase structure
-
-            # Reconstruct waveform and apply waveform-domain loss (optional)
-            if hasattr(spec_autoencoder, 'istft'):
-                wav_recon = spec_autoencoder.istft(recon_spec, length=seg_batch.size(1))  # (B, T, C)
-                loss_wave_si = waveform_si_l1_loss(seg_batch, wav_recon)
-            else:
-                loss_wave_si = torch.tensor(0.0, device=spec_batch.device) # zero if not using istft
-
-            loss_spec_total = (
-                loss_spec_mag +
-                0.2 * loss_time +
-                0.5 * loss_mag_l1 +
-                0.3 * loss_laplacian + 
-                1 * loss_wave_si
-            )
-
-            loss_spec_total.backward()
-            optimizer_spec.step()
-            spec_loss_sum += loss_spec_total.item()
-
-            # ─────────────────────── MASK AUTOENCODER ─────────────────────────────
-            optimizer_mask.zero_grad()
-            recon_mask, _ = mask_autoencoder(mask_batch)
-
-            # ── diagnostics (first batch each epoch) ──────────────────────────────
-            if batch_counter == 1:
-                mask_logits = torch.logit(recon_mask.clamp(1e-4, 1-1e-4))
-                _quick_mask_stats(mask_batch, mask_logits, recon_mask)
-            # ---------------------------------------------------------------------
-
-
-            loss_mask_px = focal_tversky_loss(mask_batch, recon_mask, alpha=0.3, beta=0.8, gamma=focal_gamma)
-
-            loss_damage = damage_amount_loss(
-                mask_batch,
-                recon_mask,
-                contrast_weight=contrast_weight,
-                margin=0.005
-            )
-
-            loss_dice = custom_mask_loss(
-                    mask_batch, recon_mask,
-                    weight_bce=weight_bce,
-                    weight_dice=weight_dice,
-                    weight_focal=weight_focal,
-                    gamma= 2.0,
-                    alpha= 0.3
-            )
-
-            loss_mask_total = (
-                0               * loss_mask_px +
-                damage_weight   * loss_damage +
-                1               * loss_dice
-            )
-
-            loss_mask_total.backward()
-            optimizer_mask.step()
-            mask_loss_sum += loss_mask_total.item()
-
-        # -------- end of epoch: compute means & log --------
-        avg_spec_loss = spec_loss_sum / batch_counter
-        avg_mask_loss = mask_loss_sum / batch_counter
-        print(f"[Epoch {epoch+1:3d}/{epochs}]  "
-            f"spec={avg_spec_loss:.4f}  mask={avg_mask_loss:.4f}")
-        
-        # AE Validation (mirrors training structure)
-        spec_autoencoder.eval()
-        mask_autoencoder.eval()
-        val_loss_spec, val_loss_mask = [], []
-
-        with torch.no_grad():
-            for spec_batch_val, mask_batch_val, seg_batch_val, _ in val_loader:
-                spec_batch_val = spec_batch_val.to(device)
-                mask_batch_val = mask_batch_val.to(device)
-                seg_batch_val  = seg_batch_val.to(device)
-
-                recon_spec_val, _ = spec_autoencoder(spec_batch_val)
-                loss_spec_mag  = complex_spectrogram_loss(spec_batch_val, recon_spec_val)
-                loss_time      = spectro_time_consistency_loss(seg_batch_val, recon_spec_val)
-                loss_mag_l1    = magnitude_l1_loss(spec_batch_val, recon_spec_val)
-                loss_laplacian = laplacian_loss_phase_only(spec_batch_val, recon_spec_val)
-
-                if hasattr(spec_autoencoder, 'istft'):
-                    wav_recon_val = spec_autoencoder.istft(recon_spec_val, length=seg_batch_val.size(1))
-                    loss_wave_si = waveform_si_l1_loss(seg_batch_val, wav_recon_val)
-                else:
-                    loss_wave_si = torch.tensor(0.0, device=spec_batch_val.device)
-
-                loss_spec_val_total = (
-                    loss_spec_mag +
-                    0.2 * loss_time +
-                    0.5 * loss_mag_l1 +
-                    0.3 * loss_laplacian +
-                    1 * loss_wave_si
-                )
-                val_loss_spec.append(loss_spec_val_total.item())
-
-                recon_mask_val, _ = mask_autoencoder(mask_batch_val)
-                loss_mask_px = focal_tversky_loss(mask_batch_val, recon_mask_val, alpha=0.3, beta=0.8, gamma=focal_gamma)
-
-                loss_damage  = damage_amount_loss(
-                        mask_batch_val,
-                        recon_mask_val,
-                        contrast_weight=contrast_weight,
-                        margin=0.005
-                )
-                
-                loss_dice = custom_mask_loss(
-                    mask_batch_val, recon_mask_val,
-                    weight_bce=weight_bce,
-                    weight_dice=weight_dice,
-                    weight_focal=weight_focal,
-                    gamma= 2.0,
-                    alpha= 0.3
-                )
-
-                loss_mask_val_total = (
-                    0               * loss_mask_px +
-                    damage_weight   * loss_damage +
-                    1               * loss_dice
-                )
-                val_loss_mask.append(loss_mask_val_total.item())
-
-        print(f"AE Val Spec Loss: {np.mean(val_loss_spec):.4f}, AE Val Mask Loss: {np.mean(val_loss_mask):.4f}")
-
-        #track losses for plotting
-        spec_history["train_loss"].append(avg_spec_loss)
-        spec_history["val_loss"].append(np.mean(val_loss_spec))
-        mask_history["train_loss"].append(avg_mask_loss)
-        mask_history["val_loss"].append(np.mean(val_loss_mask))
-
-        # step the LR schedulers
-        scheduler_spec.step()
-        scheduler_mask.step()
-
-        # Early stopping logic based on spec loss (or mask loss, or both)
-        if avg_spec_loss < best_spec_loss:
-            best_spec_loss = avg_spec_loss
-            best_mask_loss = avg_mask_loss
-            patience_counter = 0
-            # Save best model weights
-            torch.save(spec_autoencoder.state_dict(), "results_diff/autoencoders/spec_autoencoder_best.pt")
-            torch.save(mask_autoencoder.state_dict(), "results_diff/autoencoders/mask_autoencoder_best.pt")
-        else:
-            patience_counter += 1
-            if patience_counter >= patience:
-                print(f"⏹️ Early stopping at epoch {epoch+1} after no improvement for {patience} epochs.")
-                break
-        
-    return spec_history, mask_history
-
-# ----- Visualization Functions and tests -----
-def visualize_training_history(history, save_path=None):
-    """
-    Visualize the training history.
-
-    Args:
-        history: Training history dictionary
-        save_path: Path to save the plot
-    """
-    plt.figure(figsize=(10, 5))
-    plt.plot(history['train_loss'], label='Train Loss')
-
-    if history['val_loss']:
-        plt.plot(history['val_loss'], label='Validation Loss')
-
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.title('Training History')
-    plt.legend()
-    plt.grid(True)
-
-    if save_path:
-        plt.savefig(save_path)
-
-    plt.close()
-
-def save_visualizations_and_metrics(model, train_loader, val_loader, training_metrics, output_dir="results_diff"):
-    os.makedirs(output_dir, exist_ok=True)
-    plots_dir = os.path.join(output_dir, "plots")
-    os.makedirs(plots_dir, exist_ok=True)
-
-    def plot_training_curves(metrics):
-        epochs = list(range(1, len(metrics['train_loss']) + 1))
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=epochs, y=metrics['train_loss'],
-                                 mode='lines+markers', name="Train Loss", line=dict(color='blue')))
-        if metrics['val_loss']:
-            fig.add_trace(go.Scatter(x=epochs, y=metrics['val_loss'],
-                                     mode='lines+markers', name="Val Loss", line=dict(color='red')))
-        fig.update_layout(title="Loss vs Epochs",
-                          xaxis_title="Epoch", yaxis_title="Loss",
-                          template="plotly_white")
-        file_path = os.path.join(plots_dir, "train_val_loss.html")
-        pio.write_html(fig, file=file_path, auto_open=False)
-        print(f"Saved training curves to {file_path}")
-
-    plot_training_curves(training_metrics)
-
-    def extract_and_reduce_latents(loader):
-        # Explicitly set evaluation mode for internal modules
-        model.diffusion_model.eval()
-        for ae in model.autoencoders.values():
-            ae.eval()
-
-        latents, ids = [], []
-        device = model.device  # Correct way to get the device
-
-        for spec, _, _, test_id in loader:
-            spec = spec.to(device)
-            with torch.no_grad():
-                _, z = model.autoencoders["spec"](spec)
-            latents.append(z.cpu().numpy())
-            ids.append(test_id.numpy().flatten())
-
-        latents = np.concatenate(latents, axis=0)
-        ids = np.concatenate(ids, axis=0)
-
-        reducer = umap.UMAP(n_neighbors=15, min_dist=0.05, n_components=3, random_state=42)
-
-        latent_3d = reducer.fit_transform(latents)
-
-        return latent_3d, ids
-
-    latent_3d, train_ids = extract_and_reduce_latents(train_loader)
-
-    def plot_latent_space_3d(latent_3d, ids):
-        df = pd.DataFrame(latent_3d, columns=["UMAP_1", "UMAP_2", "UMAP_3"])
-        df["Test ID"] = pd.to_numeric(ids, errors="coerce")
-        fig = px.scatter_3d(df, x="UMAP_1", y="UMAP_2", z="UMAP_3", color="Test ID",
-                             color_continuous_scale="Viridis", title="Latent Space Visualization (3D UMAP)", opacity=0.8)
-        file_path = os.path.join(plots_dir, "latent_space_3d.html")
-        pio.write_html(fig, file=file_path, auto_open=False)
-        print(f"Saved 3D latent space plot to {file_path}")
-
-    plot_latent_space_3d(latent_3d, train_ids)
-
-    def latent_analysis(loader):
-        model.eval()
-        latents = []
-        for spec, _, _, _ in loader:
-            spec = spec.to(model.device)
-            with torch.no_grad():
-                _, z = model.autoencoders["spec"](spec)
-            latents.append(z.cpu().numpy())
-        latents = np.concatenate(latents, axis=0)
-        norms = np.linalg.norm(latents, axis=1, keepdims=True)
-        normalized = latents / (norms + 1e-8)
-        cosine_sim = np.dot(normalized, normalized.T).diagonal()
-        fig = go.Figure(data=go.Histogram(x=cosine_sim, histnorm='probability density', marker_color='blue', opacity=0.7))
-        fig.update_layout(title="Cosine Similarity Distribution (Validation Latents)",
-                          xaxis_title="Cosine Similarity", yaxis_title="Probability Density", template="plotly_white")
-        file_path = os.path.join(plots_dir, "cosine_similarity_hist.html")
-        pio.write_html(fig, file=file_path, auto_open=False)
-        print(f"Saved cosine similarity histogram to {file_path}")
-        return {"avg_cosine_similarity": float(np.mean(cosine_sim))}
-
-    latent_metrics = latent_analysis(val_loader)
-    print("Latent analysis metrics:", latent_metrics)
-
-    return {
-        "latent_metrics": latent_metrics,
-        "latent_space_3d": latent_3d
-    }
-
-def save_plotly_loss_curve(metrics, save_path, title="Loss vs Epochs"):
-    import plotly.graph_objs as go
-    import plotly.io as pio
-    import os
-
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-
-    epochs = list(range(1, len(metrics['train_loss']) + 1))
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=epochs, y=metrics['train_loss'],
-                             mode='lines+markers', name="Train Loss", line=dict(color='blue')))
-    if metrics['val_loss']:
-        fig.add_trace(go.Scatter(x=epochs, y=metrics['val_loss'],
-                                 mode='lines+markers', name="Val Loss", line=dict(color='red')))
-
-    fig.update_layout(title=title,
-                      xaxis_title="Epoch", yaxis_title="Loss",
-                      template="plotly_white")
-
-    pio.write_html(fig, file=save_path, auto_open=False)
-    print(f"✅ Saved Plotly loss curve to {save_path}")
-
-
-# ----- Main Function -----
-def main():
-    # ─── Mode Control ───────────────────────────────────────────────
-    train_AE        = True                   # whether to train AE
-    ae_epochs      = 500                   # epochs for autoencoder training
-    patience_ae     = 50                     # patience for autoencoder training
-    recompute_data  = False                   # whether to recompute cache
-    dm_mode         = "scratch"              # "scratch" or "continue"
-    dm_epochs       = 1                    # extra epochs for diffusion
-    learning_rate_dm = 5e-4
-    learning_rate_ae = 5e-4
-    diff_ckpt       = "results_diff/diffusion/final_diffusion_model.pt"
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    os.makedirs("results_diff/autoencoders", exist_ok=True)
-    os.makedirs("results_diff/diffusion", exist_ok=True)
-
-    # ─── Data Parameters ────────────────────────────────────────────
-    fs = 200
-    segment_duration = 4.0
-    nperseg = 256
-    noverlap = 224
-    latent_dim = 256
-    batch_size = 200
-
-    tag = f"{segment_duration:.2f}s_{nperseg}_{noverlap}"
-    cache_dir = "cache"
-    os.makedirs(cache_dir, exist_ok=True)
-
-    final_path    = os.path.join(cache_dir, f"specs_{tag}.npy")
-    heatmaps_path = os.path.join(cache_dir, f"masks_{tag}.npy")
-    ids_path      = os.path.join(cache_dir, f"segIDs_{tag}.npy")
-    seg_path      = os.path.join(cache_dir, f"segments_{tag}.npy")
-
-    # ─── Load or compute features ───────────────────────────────────
-    all_cached = all(os.path.exists(p) for p in [final_path, heatmaps_path, ids_path, seg_path])
-    if all_cached and not recompute_data:
-        print("✅ Loading cached files...")
-        spectral_features = np.load(final_path)
-        mask_segments     = np.load(heatmaps_path)
-        test_ids          = np.load(ids_path)
-        segments          = np.load(seg_path)
-    else:
-        print("⚠️  Cache missing or recompute requested … building fresh.")
-        _, _, heatmaps, segments, spectrograms, test_ids = data_loader.load_data(
-            segment_duration = segment_duration,
-            nperseg          = nperseg,
-            noverlap         = noverlap,
-            sample_rate      = fs,
-            recompute        = recompute_data,
-            cache_dir        = cache_dir
-        )
-        spectral_features = spectrograms
-        mask_segments     = np.stack([heatmaps[tid] for tid in test_ids], axis=0)
-
-        np.save(final_path,    spectral_features)
-        np.save(heatmaps_path, mask_segments)
-        np.save(ids_path,      test_ids)
-        np.save(seg_path,      segments)
-        print("✅ New cache written.")
-
-    # ─── Dataset Splitting ──────────────────────────────────────────
-    spectral_features = spectral_features.transpose(0, 3, 1, 2)  # (N,2C,F,T)
-    mask_segments     = mask_segments.transpose(0, 3, 1, 2)
-
-    N = spectral_features.shape[0]
-    indices = np.random.permutation(N)
-    split = int(0.8 * N)
-    train_idx, val_idx = indices[:split], indices[split:]
-
-    train_spec = spectral_features[train_idx]
-    val_spec   = spectral_features[val_idx]
-    train_mask = mask_segments[train_idx]
-    val_mask   = mask_segments[val_idx]
-    train_ids  = test_ids[train_idx]
-    val_ids    = test_ids[val_idx]
-    train_seg  = segments[train_idx]
-    val_seg    = segments[val_idx]
-
-    print(f"✅ Train: {train_spec.shape[0]} samples | Val: {val_spec.shape[0]} samples")
-
-    # ─── Create Torch Loaders ───────────────────────────────────────
-    train_loader = create_torch_dataset(train_spec, train_mask, train_seg, train_ids, batch_size=batch_size)
-    val_loader   = create_torch_dataset(val_spec,   val_mask,   val_seg,   val_ids,   batch_size=batch_size)
-
-    freq_bins, time_bins = train_spec.shape[2:]
-    channels = train_spec.shape[1] // 2
-    mask_height, mask_width = mask_segments.shape[-2:]
-
-    # ─── Build Model ────────────────────────────────────────────────
-    spec_autoencoder = SpectrogramAutoencoder(latent_dim, channels, freq_bins, time_bins).to(device)
-    mask_autoencoder = MaskAutoencoder(latent_dim, (mask_height, mask_width)).to(device)
-
-    spec_autoencoder.istft = DifferentiableISTFT(nperseg=nperseg, noverlap=noverlap).to(device)
-
-
-
-    if train_AE:
-        print("🚀 Training Autoencoders...")
-        spec_history, mask_history = train_autoencoders(
-            spec_autoencoder, mask_autoencoder,
-            train_loader, val_loader,
-            device, epochs=ae_epochs,
-            lr=learning_rate_ae, patience=patience_ae
-        )
-        save_plotly_loss_curve(spec_history, "results_diff/autoencoders/spec_loss.html", title="Spectrogram AE Loss")
-        save_plotly_loss_curve(mask_history, "results_diff/autoencoders/mask_loss.html", title="Mask AE Loss")
-
-        torch.save(spec_autoencoder.state_dict(), "results_diff/autoencoders/spec_autoencoder.pt")
-        torch.save(mask_autoencoder.state_dict(), "results_diff/autoencoders/mask_autoencoder.pt")
-    else:
-        print("🔄 Loading pretrained autoencoders...")
-        spec_autoencoder.load_state_dict(torch.load("results_diff/autoencoders/spec_autoencoder.pt", map_location=device))
-        mask_autoencoder.load_state_dict(torch.load("results_diff/autoencoders/mask_autoencoder.pt", map_location=device))
-
-    mld = MultiModalLatentDiffusion(spec_autoencoder, mask_autoencoder, latent_dim, ["spec", "mask"], device)
-
-    mld.istft = DifferentiableISTFT(nperseg=nperseg, noverlap=noverlap).to(device)
-
-
-    # ─── Diffusion training control ─────────────────────────────────
-    if dm_mode == "continue":
-        if os.path.exists(diff_ckpt):
-            print("🔄 Continuing diffusion training from checkpoint.")
-            mld.load_diffusion_model(diff_ckpt)
-        else:
-            print("❌ No diffusion checkpoint found – aborting continue mode.")
-            return
-    elif dm_mode == "scratch":
-        print("🆕 Training diffusion model from scratch.")
-    else:
-        raise ValueError(f"Invalid dm_mode: {dm_mode}. Choose 'scratch' or 'continue'.")
-
-    print(f"🚀 Training diffusion model for {dm_epochs} epoch(s).")
-    history = mld.train_diffusion_model(
-        train_dataloader = train_loader,
-        val_dataloader   = val_loader,
-        num_epochs       = dm_epochs,
-        learning_rate    = learning_rate_dm,
-        save_dir         = "results_diff/diffusion"
-    )
-
-    mld.save_diffusion_model(diff_ckpt)
-
-    visualize_training_history(history, save_path="results_diff/diffusion/training_curve.png")
-    save_visualizations_and_metrics(mld, train_loader, val_loader, training_metrics=history, output_dir="results_diff")
-
-    print("✅ All training, evaluation, and synthesis complete.")
-
-
-
-if __name__ == "__main__":
-    main()
