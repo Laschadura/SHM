@@ -79,8 +79,8 @@ Raw input:
 
 ```
 Data/
-├── Data/Test_*/Accel_*.csv        # Time-series accelerometer input
-├── Labels/Test_*/mask_*.png       # Crack masks
+├── Data/Test_*/accel_*.csv        # Time-series accelerometer data of 12 sensors
+├── Labels/Test_*/label_*.png       # images of the damage on the bridge
 ```
 
 Cached and normalized data is stored in `cache/` based on config-defined segment duration and STFT parameters.
