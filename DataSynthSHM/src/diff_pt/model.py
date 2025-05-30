@@ -46,16 +46,18 @@ class DifferentiableISTFT(nn.Module):
         )
 
     def forward(self, spec, length):
-        # Accepts (B, 2C, F, T)
-        spec = spec.permute(0, 2, 3, 1).contiguous()  # → (B, F, T, 2C)
+        # Accepts (B, 3C, F, T)   = [log|S|, sinφ, cosφ]
+        spec = spec.permute(0, 2, 3, 1).contiguous()  # (B, F, T, 3C)
 
         B, F, T, D = spec.shape
-        C = D // 2
+        C = D // 3
 
-        # Separate log-magnitude and phase
-        spec = spec.view(B, F, T, C, 2)
-        log_mag = spec[..., 0]        # (B, F, T, C)
-        phase   = spec[..., 1]
+        # split triplets  → (B, F, T, C, 3)
+        spec = spec.view(B, F, T, C, 3)
+        log_mag = spec[..., 0]
+        phase_s = spec[..., 1]
+        phase_c = spec[..., 2]
+        phase   = torch.atan2(phase_s, phase_c)            # recover φ
 
         # Flatten for batch ISTFT: (B*C, F, T)
         log_mag = log_mag.permute(0, 3, 1, 2).reshape(-1, F, T)
@@ -355,42 +357,43 @@ class MaskDecoder(nn.Module):
 # ----- Autoencoders -----
 class SpectrogramAutoencoder(nn.Module):
     """
-    Dual-path magnitude / phase auto-encoder.
-
-    enc_mag   ─┐                ┌──►  z_mag   (B, D)
-               │   concat (+)   │
-    enc_phase ─┘                └──►  z_phi   (B, D)
-                                 │
-              decoder(2D)  ───►  recon  (B, 2C, F, T)
+    Dual-path magnitude / phase auto-encoder
+              ┌── enc_mag (C) ──►  z_mag
+    spec ──►  │
+              └── enc_phase (2C, sin|cos) ──► z_phi   ──┐
+                                                       ├─ concat → joint z
+    joint z ──┐
+              ├─ dec_mag  →  Ŝ_mag
+              └─ dec_phase→  Ŝ_phase(sin|cos)
+    recon = cat([Ŝ_mag, Ŝ_phase])   # (B, 3C, F, T)
     """
     def __init__(self, latent_dim, channels, freq_bins, time_bins, share_weights=False):
         super().__init__()
 
-        # two independent encoders (C channels each)
-        self.enc_mag   = SpectrogramEncoder(latent_dim, channels)
-        self.enc_phase = SpectrogramEncoder(latent_dim, channels)
+        self.enc_mag   = SpectrogramEncoder(latent_dim, channels)        #  C
+        self.enc_phase = SpectrogramEncoder(latent_dim, channels * 2)    # 2C
 
         if share_weights:
             self.enc_phase.load_state_dict(self.enc_mag.state_dict())
 
         self.dec_mag   = SpectrogramDecoder(latent_dim, freq_bins, time_bins, channels)
-        self.dec_phase = SpectrogramDecoder(latent_dim, freq_bins, time_bins, channels)
-
+        self.dec_phase = SpectrogramDecoder(latent_dim, freq_bins, time_bins, channels * 2)
 
     def encode(self, spec):
-        C = spec.shape[1] // 2
-        z_m = self.enc_mag(spec[:, :C])    # (B, D)
-        z_p = self.enc_phase(spec[:, C:])  # (B, D)
-        return torch.cat([z_m, z_p], dim=1)   # (B, 2D)
+        C = spec.shape[1] // 3
+        z_m = self.enc_mag(spec[:, :C])
+        z_p = self.enc_phase(spec[:, C:])
+        return torch.cat([z_m, z_p], dim=1)
 
     def forward(self, spec):
-        C = spec.shape[1] // 2
-        z_mag   = self.enc_mag(spec[:, :C])
-        z_phase = self.enc_phase(spec[:, C:])
-        mag_hat = self.dec_mag(z_mag)
-        phi_hat = self.dec_phase(z_phase)
-        recon   = torch.cat([mag_hat, phi_hat], dim=1)
-        return recon, torch.cat([z_mag, z_phase], dim=1)
+        C = spec.shape[1] // 3
+        z_m = self.enc_mag(spec[:, :C])
+        z_p = self.enc_phase(spec[:, C:])
+        mag_hat = self.dec_mag(z_m)
+        pha_hat = self.dec_phase(z_p)
+        recon = torch.cat([mag_hat, pha_hat], dim=1)
+        return recon, torch.cat([z_m, z_p], dim=1)
+
 
 
     
