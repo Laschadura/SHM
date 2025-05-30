@@ -122,13 +122,13 @@ def main():
     mld = MultiModalLatentDiffusion(
         spec_autoencoder,
         mask_autoencoder,
-        latent_dim,
-        ["spec", "mask"],
-        device,
+        modality_dims=[latent_dim*2, latent_dim],   # ❶
+        latent_dim_spec=latent_dim*2,               # ❷ keep for convenience
+        device=device,
         mu_spec=mu_tensor,
         sig_spec=std_tensor
     )
-
+    
     mld.istft = DifferentiableISTFT(nperseg=nperseg, noverlap=noverlap).to(device)
 
     if train_AE:

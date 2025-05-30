@@ -95,9 +95,9 @@ class SpectrogramEncoder(nn.Module):
     def __init__(self, latent_dim, channels):
         super().__init__()
         
-        # Initial adaptive dimension adjustment: e.g. channels*2 if you're storing mag+phase
+        
         self.adjust_conv = nn.Conv2d(
-            in_channels=channels*2,
+            in_channels=channels,
             out_channels=32,
             kernel_size=1,
             padding='same'
@@ -354,15 +354,45 @@ class MaskDecoder(nn.Module):
 
 # ----- Autoencoders -----
 class SpectrogramAutoencoder(nn.Module):
-    def __init__(self, latent_dim, channels, freq_bins, time_bins):
-        super().__init__()
-        self.encoder = SpectrogramEncoder(latent_dim, channels)
-        self.decoder = SpectrogramDecoder(latent_dim, freq_bins, time_bins, channels*2)
+    """
+    Dual-path magnitude / phase auto-encoder.
 
-    def forward(self, x):
-        z = self.encoder(x)
-        x_recon = self.decoder(z)
-        return x_recon, z
+    enc_mag   ─┐                ┌──►  z_mag   (B, D)
+               │   concat (+)   │
+    enc_phase ─┘                └──►  z_phi   (B, D)
+                                 │
+              decoder(2D)  ───►  recon  (B, 2C, F, T)
+    """
+    def __init__(self, latent_dim, channels, freq_bins, time_bins, share_weights=False):
+        super().__init__()
+
+        # two independent encoders (C channels each)
+        self.enc_mag   = SpectrogramEncoder(latent_dim, channels)
+        self.enc_phase = SpectrogramEncoder(latent_dim, channels)
+
+        if share_weights:
+            self.enc_phase.load_state_dict(self.enc_mag.state_dict())
+
+        self.dec_mag   = SpectrogramDecoder(latent_dim, freq_bins, time_bins, channels)
+        self.dec_phase = SpectrogramDecoder(latent_dim, freq_bins, time_bins, channels)
+
+
+    def encode(self, spec):
+        C = spec.shape[1] // 2
+        z_m = self.enc_mag(spec[:, :C])    # (B, D)
+        z_p = self.enc_phase(spec[:, C:])  # (B, D)
+        return torch.cat([z_m, z_p], dim=1)   # (B, 2D)
+
+    def forward(self, spec):
+        C = spec.shape[1] // 2
+        z_mag   = self.enc_mag(spec[:, :C])
+        z_phase = self.enc_phase(spec[:, C:])
+        mag_hat = self.dec_mag(z_mag)
+        phi_hat = self.dec_phase(z_phase)
+        recon   = torch.cat([mag_hat, phi_hat], dim=1)
+        return recon, torch.cat([z_mag, z_phase], dim=1)
+
+
     
 class MaskAutoencoder(nn.Module):
     def __init__(self, latent_dim, output_shape):
