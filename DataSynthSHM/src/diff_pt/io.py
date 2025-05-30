@@ -90,7 +90,7 @@ class SpectrogramDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         x = self.specs[idx].clone()
         if self.mu is not None and self.std is not None:
-            C = x.shape[0] // 2
+            C = x.shape[0] // 3                 #  mag, sinφ, cosφ
             x[:C] = (x[:C] - self.mu) / self.std  # Only normalize log-magnitude
             # x[C:] is phase → remains untouched
         return x, self.masks[idx], self.segs[idx], self.ids[idx], self.stats[idx]

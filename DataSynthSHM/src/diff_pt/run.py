@@ -55,8 +55,19 @@ def main():
             recompute        = recompute_data,
             cache_dir        = cache_dir)
 
-    # post-process into channel-first arrays
-    spectrograms  = spectrograms.transpose(0, 3, 1, 2)            # (N, 2C, F, T)
+    # post-process into channel-first arrays and separate mag/phase(sin/cos)
+    spectrograms = spectrograms.transpose(0, 3, 1, 2)    # (N,2C,F,T)
+    N, twoC, F, T = spectrograms.shape
+    C = twoC // 3
+    mag   = spectrograms[:, 0::2]
+    phase = spectrograms[:, 1::2]
+
+    spectrograms = np.concatenate(
+        [mag,
+        np.sin(phase),
+        np.cos(phase)], axis=1
+    ).astype(np.float32)                                  # (N,3C,F,T)
+
     mask_segments = np.stack([heatmaps[tid] for tid in test_ids], axis=0)
     mask_segments = mask_segments.transpose(0, 3, 1, 2)          # (N, 1, 32, 96)
 
@@ -73,7 +84,7 @@ def main():
     tr_stats,va_stats  = np.array(seg_stats, dtype=object)[tr_idx], np.array(seg_stats, dtype=object)[va_idx]
 
     # ───   GLOBAL μ,σ  (no leakage/train_ds only used) ─────────────────────────────────
-    C = tr_spec.shape[1] // 2  # 2C channels total → split into C mag + C phase
+    C = tr_spec.shape[1] // 3  # 3C channels total → split into C mag + C phase(sin/cos)
 
     # Separate
     logmag_train = tr_spec[:, :C]     # (N, C, F, T)
@@ -104,7 +115,7 @@ def main():
 
 
     freq_bins, time_bins = tr_spec.shape[2:]
-    channels = tr_spec.shape[1] // 2
+    channels = tr_spec.shape[1] // 3
     mask_height, mask_width = mask_segments.shape[-2:]
 
     # ─── Build Model ────────────────────────────────────────────────
@@ -128,7 +139,7 @@ def main():
         mu_spec=mu_tensor,
         sig_spec=std_tensor
     )
-    
+
     mld.istft = DifferentiableISTFT(nperseg=nperseg, noverlap=noverlap).to(device)
 
     if train_AE:

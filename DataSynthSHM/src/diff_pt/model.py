@@ -394,9 +394,6 @@ class SpectrogramAutoencoder(nn.Module):
         recon = torch.cat([mag_hat, pha_hat], dim=1)
         return recon, torch.cat([z_m, z_p], dim=1)
 
-
-
-    
 class MaskAutoencoder(nn.Module):
     def __init__(self, latent_dim, output_shape):
         super().__init__()
