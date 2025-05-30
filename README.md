@@ -2,14 +2,17 @@
 
 # 🧠 Structural Damage Modeling with Spectral MMVAE & Latent Diffusion
 
-This repository contains modular deep learning pipelines for **structural damage detection and data synthesis** from multimodal inputs such as time-frequency spectrograms and crack masks.
+This repository contains modular deep learning pipelines for **structural damage detection and data synthesis** using multimodal input data like accelerometer spectrograms and spatial crack masks.
 
 It combines two complementary approaches:
 
 1. **Spectral MMVAE** – A Multimodal Variational Autoencoder for realistic data synthesis.
 2. **Multi-Modal Latent Diffusion (MLD)** – A generative diffusion-based model for realistic data synthesis.
 
-Both try to archieve the same goal. Learn, in a multimodal way, to generate synthetic vabriational data and corresponding damage scenarios as pairs based on real world data from a masonry arch bridge.
+Both models aim to learn, in a multimodal way, to generate synthetic vibrational data and corresponding damage scenarios as pairs, using real-world measurements from a masonry arch bridge.
+
+> 📌 This project is an extension of my semester thesis at ETH Zürich.
+> 📚 The dataset and experimental foundation were provided by [Liu et al., 2024](https://doi.org/10.1016/j.engstruct.2024.118466), *“Full life-cycle vibration-based monitoring of a full-scale masonry arch bridge with increasing levels of damage”*, Engineering Structures 315.
 
 ---
 
@@ -53,7 +56,7 @@ DataSynthSHM/
 
 ---
 
-## 1⃣ Spectral MMVAE (TensorFlow)\$1
+## 1⃣ Spectral MMVAE (TensorFlow)
 
 **Module tests (example):**
 
@@ -63,7 +66,7 @@ python -m mmvae_tf.tests.test_MoE_MMVAE
 
 ---
 
-## 2⃣ Latent Diffusion Model (PyTorch)\$1
+## 2⃣ Latent Diffusion Model (PyTorch)
 
 **Module tests (example):**
 
@@ -80,7 +83,7 @@ Raw input:
 ```
 Data/
 ├── Data/Test_*/accel_*.csv        # Time-series accelerometer data of 12 sensors
-├── Labels/Test_*/label_*.png       # images of the damage on the bridge
+├── Labels/Test_*/label_*.png      # Images of the damage on the bridge
 ```
 
 Cached and normalized data is stored in `cache/` based on config-defined segment duration and STFT parameters.
@@ -160,6 +163,12 @@ pip install -r requirements.txt
 
 Developed by **Simon Scandella**
 MSc ETH Zürich – Structural Health Monitoring & Machine Learning
+
+---
+
+## 📄 License
+
+This repository is licensed under the [MIT License](https://opensource.org/licenses/MIT). You are free to use, modify, and distribute the code with attribution.
 
 ---
 
