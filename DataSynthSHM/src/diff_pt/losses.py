@@ -6,173 +6,115 @@ import math
 from .utils import _split_mag_phase
 from bridge_data.postprocess import inverse_spectrogram
 
+from .utils import _split_mag_sincos_from_phase as _split_mag_sincos
 
-# --------------Spectrogram Losses-------------------
-def complex_spectrogram_loss(spec_true: torch.Tensor,
-                              spec_pred: torch.Tensor) -> torch.Tensor:
-    """
-    • magnitude MSE  
-    • phase cosine distance  
-    • instantaneous-frequency L1
-    """
-    mag_t, phase_t = _split_mag_phase(spec_true)
-    mag_p, phase_p = _split_mag_phase(spec_pred)
+# ---------- magnitude ------------------------------------------------------
+def loss_mag_mse(spec_t, spec_p):
+    M_t, _, _ = _split_mag_sincos(spec_t)
+    M_p, _, _ = _split_mag_sincos(spec_p)
+    return F.mse_loss(M_p, M_t)
 
-    # 1) magnitude (L2)
-    mag_loss = F.mse_loss(mag_p, mag_t)
+def loss_mag_l1(spec_t, spec_p):
+    M_t, _, _ = _split_mag_sincos(spec_t)
+    M_p, _, _ = _split_mag_sincos(spec_p)
+    return F.l1_loss(M_p, M_t)
 
-    # 2) phase cosine distance
-    diff_cos = torch.cos(phase_p - phase_t)      # cos(Δφ)
-    phase_loss = torch.mean(1.0 - diff_cos)
+# ---------- helpers for phase ---------------------------------------------
+def _phase(spec):
+    _, s, c = _split_mag_sincos(spec)
+    return torch.atan2(s, c)
 
-    # 3) instantaneous frequency (optional)
-    if_t = phase_t[..., 1:] - phase_t[..., :-1]
-    if_p = phase_p[..., 1:] - phase_p[..., :-1]
-    if_loss = torch.mean(torch.abs(if_p - if_t))
+# ---------- phase: absolute dot-distance ----------------------------------
+def loss_phase_dot(spec_t, spec_p):
+    _, s_t, c_t = _split_mag_sincos(spec_t)
+    _, s_p, c_p = _split_mag_sincos(spec_p)
+    dot = (s_p * s_t + c_p * c_t).mean()      # ⟨u·v⟩   (u,v are unit vectors)
+    return 1.0 - dot                          # = 0 when perfectly aligned
 
-    return 0.5 * mag_loss + 0.3 * phase_loss + 0.2 * if_loss
+# ---------- phase: instantaneous frequency (time derivative) ---------------
+def loss_phase_if(spec_t, spec_p):
+    φ_t = _phase(spec_t)
+    φ_p = _phase(spec_p)
+    dt_t = φ_t[..., 1:] - φ_t[..., :-1]
+    dt_p = φ_p[..., 1:] - φ_p[..., :-1]
+    return F.l1_loss(dt_p, dt_t)
 
-def gradient_loss_phase_only(spec_true: torch.Tensor,
-                             spec_pred: torch.Tensor) -> torch.Tensor:
-    _, phase_t = _split_mag_phase(spec_true)
-    _, phase_p = _split_mag_phase(spec_pred)
-
-    dx_t = phase_t[:, :, 1:, :] - phase_t[:, :, :-1, :]
-    dx_p = phase_p[:, :, 1:, :] - phase_p[:, :, :-1, :]
-
-    dy_t = phase_t[:, :, :, 1:] - phase_t[:, :, :, :-1]
-    dy_p = phase_p[:, :, :, 1:] - phase_p[:, :, :, :-1]
-
+# ---------- phase: spatial X/Y gradients -----------------------------------
+def loss_phase_grad(spec_t, spec_p):
+    φ_t = _phase(spec_t)
+    φ_p = _phase(spec_p)
+    dx_t, dx_p = φ_t[:, :, 1:, :] - φ_t[:, :, :-1, :], φ_p[:, :, 1:, :] - φ_p[:, :, :-1, :]
+    dy_t, dy_p = φ_t[:, :, :, 1:] - φ_t[:, :, :, :-1], φ_p[:, :, :, 1:] - φ_p[:, :, :, :-1]
     return F.l1_loss(dx_p, dx_t) + F.l1_loss(dy_p, dy_t)
 
-def laplacian_loss_phase_only(spec_true: torch.Tensor,
-                              spec_pred: torch.Tensor) -> torch.Tensor:
-    _, phase_t = _split_mag_phase(spec_true)
-    _, phase_p = _split_mag_phase(spec_pred)
-
+# ---------- phase: Laplacian -----------------------------------------------
+def loss_phase_lap(spec_t, spec_p):
+    φ_t = _phase(spec_t)
+    φ_p = _phase(spec_p)
     def lap(x):
         return (-4*x[:, :, 1:-1, 1:-1] +
                 x[:, :, :-2, 1:-1] + x[:, :, 2:, 1:-1] +
                 x[:, :, 1:-1, :-2] + x[:, :, 1:-1, 2:])
+    return F.l1_loss(lap(φ_p), lap(φ_t))
 
-    return F.l1_loss(lap(phase_p), lap(phase_t))
+# ---------- phase: amplitude-weighted absolute error -----------------------
+def loss_phase_abs_aw(spec_t, spec_p):
+    M_t, _, _ = _split_mag_sincos(spec_t)
+    φ_t = _phase(spec_t);  φ_p = _phase(spec_p)
+    dφ = torch.atan2(torch.sin(φ_p - φ_t), torch.cos(φ_p - φ_t)).abs()
+    w  = M_t.exp()                                   # undo log
+    w  = w / (w.amax(dim=(-2, -1), keepdim=True) + 1e-6)
+    return (w * dφ).mean()
 
-def spectro_time_consistency_loss(orig_wave, recon_spec_norm, sigma, mu,
-                                  istft_layer, weight=1.0):
-    recon_spec = recon_spec_norm.clone()
-    C = recon_spec.shape[1] // 2
-    recon_spec[:, :C] = recon_spec[:, :C] * sigma + mu
+# ===========================================================================
+#  T I M E - D O M A I N   L O S S E S
+# ===========================================================================
 
-    wav_rec    = istft_layer(recon_spec, length=orig_wave.shape[1])
-    scale      = orig_wave.std(dim=1, keepdim=True) / (wav_rec.std(dim=1, keepdim=True)+1e-8)
-    wav_rec = wav_rec * scale
-    return weight * F.l1_loss(wav_rec, orig_wave)
+def loss_wave_l1(w_t, w_p):
+    return F.l1_loss(w_p, w_t)
 
-def magnitude_l1_loss(spec_true: torch.Tensor,
-                      spec_pred: torch.Tensor) -> torch.Tensor:
+def loss_wave_mrstft(w_t, w_p, fft_sizes=(256, 512, 1024)):
     """
-    L1 distance between magnitudes only (ignores phase).
-    spec_*  (B, 2C, F, T)  or (B, F, T, 2C) – handled transparently.
+    Multi-resolution STFT log-magnitude distance (channel-wise).
+    w_* : (B, T, C)
     """
-    if spec_true.ndim != 4:
-        raise ValueError("Expected 4-D spectrogram tensors")
-
-    # Make sure we are channel-first for our internal helpers
-    if spec_true.shape[1] % 2 != 0:         # channel-last → swap
-        spec_true = spec_true.permute(0, 3, 1, 2).contiguous()
-        spec_pred = spec_pred.permute(0, 3, 1, 2).contiguous()
-
-    mag_t, _ = _split_mag_phase(spec_true)
-    mag_p, _ = _split_mag_phase(spec_pred)
-    return F.l1_loss(mag_p, mag_t)
-
-def robust_phase_loss(spec_true: torch.Tensor,
-                      spec_pred: torch.Tensor,
-                      mag_weight: float = 0.6,
-                      if_weight:  float = 0.4) -> torch.Tensor:
-    """
-    Robust phase alignment loss.
-
-    Parameters
-    ----------
-    spec_true, spec_pred : (B, 2C, F, T)  or  (B, F, T, 2C)
-        Spectrograms storing **log–magnitude** and **phase** (radians)
-        in alternating channel order:  [log|S|, φ, log|S|, φ, …].
-
-    mag_weight : float
-        Weight for the absolute phase distance term.
-
-    if_weight  : float
-        Weight for the instantaneous-frequency (time-derivative) term.
-
-    Returns
-    -------
-    torch.Tensor  (scalar)
-        A convex combination of
-        • **Amplitude-weighted absolute phase error**  
-          \|Δφ\| is wrapped to [-π, π] and scaled by normalised |S| so that
-          low-SNR bins contribute less.  
-        • **Amplitude-weighted IF error**  
-          Δφ̇ along the **time** axis only – empirically more stable than
-          spatial gradients on noisy data.
-    """
-    # 1. split into magnitude / phase
-    _, φ_t = _split_mag_phase(spec_true)
-    _, φ_p = _split_mag_phase(spec_pred)
-
-    # 2. shortest-path phase difference  Δφ ∈ [-π, π]
-    Δφ = torch.atan2(torch.sin(φ_p - φ_t), torch.cos(φ_p - φ_t))
-
-    # 3. magnitude weights  w ∈ [0,1]  (broadcast over phase channels)
-    w = (spec_true[:, 0::2]).exp()                # |S|
-    w = w / (w.amax(dim=(-2, -1), keepdim=True) + 1e-6)
-
-    # 4.a amplitude-weighted absolute phase
-    phase_abs = (w * Δφ.abs()).mean()
-
-    # 4.b instantaneous frequency along **time**
-    if_t = φ_t[..., 1:] - φ_t[..., :-1]
-    if_p = φ_p[..., 1:] - φ_p[..., :-1]
-    if_loss = (w[..., 1:] * (if_p - if_t).abs()).mean()
-
-    return mag_weight * phase_abs + if_weight * if_loss
-
-# --------------Time Domain Losses-------------------
-def waveform_l1_loss(wav_true: torch.Tensor,
-                     wav_pred: torch.Tensor) -> torch.Tensor:
-    return F.l1_loss(wav_pred, wav_true)
-
-def waveform_si_l1_loss(wav_true: torch.Tensor,
-                        wav_pred: torch.Tensor,
-                        eps: float = 1e-7) -> torch.Tensor:
-    """
-    Scale-invariant L1 in time domain.
-    """
-    diff  = torch.mean(torch.abs(wav_true - wav_pred))
-    denom = torch.mean(torch.abs(wav_true)) + eps
-    return diff / denom
-
-def multi_channel_mrstft_loss(wav_true: torch.Tensor,
-                              wav_pred: torch.Tensor,
-                              fft_sizes=(256, 512, 1024)) -> torch.Tensor:
-    """
-    wav_* : (B, T, C)   time-domain windows after ISTFT
-    """
-    B, T, C = wav_true.shape
+    _, _, C = w_t.shape
     loss = 0.0
-    window_fns = {n: torch.hann_window(n, device=wav_true.device) for n in fft_sizes}
-
+    windows = {n: torch.hann_window(n, device=w_t.device) for n in fft_sizes}
     for n_fft in fft_sizes:
         hop = n_fft // 4
-        window = window_fns[n_fft]
+        win = windows[n_fft]
         for ch in range(C):
-            S_t = torch.stft(wav_true[:, :, ch], n_fft, hop_length=hop,
-                             window=window, return_complex=True)
-            S_p = torch.stft(wav_pred[:, :, ch], n_fft, hop_length=hop,
-                             window=window, return_complex=True)
-            loss += torch.mean(torch.abs(torch.log1p(S_t.abs()) -
-                                         torch.log1p(S_p.abs())))
+            St = torch.stft(w_t[:, :, ch], n_fft, hop_length=hop,
+                            window=win, return_complex=True)
+            Sp = torch.stft(w_p[:, :, ch], n_fft, hop_length=hop,
+                            window=win, return_complex=True)
+            loss += torch.mean(torch.abs(torch.log1p(St.abs()) -
+                                         torch.log1p(Sp.abs())))
     return loss / (len(fft_sizes) * C)
+
+# ===========================================================================
+#  S P E C –>  W A V   C O N S I S T E N C Y
+# ===========================================================================
+
+def loss_spectro_time_consistency(wav_ref,
+                                  spec_pred_norm,
+                                  sigma, mu,
+                                  istft_layer):
+    """
+    • Denormalises **only** log-magnitude  
+    • Runs differentiable ISTFT  
+    • Returns scale-invariant L1 in the time domain
+    """
+    spec_dn = spec_pred_norm.clone()
+    C = spec_dn.shape[1] // 3
+    spec_dn[:, :C] = spec_dn[:, :C] * sigma + mu
+    wav_rec = istft_layer(spec_dn, length=wav_ref.size(1))
+
+    scale = wav_ref.std(dim=1, keepdim=True) / (wav_rec.std(dim=1, keepdim=True) + 1e-8)
+    wav_rec = wav_rec * scale
+    return F.l1_loss(wav_rec, wav_ref)
+# ────────────────────────────────────────────────────────────────────────────
 
 # --------------Mask Losses-------------------
 def damage_amount_loss(mask_true: torch.Tensor,
