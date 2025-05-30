@@ -18,6 +18,8 @@ Both models aim to learn, in a multimodal way, to generate synthetic vibrational
 
 ## 📁 Repository Structure
 
+This repository is organized as follows:
+
 ```text
 DataSynthSHM/
 ├── configs/                # OmegaConf YAMLs for model configs
@@ -25,23 +27,21 @@ DataSynthSHM/
 ├── src/
 │   ├── bridge_data/        # Shared preprocessing, transforms, IO
 │   ├── diff_pt/            # PyTorch latent diffusion model
-│   │   ├── model.py        # Full diffusion model architecture
-│   │   ├── train.py        # Training loop and checkpointing
-│   │   ├── run.py          # CLI entry point
-│   │   ├── io.py, losses.py, utils.py, vis.py
-│   │   └── tests/          # Evaluation & reconstruction scripts
 │   └── mmvae_tf/           # TensorFlow-based Spectral MMVAE
-│       ├── model.py        # Encoders, decoders, and MoE logic
-│       ├── train.py        # MMVAE training logic and loop
-│       ├── run.py          # CLI entry point
-│       ├── losses.py, utils.py, env.py, io.py, vis.py
-│       └── tests/          # VAE test & visualization utilities
-├── cache/                  # Cached .npy/.pkl data
-├── results_diff/           # Diffusion model logs/outputs
-├── results_mmvae/          # MMVAE model logs/outputs
-├── logs/                   # Shared training logs
-└── setup.py                # Editable install
 ```
+
+Additional folders that are generated locally or used during training (not tracked in Git):
+
+```text
+Data/                       # Raw accelerometer CSVs (not included)
+Labels/                     # Raw label masks (not included)
+cache/                      # Cached spectrograms, masks, etc.
+results_diff/               # Diffusion model outputs and logs
+results_mmvae/              # MMVAE model outputs and logs
+logs/                       # Training logs
+```
+
+These folders are ignored via `.gitignore` to reduce repo size and preserve data privacy. To run the pipeline, users must place raw data in the expected structure and allow the pipeline to regenerate cached features.
 
 ---
 
