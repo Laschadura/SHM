@@ -2,6 +2,10 @@ import os
 import numpy as np
 import torch
 
+import hydra
+from omegaconf import DictConfig, OmegaConf
+import wandb
+
 from diff_pt.model import SpectrogramAutoencoder, MaskAutoencoder, MultiModalLatentDiffusion, DifferentiableISTFT
 from diff_pt.train import train_autoencoders
 from diff_pt.vis import save_plotly_loss_curve, save_visualizations_and_metrics, visualize_training_history
@@ -15,7 +19,19 @@ from diff_pt.io import (
 
 from bridge_data.loader import load_data
 
-def main():
+@hydra.main(version_base=None, config_path="../configs", config_name="diffusion")
+def main(cfg: DictConfig):
+
+    wandb.init(
+        project="SHM-AE-sweep",
+        config=OmegaConf.to_container(cfg, resolve=True),
+        name=f"sweep_run_{os.environ.get('SLURM_JOB_ID', 'local')}",
+        mode="online",  # change to "disabled" if debugging on login node
+    )
+
+    loss_cfg = cfg.loss_weights
+
+
     # ─── Mode Control ───────────────────────────────────────────────
     train_AE        = True                 # whether to train AE
     ae_epochs      = 600                   # epochs for autoencoder training
@@ -150,6 +166,7 @@ def main():
             device, epochs=ae_epochs,
             lr=learning_rate_ae, patience=patience_ae,
             cache_dir=cache_dir,
+            loss_cfg=loss_cfg
         )
         save_plotly_loss_curve(spec_history, "results_diff/autoencoders/spec_loss.html", title="Spectrogram AE Loss")
         save_plotly_loss_curve(mask_history, "results_diff/autoencoders/mask_loss.html", title="Mask AE Loss")

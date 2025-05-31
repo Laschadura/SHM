@@ -4,6 +4,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from tqdm import tqdm
 from torch.optim.lr_scheduler import ReduceLROnPlateau
+import wandb
 
 # ──────────────────────────────────────────────────────────────────────────
 #  Atomic losses
@@ -20,37 +21,16 @@ from diff_pt.losses import (
     focal_tversky_loss,
 )
 
-# (keep MR-STFT or grad / lap losses if you later need them)
-# from diff_pt.losses import loss_phase_grad, loss_phase_lap, loss_wave_mrstft
-
 from diff_pt.utils import _quick_mask_stats, scheduler
 
-# ──────────────────────────────────────────────────────────────────────────
-#  GLOBAL HYPER-PARAMETERS
-# ──────────────────────────────────────────────────────────────────────────
-# ––– Spectrogram AE –––
-MAG_MSE_W          = 1.0
-PHASE_DOT_W        = 1.0
-PHASE_IF_W         = 0.5
-PHASE_AW_ABS_W     = 0.0         # set >0 if you want the weighted |Δφ|
-MAG_CURRIC_MIN_W   = 0.3
-MAG_CURRIC_MAX_W   = 1.5
-TIME_CONSIST_W     = 0.5
-WAVE_L1_W          = 2.0
+from omegaconf      import DictConfig 
 
-# ––– Mask AE –––
-MASK_PX_W          = 0.0
-DAMAGE_W_INITIAL   = 2.0
-DAMAGE_W_FINAL     = 0.3
-FOCAL_GAMMA_INIT   = 1.0
-FOCAL_GAMMA_LATE   = 1.5
 
 # ──────────────────────────────────────────────────────────────────────────
 #  Helper schedules
 # ──────────────────────────────────────────────────────────────────────────
-def phase_curriculum(epoch: int) -> float:
-    """Linear decay MAG_CURRIC_MAX_W → MAG_CURRIC_MIN_W in first 80 epochs."""
-    return scheduler(0, 80, epoch, MAG_CURRIC_MIN_W, MAG_CURRIC_MAX_W)
+def phase_curriculum(epoch: int, cfg) -> float:
+    return scheduler(0, 80, epoch, cfg.mag_curric_min, cfg.mag_curric_max)
 
 # ──────────────────────────────────────────────────────────────────────────
 #  Main training routine
@@ -65,6 +45,7 @@ def train_autoencoders(
     lr:       float = 5e-4,
     patience: int = 50,
     cache_dir: str = "cache",
+    loss_cfg: DictConfig | dict = None,
 ):
     """
     Joint training of spectrogram- and mask-autoencoder.
@@ -95,8 +76,8 @@ def train_autoencoders(
         spec_autoencoder.train();  mask_autoencoder.train()
 
         # —— dynamic mask weights ——
-        damage_w    = DAMAGE_W_FINAL  if epoch >= 200 else DAMAGE_W_INITIAL
-        focal_gamma = FOCAL_GAMMA_LATE if epoch >= 250 else FOCAL_GAMMA_INIT
+        damage_w    = loss_cfg.damage_final  if epoch >= 200 else loss_cfg.damage_initial
+        focal_gamma = loss_cfg.focal_gamma_late if epoch >= 250 else loss_cfg.focal_gamma_init
         contrast_w  = min(0.3, epoch / 100 * 0.3)
         w_bce, w_dice, w_focal = (0.4, 0.5, 0.1) if epoch < 200 else (0.1, 0.8, 0.1)
 
@@ -112,28 +93,34 @@ def train_autoencoders(
             opt_spec.zero_grad()
             recon_spec, _ = spec_autoencoder(spec_b)
 
-            w_curr = phase_curriculum(epoch)  # curriculum factor
+            w_curr = phase_curriculum(epoch, loss_cfg)
 
-            loss_mag   = MAG_MSE_W   * loss_mag_mse(spec_b, recon_spec)
-            loss_p_dot = PHASE_DOT_W * loss_phase_dot(spec_b, recon_spec) * w_curr
-            loss_p_if  = PHASE_IF_W  * loss_phase_if (spec_b, recon_spec) * w_curr
-            loss_p_aw  = PHASE_AW_ABS_W * loss_phase_abs_aw(spec_b, recon_spec)
+            loss_mag   = loss_mag_mse(spec_b, recon_spec)
+            loss_p_dot = loss_phase_dot(spec_b, recon_spec) * w_curr
+            loss_p_if  = loss_phase_if (spec_b, recon_spec) * w_curr
+            loss_p_aw  = loss_phase_abs_aw(spec_b, recon_spec)
 
             istft_layer = getattr(spec_autoencoder, "istft", None)
             if istft_layer is not None:
-                loss_time = TIME_CONSIST_W * loss_spectro_time_consistency(
+                loss_time = loss_spectro_time_consistency(
                     seg_b, recon_spec, SIG_SPEC, MU_SPEC, istft_layer)
                 # Wave L1 (scale-invariant via the helper)
                 recon_dn = recon_spec.clone()
                 C = recon_dn.shape[1] // 3
                 recon_dn[:, :C] = recon_dn[:, :C] * SIG_SPEC + MU_SPEC
                 wav_rec = istft_layer(recon_dn, length=seg_b.size(1))
-                loss_wave = WAVE_L1_W * loss_wave_l1(seg_b, wav_rec)
+                loss_wave = loss_wave_l1(seg_b, wav_rec)
             else:
                 loss_time = loss_wave = torch.tensor(0.0, device=device)
 
-            spec_total = (loss_mag + loss_p_dot + loss_p_if +
-                          loss_p_aw + loss_time + loss_wave)
+            spec_total = (
+                loss_cfg.MAG_MSE_W * loss_mag + 
+                loss_cfg.PHASE_DOT_W * loss_p_dot + 
+                loss_cfg.PHASE_IF_W * loss_p_if +
+                loss_cfg.PHASE_AW_ABS_W * loss_p_aw + 
+                loss_cfg.TIME_CONSIST_W * loss_time + 
+                loss_cfg.WAVE_L1_W * loss_wave
+                )
             spec_total.backward();  opt_spec.step()
 
             # ——— M A S K ———
@@ -152,7 +139,7 @@ def train_autoencoders(
             loss_dice    = custom_mask_loss(mask_b, recon_mask,
                                             weight_bce=w_bce, weight_dice=w_dice,
                                             weight_focal=w_focal)
-            mask_total = MASK_PX_W * loss_mask_px + damage_w * loss_damage + loss_dice
+            mask_total = loss_cfg.MASK_PX_W * loss_mask_px + damage_w * loss_damage + loss_cfg.dice_w *loss_dice
             mask_total.backward();  opt_mask.step()
 
             sum_spec += spec_total.item();  sum_mask += mask_total.item()
@@ -173,24 +160,30 @@ def train_autoencoders(
                 recon_v, _ = spec_autoencoder(spec_v)
 
                 # —— spec losses ——
-                loss_mag   = MAG_MSE_W   * loss_mag_mse(spec_v, recon_v)
-                loss_p_dot = PHASE_DOT_W * loss_phase_dot(spec_v, recon_v) * w_curr
-                loss_p_if  = PHASE_IF_W  * loss_phase_if (spec_v, recon_v) * w_curr
-                loss_p_aw  = PHASE_AW_ABS_W * loss_phase_abs_aw(spec_v, recon_v)
+                loss_mag   = loss_mag_mse(spec_v, recon_v)
+                loss_p_dot = loss_phase_dot(spec_v, recon_v) * w_curr
+                loss_p_if  = loss_phase_if (spec_v, recon_v) * w_curr
+                loss_p_aw  = loss_phase_abs_aw(spec_v, recon_v)
 
                 if istft_layer is not None:
-                    loss_time = TIME_CONSIST_W * loss_spectro_time_consistency(
+                    loss_time = loss_spectro_time_consistency(
                         seg_v, recon_v, SIG_SPEC, MU_SPEC, istft_layer)
                     recon_dn = recon_v.clone()
                     C = recon_dn.shape[1] // 3
                     recon_dn[:, :C] = recon_dn[:, :C] * SIG_SPEC + MU_SPEC
                     wav_rec = istft_layer(recon_dn, length=seg_b.size(1))
-                    loss_wave = WAVE_L1_W * loss_wave_l1(seg_v, wav_rec)
+                    loss_wave = loss_wave_l1(seg_v, wav_rec)
                 else:
                     loss_time = loss_wave = torch.tensor(0.0, device=device)
 
-                val_spec_total = (loss_mag + loss_p_dot + loss_p_if +
-                                  loss_p_aw + loss_time + loss_wave)
+                val_spec_total =  (
+                    loss_cfg.MAG_MSE_W * loss_mag + 
+                    loss_cfg.PHASE_DOT_W * loss_p_dot + 
+                    loss_cfg.PHASE_IF_W * loss_p_if +
+                    loss_cfg.PHASE_AW_ABS_W * loss_p_aw + 
+                    loss_cfg.TIME_CONSIST_W * loss_time + 
+                    loss_cfg.WAVE_L1_W * loss_wave
+                )
                 val_spec_losses.append(val_spec_total.item())
 
                 # —— mask losses ——
@@ -203,7 +196,7 @@ def train_autoencoders(
                                                 weight_bce=w_bce, weight_dice=w_dice,
                                                 weight_focal=w_focal)
 
-                val_mask_total = MASK_PX_W * loss_mask_px + damage_w * loss_damage + loss_dice
+                val_mask_total = loss_cfg.MASK_PX_W * loss_mask_px + damage_w * loss_damage + loss_cfg.dice_w * loss_dice
                 val_mask_losses.append(val_mask_total.item())
 
         val_spec_loss = float(np.mean(val_spec_losses))
@@ -239,19 +232,22 @@ def train_autoencoders(
             print(f"⏹ Early stop @ epoch {epoch+1} – no improv for {patience} ep.")
             break
 
-        # ─────────── W&B hook (optional) ───────────
-        # if wandb.run is not None:
-        #     wandb.log({
-        #         "train/spec": train_spec_loss,
-        #         "train/mask": train_mask_loss,
-        #         "val/spec":   val_spec_loss,
-        #         "val/mask":   val_mask_loss,
-        #         "lr/spec":    sch_spec.optimizer.param_groups[0]["lr"],
-        #         "lr/mask":    sch_mask.get_last_lr()[0],
-        #     }, step=epoch)
+        #─────────── W&B hook ───────────
+        if wandb.run is not None:
+            wandb.log({
+                "train/spec": train_spec_loss,
+                "train/mask": train_mask_loss,
+                "val/spec":   val_spec_loss,
+                "val/mask":   val_mask_loss,
+                "epoch": epoch,
+            }, step=epoch)
+
 
     # —— return history dicts ——
     spec_hist = {"train_loss": hist["spec_train"], "val_loss": hist["spec_val"]}
     mask_hist = {"train_loss": hist["mask_train"], "val_loss": hist["mask_val"]}
+
+    wandb.finish()
+
     return spec_hist, mask_hist
-# ──────────────────────────────────────────────────────────────────────────
+

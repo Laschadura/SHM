@@ -5,24 +5,31 @@ import torch.nn.functional as F
 from torch import optim
 import numpy as np
 from tqdm import tqdm
+import wandb
 
-from .losses import (
-    complex_spectrogram_loss,
-    magnitude_l1_loss,
-    laplacian_loss_phase_only,
-    gradient_loss_phase_only,
-    waveform_si_l1_loss,
-    focal_tversky_loss,
-    damage_amount_loss,
-    custom_mask_loss,
+from diff_pt.losses import (
+    loss_mag_mse, loss_phase_dot, loss_phase_if,
+    loss_wave_l1, loss_spectro_time_consistency,
+    damage_amount_loss, focal_tversky_loss
 )
 
 from .utils import (
     energy_sigma,
     sinusoidal_time_embedding,
     betas_for_alpha_bar,
-    dynamic_weighting,
+    _split_mag_sincos_from_phase
 )
+
+DIFF_LOSS_WEIGHTS = {
+    "flowmatch": 1.0,
+    "complex":   0.5,
+    "phase_grad": 0.0,
+    "phase_lap":  0.0,
+    "mag_l1":     0.0,
+    "wave_si":    0.5,
+    "mask_px":    1.0,
+    "damage":     0.5,
+}
 
 # ----- Helpers -----
 def _upsample_block(in_ch, out_ch):
@@ -31,6 +38,21 @@ def _upsample_block(in_ch, out_ch):
         nn.Conv2d(in_ch, out_ch, kernel_size=3, padding=1),
         nn.LeakyReLU(0.1)
     )
+
+def dynamic_loss_weights(epoch: int, config: dict) -> dict:
+    return {
+        "damage_weight": (
+            config["damage_weight_late"]
+            if epoch >= config["damage_switch_epoch"]
+            else config["damage_weight_early"]
+        ),
+        "focal_gamma": (
+            config["focal_gamma_late"]
+            if epoch >= config["focal_gamma_switch_epoch"]
+            else config["focal_gamma_early"]
+        ),
+        "contrast_weight": min(config["contrast_weight_max"], epoch / 100 * config["contrast_weight_max"]),
+    }
 
 # ----- Custom Layers -----
 class DifferentiableISTFT(nn.Module):
@@ -829,255 +851,180 @@ class MultiModalLatentDiffusion:
         learning_rate=1e-4,
         save_dir="./results/diffusion"
         ):
-        """
-        Train the diffusion model on the joint latent space.
-        This is usefiul if autoencoders are pretrained and we want to train the diffusion model only.
-        
-        Args:
-            train_dataloader: DataLoader for training data
-            val_dataloader: Optional DataLoader for validation
-            num_epochs: Number of training epochs
-            learning_rate: Learning rate for optimizer
-            save_dir: Directory to save checkpoints and logs
-        
-        Returns:
-            Training history
-        """
         os.makedirs(save_dir, exist_ok=True)
-        
-        # Initialize optimizer
-        optimizer = optim.AdamW(self.diffusion_model.parameters(), lr=learning_rate)
-        
-        # Training history
-        history = {
-            "train_loss": [],
-            "val_loss": [] if val_dataloader else None
-        }
-        
+        optimizer = torch.optim.AdamW(self.diffusion_model.parameters(), lr=learning_rate)
+        history = {"train_loss": [], "val_loss": [] if val_dataloader else None}
         best_val_loss = float("inf")
-        
-        # Training loop
-        for epoch in range(num_epochs):
-            # Dynamic loss weights
-            damage_weight = 0.5 if epoch >= 200 else 2.0
-            focal_gamma = 1.5 if epoch >= 250 else 1.0
-            contrast_weight = min(0.3, epoch / 100 * 0.3)
 
-            # Training
+        for epoch in range(num_epochs):
             self.diffusion_model.train()
             train_losses = []
-            
+
+            weights = dynamic_loss_weights(epoch, wandb.config)
+
+            damage_weight    = weights["damage_weight"]
+            focal_gamma      = weights["focal_gamma"]
+            contrast_weight  = weights["contrast_weight"]
+
+
             pbar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{num_epochs}")
             for batch in pbar:
-                # Get data for each modality
                 modality_data = {
-                    name: batch[i] if i < len(batch) else None 
+                    name: batch[i] if i < len(batch) else None
                     for i, name in enumerate(self.modality_names)
                 }
-
-                # 🔍 Debug: Print shape before autoencoder is called
-                if epoch == 0 and len(train_losses) == 0:  # Only for first batch of first epoch
-                    print("🔍 Debug Info (first batch only):")
-                    for modality_name, data in modality_data.items():
-                        if data is not None:
-                            print(f"📦 Input modality '{modality_name}' shape: {data.shape}")
-                            ae = self.autoencoders[modality_name]
-                            print(f"🔧 Encoder conv weight shape: {ae.encoder.adjust_conv.weight.shape}")
-                            print(f"🔧 Expected in_channels: {ae.encoder.adjust_conv.in_channels}")
-                            try:
-                                with torch.no_grad():
-                                    _, z = ae(data.to(self.device))
-                                    print(f"✅ Forward pass succeeded, latent shape: {z.shape}")
-                            except Exception as e:
-                                print(f"❌ Forward pass FAILED for modality '{modality_name}': {e}")
-                                raise e
-
-                
-                # Encode each modality to get latent representations
                 latents, joint_latent = self.encode_modalities(modality_data)
-                
                 if joint_latent is None:
                     continue
 
-                # Compute σ from spec magnitude
+                # ========== adaptive σ from mag ==========
                 spec = modality_data["spec"].to(self.device)
-                # invert global normalization
-                spec_dn = spec * self.sig_spec + self.mu_spec
-                real, imag = spec_dn[:, 0::2], spec_dn[:, 1::2]
-                mag = torch.sqrt(real**2 + imag**2)
+                mag, _, _ = _split_mag_sincos_from_phase(spec)
+                sigma_t = energy_sigma(mag)
+                sigma_mean = sigma_t.mean(dim=1, keepdim=True)
+                z0 = torch.randn_like(joint_latent) * sigma_mean
 
-                sigma_t = energy_sigma(mag)                          # (B, T)
-                sigma_mean = sigma_t.mean(dim=1, keepdim=True)       # (B, 1)
+                # ========== flow matching ==========
+                B = joint_latent.size(0)
+                t = torch.randint(0, self.noise_scheduler.num_timesteps, (B,), device=self.device)
+                tau = t.view(-1, 1).float() / (self.noise_scheduler.num_timesteps - 1)
 
-                # Sample z0 from adaptive prior
-                z0 = torch.randn_like(joint_latent) * sigma_mean     # (B, D)
-
-
-                # ---------------- flow-matching targets -------------------------
-                batch_size = joint_latent.size(0)
-                t_int  = torch.randint(0, self.noise_scheduler.num_timesteps,
-                                    (batch_size,), device=self.device)
-                tau    = t_int.view(-1,1).float() / (self.noise_scheduler.num_timesteps-1)
-
-                x_t    = tau * joint_latent + (1. - tau) * z0
-                v_tgt  = joint_latent - z0
+                x_t = tau * joint_latent + (1 - tau) * z0
+                v_tgt = joint_latent - z0
                 v_pred = self.diffusion_model(x_t, tau)
 
-                # --- FLOW-MATCH loss ---
                 loss_fm = F.mse_loss(v_pred, v_tgt)
 
-
-                # ---------------- spectrogram auxiliaries ----------------------
-                # Decode
+                # ========== decode ==========
                 z_recon = v_pred + z0
                 outputs = self.decode_modalities(z_recon)
-
                 spec_pred = outputs["spec"]
                 spec_true = modality_data["spec"].to(self.device)
 
-                loss_complex   = complex_spectrogram_loss(spec_true, spec_pred)
-                loss_phase_g   = gradient_loss_phase_only(spec_true, spec_pred)
-                loss_phase_l   = laplacian_loss_phase_only(spec_true, spec_pred)
-                loss_mag_l1    = magnitude_l1_loss(spec_true, spec_pred)
+                # ========== spec losses ==========
+                loss_mag   = loss_mag_mse(spec_true, spec_pred)
+                loss_p_dot = loss_phase_dot(spec_true, spec_pred)
+                loss_p_if  = loss_phase_if(spec_true, spec_pred)
 
-                # robust .istft access
                 core = getattr(self, "module", self)
-                istft_layer = getattr(core, "istft", None)
-
-                if istft_layer is not None:
+                istft = getattr(core, "istft", None)
+                if istft is not None:
                     spec_pred_dn = spec_pred.clone()
-                    C = spec_pred_dn.shape[1] // 2
+                    C = spec_pred.shape[1] // 3
                     spec_pred_dn[:, :C] = spec_pred_dn[:, :C] * self.sig_spec + self.mu_spec
-                    # spec_pred_dn[:, C:] stays untouched (raw phase)
-                    wav_pred = istft_layer(spec_pred_dn, length=spec_true.size(2) * 4)
-                    wav_true = istft_layer(spec_true, length=spec_true.size(2) * 4)
-                    loss_wave_si = waveform_si_l1_loss(wav_true, wav_pred)
+
+                    wav_pred = istft(spec_pred_dn, length=spec_true.size(-1) * 4)
+                    spec_true_dn = spec_true.clone()
+                    spec_true_dn[:, :C] = spec_true_dn[:, :C] * self.sig_spec + self.mu_spec
+                    wav_true = istft(spec_true_dn, length=spec_true.size(-1) * 4)
+
+                    loss_wave = loss_wave_l1(wav_true, wav_pred)
+                    loss_consist = loss_spectro_time_consistency(
+                        wav_true, spec_pred, self.sig_spec, self.mu_spec, istft
+                    )
                 else:
-                    loss_wave_si = torch.tensor(0.0, device=spec_true.device)
+                    loss_wave = loss_consist = torch.tensor(0.0, device=self.device)
 
+                # ========== mask losses ==========
+                mask_pred = outputs["mask"]
+                mask_true = modality_data["mask"].to(self.device)
+                loss_mask = focal_tversky_loss(mask_true, mask_pred,
+                                            alpha=0.3, beta=0.8, gamma=focal_gamma)
+                loss_dmg  = damage_amount_loss(mask_true, mask_pred,
+                                            contrast_weight=contrast_weight, margin=0.005)
 
-                mask_pred  = outputs["mask"]
-                mask_true  = modality_data["mask"].to(self.device)
-                loss_mask_px = focal_tversky_loss(mask_true, mask_pred, alpha=0.3, beta=0.8, gamma=focal_gamma)
-                loss_damage  = damage_amount_loss(
-                        mask_true,
-                        mask_pred,
-                        contrast_weight=contrast_weight,
-                        margin=0.005
-                        )
-
-                # Combined loss
+                # ========== total loss ==========
                 loss = (
-                    1               * loss_fm + 
-                    0.5             * loss_complex +
-                    0               * loss_phase_g +
-                    0               * loss_phase_l +
-                    0               * loss_mag_l1 +
-                    0.5               * loss_wave_si +
-                    1               * loss_mask_px + 
-                    damage_weight   * loss_damage
+                    1.0 * loss_fm +
+                    0.5 * loss_mag +
+                    0.5 * loss_p_dot +
+                    0.25 * loss_p_if +
+                    0.5 * loss_consist +
+                    2.0 * loss_wave +
+                    1.0 * loss_mask +
+                    damage_weight * loss_dmg
                 )
 
-                # Update model
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
-                
-                # Track progress
+
                 train_losses.append(loss.item())
                 pbar.set_postfix({"loss": loss.item()})
-            
-            # Calculate average training loss
+
             avg_train_loss = sum(train_losses) / len(train_losses)
             history["train_loss"].append(avg_train_loss)
-            
-            # Validation
+
+            # ========== validation ==========
             if val_dataloader:
                 self.diffusion_model.eval()
                 val_losses = []
 
                 with torch.no_grad():
                     for batch in tqdm(val_dataloader, desc="Validation"):
-                        # Unpack modal inputs
                         modality_data = {
-                            name: batch[i] if i < len(batch) else None 
+                            name: batch[i] if i < len(batch) else None
                             for i, name in enumerate(self.modality_names)
                         }
-
                         latents, joint_latent = self.encode_modalities(modality_data)
                         if joint_latent is None:
                             continue
 
-                        batch_size = joint_latent.size(0)
-
-                        # --- Adaptive prior noise ---
+                        B = joint_latent.size(0)
                         spec = modality_data["spec"].to(self.device)
-                        real, imag = spec[:, 0::2], spec[:, 1::2]
-                        mag = torch.sqrt(real**2 + imag**2)
+                        mag, _, _ = _split_mag_sincos_from_phase(spec)
                         sigma_t = energy_sigma(mag)
                         sigma_mean = sigma_t.mean(dim=1, keepdim=True)
                         z0 = torch.randn_like(joint_latent) * sigma_mean
 
-                        # --- Flow-matching targets ---
-                        t_int = torch.randint(0, self.noise_scheduler.num_timesteps, (batch_size,), device=self.device)
-                        tau   = t_int.view(-1, 1).float() / (self.noise_scheduler.num_timesteps - 1)
-                        x_t   = tau * joint_latent + (1 - tau) * z0
+                        t = torch.randint(0, self.noise_scheduler.num_timesteps, (B,), device=self.device)
+                        tau = t.view(-1, 1).float() / (self.noise_scheduler.num_timesteps - 1)
+                        x_t = tau * joint_latent + (1 - tau) * z0
                         v_tgt = joint_latent - z0
                         v_pred = self.diffusion_model(x_t, tau)
 
-                        loss_fm = F.mse_loss(v_pred, v_tgt)
-
-                        # --- Decode and add auxiliary losses ---
                         z_recon = v_pred + z0
                         outputs = self.decode_modalities(z_recon)
 
                         spec_pred = outputs["spec"]
                         spec_true = modality_data["spec"].to(self.device)
 
-                        loss_spec   =  complex_spectrogram_loss(spec_true, spec_pred)
-                        loss_p_g    =  gradient_loss_phase_only(spec_true, spec_pred)
-                        loss_p_l    =  laplacian_loss_phase_only(spec_true, spec_pred)
-                        loss_mag    =  magnitude_l1_loss(spec_true, spec_pred)
+                        loss_fm = F.mse_loss(v_pred, v_tgt)
+                        loss_mag   = loss_mag_mse(spec_true, spec_pred)
+                        loss_p_dot = loss_phase_dot(spec_true, spec_pred)
+                        loss_p_if  = loss_phase_if(spec_true, spec_pred)
 
-                        # robust .istft access (wrapped or not)
-                        core = getattr(self, "module", self)
-                        istft_layer = getattr(core, "istft", None)
-
-                        if istft_layer is not None:
+                        if istft is not None:
                             spec_pred_dn = spec_pred.clone()
-                            C = spec_pred_dn.shape[1] // 2
+                            C = spec_pred.shape[1] // 3
                             spec_pred_dn[:, :C] = spec_pred_dn[:, :C] * self.sig_spec + self.mu_spec
-                            # spec_pred_dn[:, C:] stays untouched (raw phase)
-                            wav_pred = istft_layer(spec_pred_dn, length=spec_true.size(2) * 4)
-                            wav_true = istft_layer(spec_true, length=spec_true.size(2) * 4)
-                            loss_wave_si = waveform_si_l1_loss(wav_true, wav_pred)
+                            wav_pred = istft(spec_pred_dn, length=spec_true.size(-1) * 4)
+                            spec_true_dn = spec_true.clone()
+                            spec_true_dn[:, :C] = spec_true_dn[:, :C] * self.sig_spec + self.mu_spec
+                            wav_true = istft(spec_true_dn, length=spec_true.size(-1) * 4)
+                            loss_wave = loss_wave_l1(wav_true, wav_pred)
+                            loss_consist = loss_spectro_time_consistency(wav_true, spec_pred, self.sig_spec, self.mu_spec, istft)
                         else:
-                            loss_wave_si = torch.tensor(0.0, device=spec_true.device)
-
+                            loss_wave = loss_consist = torch.tensor(0.0, device=self.device)
 
                         mask_pred = outputs["mask"]
                         mask_true = modality_data["mask"].to(self.device)
+                        loss_mask = focal_tversky_loss(mask_true, mask_pred,
+                                                    alpha=0.3, beta=0.8, gamma=focal_gamma)
+                        loss_dmg = damage_amount_loss(mask_true, mask_pred,
+                                                    contrast_weight=contrast_weight, margin=0.005)
 
-                        loss_mask = focal_tversky_loss(mask_true, mask_pred, alpha=0.3, beta=0.8, gamma=focal_gamma)
-                        loss_damage = damage_amount_loss(
-                            mask_true,
-                            mask_pred,
-                            contrast_weight=contrast_weight,
-                            margin=0.005
+                        total = (
+                            1.0 * loss_fm +
+                            0.5 * loss_mag +
+                            0.5 * loss_p_dot +
+                            0.25 * loss_p_if +
+                            0.5 * loss_consist +
+                            2.0 * loss_wave +
+                            1.0 * loss_mask +
+                            damage_weight * loss_dmg
                         )
-
-                        Loss = (
-                            1               * loss_fm + 
-                            0.5             * loss_spec +
-                            0               * loss_p_g +
-                            0               * loss_p_l +
-                            0               * loss_mag +
-                            0.5               * loss_wave_si +
-                            1               * loss_mask + 
-                            damage_weight   * loss_damage
-                        )
-
-                        val_losses.append(Loss.item())
+                        val_losses.append(total.item())
 
                 avg_val_loss = sum(val_losses) / len(val_losses)
                 history["val_loss"].append(avg_val_loss)
@@ -1086,25 +1033,18 @@ class MultiModalLatentDiffusion:
                     best_val_loss = avg_val_loss
                     torch.save(self.diffusion_model.state_dict(), f"{save_dir}/best_diffusion_model.pt")
 
-            # Print epoch results
-            print(f"Epoch {epoch+1}/{num_epochs} - Train Loss: {avg_train_loss:.4f}", end="")
-            if val_dataloader:
-                print(f", Val Loss: {avg_val_loss:.4f}")
-            else:
-                print("")
-            
-            # Save checkpoint
-            if (epoch + 1) % 500 == 0:
-                torch.save({
+            print(f"Epoch {epoch+1}  Train: {avg_train_loss:.4f}"
+                + (f"  Val: {avg_val_loss:.4f}" if val_dataloader else ""))
+
+            # Optional W&B logging
+            if wandb.run is not None:
+                wandb.log({
+                    "train/loss": avg_train_loss,
+                    "val/loss": avg_val_loss if val_dataloader else None,
                     "epoch": epoch,
-                    "model_state_dict": self.diffusion_model.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "loss": avg_train_loss,
-                }, f"{save_dir}/diffusion_checkpoint_epoch{epoch+1}.pt")
-        
-        # Save final model
+                })
+
         torch.save(self.diffusion_model.state_dict(), f"{save_dir}/final_diffusion_model.pt")
-        
         return history
 
     def encode_modalities(self, modality_data):
