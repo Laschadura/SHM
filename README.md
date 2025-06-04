@@ -162,7 +162,7 @@ pip install -r requirements.txt
 ## 🧠 Author
 
 Developed by **Simon Scandella**
-MSc ETH Zürich – Structural Health Monitoring & Machine Learning
+MSc ETH Zürich
 
 ---
 
