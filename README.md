@@ -175,3 +175,4 @@ This repository is licensed under the [MIT License](https://opensource.org/licen
 ## 📌 Note
 
 This repository is under active development. Expect changes in model structure, training logic, and evaluation over time.
+Also thi README is a draft generated with ChatGPT. There are some mistakes.
