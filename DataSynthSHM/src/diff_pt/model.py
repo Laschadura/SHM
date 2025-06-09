@@ -781,6 +781,7 @@ class MultiModalLatentDiffusion:
         self, 
         spec_autoencoder,
         mask_autoencoder,
+        modality_dims,
         latent_dim=128,
         modality_names=["spec", "mask"],
         device="cuda" if torch.cuda.is_available() else "cpu",
@@ -801,6 +802,9 @@ class MultiModalLatentDiffusion:
         self.modality_names = modality_names
         self.num_modalities = len(modality_names)
 
+        self.modality_dims = modality_dims
+        self.total_latent_dim = sum(self.modality_dims)
+
         self.mu_spec  = mu_spec.to(device) if mu_spec is not None else None
         self.sig_spec = sig_spec.to(device) if sig_spec is not None else None
         
@@ -813,10 +817,6 @@ class MultiModalLatentDiffusion:
         # Set autoencoders to evaluation mode (we won't train them further)
         for ae in self.autoencoders.values():
             ae.eval()
-        
-        # Initialize modality dimensions
-        self.modality_dims = [latent_dim] * self.num_modalities
-        self.total_latent_dim = sum(self.modality_dims)
         
         # Initialize the diffusion model and noise scheduler
         self.diffusion_model = DiffusionModel(

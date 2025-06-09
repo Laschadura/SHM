@@ -3,7 +3,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
-from .utils import _split_mag_phase
 from bridge_data.postprocess import inverse_spectrogram
 
 from .utils import _split_mag_sincos_from_phase as _split_mag_sincos

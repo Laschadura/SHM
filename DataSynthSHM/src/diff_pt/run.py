@@ -2,8 +2,16 @@ import os
 import numpy as np
 import torch
 
+# --- strip the leading "--" that WandB inserts -----------------
+import sys
+sys.argv = [sys.argv[0]] + [
+    a[2:] if a.startswith("--") and "=" in a else a
+    for a in sys.argv[1:]
+]
+# ---------------------------------------------------------------
+
+
 import hydra
-from omegaconf import DictConfig, OmegaConf
 import wandb
 
 from diff_pt.model import SpectrogramAutoencoder, MaskAutoencoder, MultiModalLatentDiffusion, DifferentiableISTFT
@@ -19,29 +27,50 @@ from diff_pt.io import (
 
 from bridge_data.loader import load_data
 
-@hydra.main(version_base=None, config_path="../configs", config_name="diffusion")
-def main(cfg: DictConfig):
+from omegaconf import DictConfig, OmegaConf
+from configs import config_schema
+from configs.config_schema import MainConfig, LossWeights
 
-    wandb.init(
-        project="SHM-AE-sweep",
-        config=OmegaConf.to_container(cfg, resolve=True),
-        name=f"sweep_run_{os.environ.get('SLURM_JOB_ID', 'local')}",
-        mode="online",  # change to "disabled" if debugging on login node
-    )
 
-    loss_cfg = cfg.loss_weights
+@hydra.main(
+    config_path=os.path.join(os.path.dirname(__file__), "../../configs"),
+    config_name="diffusion"
+)
+def main(cfg: MainConfig):
+    from omegaconf import open_dict, ValidationError
+    try:
+        OmegaConf.to_object(cfg)  # forces validation
+    except ValidationError as e:
+        print(e)
+        raise
+
+    loss_cfg = cfg.debug_loss_weights if cfg.debug_mode else cfg.loss_weights
+
+    if cfg.debug_mode:
+        print("🔧  Overriding loss weights with debug_loss_weights")
+        wandb.init(mode="disabled")
+    else:
+        wandb.init(
+            project=os.environ.get("WANDB_PROJECT", "SHM-AE-sweep"),
+            entity=os.environ.get("WANDB_ENTITY", None),
+            config=OmegaConf.to_container(cfg, resolve=True),
+            name=f"sweep_run_{os.environ.get('SLURM_JOB_ID', 'local')}",
+            mode="online",
+        )
+
 
 
     # ─── Mode Control ───────────────────────────────────────────────
-    train_AE        = True                 # whether to train AE
-    ae_epochs      = 600                   # epochs for autoencoder training
-    patience_ae     = 250                     # patience for autoencoder training
-    recompute_data  = False                   # whether to recompute cache
-    dm_mode         = "scratch"              # "scratch" or "continue"
-    dm_epochs       = 1                  # extra epochs for diffusion
-    learning_rate_dm = 5e-4
-    learning_rate_ae = 2e-4
-    diff_ckpt       = "results_diff/diffusion/final_diffusion_model.pt"
+    train_AE         = cfg.diffusion.train_autoencoders
+    recompute_data   = cfg.diffusion.recompute_data
+    dm_mode          = cfg.diffusion.dm_mode
+    ae_epochs        = cfg.diffusion.ae_epochs
+    patience_ae      = cfg.diffusion.ae_patience
+    learning_rate_ae = cfg.diffusion.ae_learning_rate
+    dm_epochs        = cfg.diffusion.num_epochs
+    learning_rate_dm = cfg.diffusion.learning_rate
+
+    diff_ckpt        = cfg.diffusion.ckpt_path
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs("results_diff/autoencoders", exist_ok=True)
@@ -150,7 +179,6 @@ def main(cfg: DictConfig):
         spec_autoencoder,
         mask_autoencoder,
         modality_dims=[latent_dim*2, latent_dim],   # ❶
-        latent_dim_spec=latent_dim*2,               # ❷ keep for convenience
         device=device,
         mu_spec=mu_tensor,
         sig_spec=std_tensor
@@ -171,7 +199,11 @@ def main(cfg: DictConfig):
         save_plotly_loss_curve(spec_history, "results_diff/autoencoders/spec_loss.html", title="Spectrogram AE Loss")
         save_plotly_loss_curve(mask_history, "results_diff/autoencoders/mask_loss.html", title="Mask AE Loss")
 
-        load_autoencoders(mld.autoencoders, device)
+        wandb.log({
+            "curves/spec_loss": wandb.Html(open("results_diff/autoencoders/spec_loss.html")),
+            "curves/mask_loss": wandb.Html(open("results_diff/autoencoders/mask_loss.html")),
+        })
+
 
     else:
         print("🔄 Loading pretrained autoencoders...")
@@ -179,34 +211,34 @@ def main(cfg: DictConfig):
 
 
 
-    # ─── Diffusion training control ─────────────────────────────────
-    if dm_mode == "continue":
-        if os.path.exists(diff_ckpt):
-            print("🔄 Continuing diffusion training from checkpoint.")
-            load_diffusion_model(mld.diffusion_model, device, diff_ckpt)
-        else:
-            print("❌ No diffusion checkpoint found – aborting continue mode.")
-            return
-    elif dm_mode == "scratch":
-        print("🆕 Training diffusion model from scratch.")
-    else:
-        raise ValueError(f"Invalid dm_mode: {dm_mode}. Choose 'scratch' or 'continue'.")
+    # # ─── Diffusion training control ─────────────────────────────────
+    # if dm_mode == "continue":
+    #     if os.path.exists(diff_ckpt):
+    #         print("🔄 Continuing diffusion training from checkpoint.")
+    #         load_diffusion_model(mld.diffusion_model, device, diff_ckpt)
+    #     else:
+    #         print("❌ No diffusion checkpoint found – aborting continue mode.")
+    #         return
+    # elif dm_mode == "scratch":
+    #     print("🆕 Training diffusion model from scratch.")
+    # else:
+    #     raise ValueError(f"Invalid dm_mode: {dm_mode}. Choose 'scratch' or 'continue'.")
 
-    print(f"🚀 Training diffusion model for {dm_epochs} epoch(s).")
-    history = mld.train_diffusion_model(
-        train_dataloader = train_loader,
-        val_dataloader   = val_loader,
-        num_epochs       = dm_epochs,
-        learning_rate    = learning_rate_dm,
-        save_dir         = "results_diff/diffusion"
-    )
+    # print(f"🚀 Training diffusion model for {dm_epochs} epoch(s).")
+    # history = mld.train_diffusion_model(
+    #     train_dataloader = train_loader,
+    #     val_dataloader   = val_loader,
+    #     num_epochs       = dm_epochs,
+    #     learning_rate    = learning_rate_dm,
+    #     save_dir         = "results_diff/diffusion"
+    # )
 
-    save_diffusion_model(mld.diffusion_model, diff_ckpt)
+    # save_diffusion_model(mld.diffusion_model, diff_ckpt)
 
-    visualize_training_history(history, save_path="results_diff/diffusion/training_curve.png")
-    save_visualizations_and_metrics(mld, train_loader, val_loader, training_metrics=history, output_dir="results_diff")
+    # visualize_training_history(history, save_path="results_diff/diffusion/training_curve.png")
+    # save_visualizations_and_metrics(mld, train_loader, val_loader, training_metrics=history, output_dir="results_diff")
 
-    print("✅ All training, evaluation, and synthesis complete.")
+    # print("✅ All training, evaluation, and synthesis complete.")
 
 if __name__ == "__main__":
   main()

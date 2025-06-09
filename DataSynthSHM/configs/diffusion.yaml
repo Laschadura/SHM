@@ -1,58 +1,42 @@
+# diffusion.yaml
 defaults:
-  - default.yaml
+  - _self_
+  - default
+  - loss_weights@loss_weights: base     # Register main loss weights
+  # - loss_weights@debug_loss_weights: debug   # Optional debug override
+
+debug_mode: false
 
 model_name: "MultiModalLatentDiffusion"
 
+hydra:
+  run:
+    dir: ./outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  sweep:
+    dir: ./multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
+
+
 diffusion:
-  # ============ General flags ============
   train_autoencoders: true
-  recompute_data: false
-  dm_mode: "scratch"            # or "continue"
-
-  # ============ Checkpoints ============
-  ckpt_path: "${paths.output_dir}/diffusion/final_diffusion_model.pt"
-  ae_ckpt_dir: "${paths.output_dir}/autoencoders"
-
-  # ============ Latent / AE settings ============
+  recompute_data: true
+  dm_mode: "scratch"
+  ckpt_path: "${output_dir}/diffusion/final_diffusion_model.pt"
+  ae_ckpt_dir: "${output_dir}/autoencoders"
   latent_dim: 256
   batch_size: 200
-
-  ae_epochs: 500
+  ae_epochs: 200
   ae_patience: 50
   ae_learning_rate: 5e-4
-
-  # ============ Diffusion training ============
-  num_epochs: 500         # (dm_epochs)
-  learning_rate: 5e-4     # (dm_lr)
+  num_epochs: 500
+  learning_rate: 5e-4
   beta_start: 0.0001
   beta_end: 0.02
   num_timesteps: 1000
 
-# Optional AE output shapes (can be inferred but listed for clarity)
 ae:
   spec_channels: 24
   freq_bins: 129
   time_bins: 24
   mask_shape: [32, 96]
 
-
-loss_weights:
-  # ── Spec AE ──
-  mag_mse:            1.0
-  phase_dot:          1.0
-  phase_if:           0.5
-  phase_aw_abs:       0.0
-  time_consistency:   0.5
-  wave_l1:            2.0
-  mag_curric_min:     0.3
-  mag_curric_max:     1.5
-
-
-  # ── Mask AE ──
-  mask_px:            0.0
-  dice_w:             0.0
-  damage_initial:     2.0
-  damage_final:       0.3
-  focal_gamma_init:   1.0
-  focal_gamma_late:   1.5
 
