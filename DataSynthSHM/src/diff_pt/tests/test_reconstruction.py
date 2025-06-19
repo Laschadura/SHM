@@ -98,26 +98,14 @@ def main():
     specs_t  = torch.from_numpy(specs_cf).float().to(device)
 
     # normalise exactly as during training ---------------------------------
-    C = specs_t.shape[1] // 3
     specs_norm = specs_t.clone()
     specs_norm[:, :C] = (specs_norm[:, :C] - mu) / sigma
-
-
 
     # encode→decode --------------------------------------------------------
     with torch.no_grad():
         recon_norm, _ = specAE(specs_norm)         # still Z-space-normalized
         recon_cf = recon_norm.clone()
         recon_cf[:, :C] = recon_cf[:, :C] * sigma + mu # back to real log-mag / phase
-
-    # # Artificially boost decoded log-magnitude
-    # log_mag_shift = 2.5  # try 2.0–3.0
-    # recon_cf[:, 0::2] += log_mag_shift
-
-    # # Fake better phase
-    # recon_cf[:, 1::2] = specs_t[:, 1::2]  # overwrite recon phase with original
-
-
 
     print("🔍 recon_cf stats → mean:", recon_cf.mean().item(), "std:", recon_cf.std().item())
     recon_np = recon_cf.cpu().numpy().transpose(0, 2, 3, 1)
@@ -139,7 +127,6 @@ def main():
     
     eps = 1e-5                           # the same epsilon used in compute_complex_spectrogram()
     B, _, F, T = specs_t.shape           # (B, 2C, F, T)
-    C          = specs_t.shape[1] // 2
 
     # 1) ── difference in log-magnitude ────────────────────────────────
     mag_orig  = torch.exp(specs_t[:, 0::2]) - eps          # (B, C, F, T)
@@ -148,10 +135,15 @@ def main():
     print(f"🔬 |mag| MAE (orig vs recon): {mae_mag:.4f}")
 
     # ----- phase error ---------------------------------------------------
-    phase_orig  = (specs_t[:, 1::2] + torch.pi) % (2*torch.pi)  # 0..2π
-    phase_recon = (recon_cf[:, 1::2] + torch.pi) % (2*torch.pi)
-    cos_sim_phase = torch.mean(torch.cos(phase_orig - phase_recon)).item()
-    print(f"🔬 ⟨cos(Δφ)⟩ = {cos_sim_phase:.3f}   (1.0 = perfect match, 0 = uncorrelated)")
+    sinφ_t, cosφ_t = specs_t[:, C:2*C],  specs_t[:, 2*C:]
+    sinφ_r, cosφ_r = recon_cf[:, C:2*C], recon_cf[:, 2*C:]
+
+    phase_orig  = (torch.atan2(sinφ_t, cosφ_t) + torch.pi) % (2*torch.pi)
+    phase_recon = (torch.atan2(sinφ_r, cosφ_r) + torch.pi) % (2*torch.pi)
+
+    cos_sim_phase = torch.cos(phase_orig - phase_recon).mean().item()
+    print(f"🔬 ⟨cos(Δφ)⟩ = {cos_sim_phase:.3f}   (1.0 = perfect)")
+
 
     b, ch = 0, 0
     fig, ax = plt.subplots(1, 2, figsize=(10, 4))
@@ -197,20 +189,44 @@ def main():
     ax[1].set_title("Reconstructed |S|")
     plt.tight_layout(); plt.show()
 
-    # replace inverse_spectrogram call with a helper that merges sin/cos
-    mag_log = recon_cf[:, :C]          # (B, C, F, T)
+    # ------------------------------------------------------------------
+    #  Rebuild (N, F, T, 2 C) array expected by inverse_spectrogram
+    #      layout: [log|S|, φ, log|S|, φ, …]
+    # ------------------------------------------------------------------
+    # ---- sanity check -----------------------------------------------------------------------------
+    use_perfect = False          # ← flip to True for the test of inverse and overlay plots
+    if use_perfect:
+        recon_cf[:, :C]  = specs_t[:, :C]      # log|S|
+        recon_cf[:, C:2*C] = specs_t[:, C:2*C] # sin
+        recon_cf[:, 2*C:]  = specs_t[:, 2*C:]  # cos
+    # -----------------------------------------------------------------------------------------------
+
+    mag_log = recon_cf[:, :C].clone()           # (B, C, F, T)      already log|S|
+    mag_log = torch.clamp(mag_log, min=-10.0, max=10.0)   # ← add this line
     sinφ    = recon_cf[:, C:2*C]
     cosφ    = recon_cf[:, 2*C:]
 
-    phase   = torch.atan2(sinφ, cosφ)
-    complex = torch.exp(mag_log) * torch.exp(1j*phase)
+    phase   = torch.atan2(sinφ, cosφ)   # (B, C, F, T)      radians  –π..π
 
+    # interleave log|S| and phase along channel axis
+    spec_lp = torch.empty((mag_log.size(0), 2*C, *mag_log.shape[2:]),
+                        dtype=mag_log.dtype, device=mag_log.device)
+    spec_lp[:, 0::2] = mag_log          # even channels  → log|S|
+    spec_lp[:, 1::2] = phase            # odd  channels  → φ
+
+    # (B, 2C, F, T)  →  (B, F, T, 2C)  for inverse_spectrogram()
+    spec_lp = spec_lp.permute(0, 2, 3, 1).cpu().numpy().astype(np.float32)
+
+    # ---------------- ISTFT -------------------------------------------
     print("🔄 ISTFT reconstruction…")
     recon_ts = inverse_spectrogram(
-        complex.cpu().numpy().transpose(0,2,3,1),  # (B,F,T,C) complex
-        time_length=segments.shape[1],
-        fs=args.fs, nperseg=args.nperseg, noverlap=args.noverlap
-    )
+        spec_lp,
+        time_length = segments.shape[1],
+        fs          = args.fs,
+        nperseg     = args.nperseg,
+        noverlap    = args.noverlap,
+    )                                   # (B, T, C = 12)
+
 
     rms_recon = recon_ts.std(axis=1).mean()
     print(f"⚡  RMS of waveform after ISTFT: {rms_recon:.4f}")
@@ -218,12 +234,11 @@ def main():
     # 5.  Align recon ↔ original via x-corr, compute metrics, plot          #
     # --------------------------------------------------------------------- #
     print("🔧 Aligning reconstructions via x-corr…")
-    aligned   = np.empty_like(recon_ts)
-    lags      = []
-    for i in range(args.n_segments):
-        aligned_i, lag = align_by_xcorr(segments[i], recon_ts[i])
-        aligned[i] = aligned_i
-        lags.append(lag)
+    aligned, lags = [], []
+    for seg, rec in zip(segments, recon_ts):          # seg,rec are (T,C)
+        ali, lag = align_by_xcorr(seg, rec)
+        aligned.append(ali); lags.append(lag)
+    aligned = np.stack(aligned)
 
     print("📊 Metrics …")
     metrics = calculate_reconstruction_metrics(segments, aligned)
@@ -246,13 +261,16 @@ def main():
     print("📁 Saved detailed metrics ➜ reconstruction_results/ae_metrics.csv")
 
     print("📈 Overlay plots …")
+    # ------------------------------------------------------------------ 8 --
+    #  Show overlays (time-series)                                        #
+    # --------------------------------------------------------------------- #
     for i in range(args.n_segments):
         plot_overlay_all_channels(
-            original      = segments,
-            reconstructed = aligned,
+            original      = segments,      # (N,T,C)
+            reconstructed = aligned,       # (N,T,C)
             segment_idx   = i,
             fs            = args.fs,
-            title_extra="After AE"
+            title_extra   = f"segment {i} – After AE"
         )
 
     print("✅ Done – originals vs AE reconstructions plotted & scored.")
