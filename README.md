@@ -1,148 +1,146 @@
+> ⚠️ **Work in progress** – This repository is under active development. APIs, configs, and model logic may change without notice.
+
 # 🧠 Structural Damage Modeling with Spectral MMVAE & Latent Diffusion
 
-This repository contains two complementary deep learning pipelines for **structural damage detection and synthesis** using multimodal input:
+This repository contains modular deep learning pipelines for **structural damage detection and data synthesis** using multimodal input data like accelerometer spectrograms and spatial crack masks.
 
-1. **Spectral MMVAE** — A Multimodal Variational Autoencoder for reconstructing and analyzing real-world bridge damage.
-2. **Multi-Modal Latent Diffusion (MLD)** — A generative model for synthesizing realistic damage states in a shared latent space.
+It combines two complementary approaches:
+
+1. **Spectral MMVAE** – A Multimodal Variational Autoencoder for realistic data synthesis.
+2. **Multi-Modal Latent Diffusion (MLD)** – A generative diffusion-based model for realistic data synthesis.
+
+Both models aim to learn, in a multimodal way, to generate synthetic vibrational data and corresponding damage scenarios as pairs, using real-world measurements from a masonry arch bridge.
+
+> 📌 This project is an extension of my semester thesis at ETH Zürich.
+> 📚 The dataset and experimental foundation were provided by [Liu et al., 2024](https://doi.org/10.1016/j.engstruct.2024.118466), *“Full life-cycle vibration-based monitoring of a full-scale masonry arch bridge with increasing levels of damage”*, Engineering Structures 315.
 
 ---
 
-## 📆 Repository Structure
+## 📁 Repository Structure
 
+This repository is organized as follows:
+
+```text
+DataSynthSHM/
+├── configs/                # OmegaConf YAMLs for model configs
+├── scripts/                # SLURM cluster launch scripts
+├── src/
+│   ├── bridge_data/        # Shared preprocessing, transforms, IO
+│   ├── diff_pt/            # PyTorch latent diffusion model
+│   └── mmvae_tf/           # TensorFlow-based Spectral MMVAE
 ```
-Euler_MMVAE/
-├── scripts/
-│   ├── vae_generator.py         # Spectral MMVAE training
-│   ├── diffusion_model.py       # Latent diffusion training
-│   ├── test_diffusion.py        # Evaluation & synthesis for MLD
-│   ├── Gen_VAE_Test.py          # Evaluation for MMVAE
-│   ├── data_loader.py           # Shared: I/O, augmentation, ISTFT, caching
-│   ├── losses.py                # Shared: waveform, mask, and phase losses
-│   ├── custom_distributions.py  # MMVAE-specific: JS divergence and latent mixing
-│
-├── cache/                       # Preprocessed .npy: spec, masks, wave, etc.
-├── data/                        # Raw Test_* folders (spectrograms + labels)
-├── results_mmvae/               # Saved MMVAE models and logs
-├── results_diff/                # Diffusion models, reconstructions, plots
-├── logs/                        # Training curves, beta schedules, metrics
-└── README.md
+
+Additional folders that are generated locally or used during training (not tracked in Git):
+
+```text
+Data/                       # Raw accelerometer CSVs (not included)
+Labels/                     # Raw label masks (not included)
+cache/                      # Cached spectrograms, masks, etc.
+results_diff/               # Diffusion model outputs and logs
+results_mmvae/              # MMVAE model outputs and logs
+logs/                       # Training logs
 ```
 
----
-
-## 🔧 Key Features
-
-* ✅ Multimodal learning (spectrograms & spatial masks)
-* ✅ Jensen-Shannon divergence & latent regularization
-* ✅ Waveform reconstruction from spectrogram via ISTFT
-* ✅ Score-based latent diffusion with conditioned sampling
-* ✅ Modular training + eval scripts for both models
-* ✅ Data augmentation (SpecAug, pink noise, sign flip, time shift)
-* ✅ Multi-GPU compatible (TF MirroredStrategy / PyTorch DDP-ready)
+These folders are ignored via `.gitignore` to reduce repo size and preserve data privacy. To run the pipeline, users must place raw data in the expected structure and allow the pipeline to regenerate cached features.
 
 ---
 
-## 1⃣ Spectral MMVAE
+## 🧰 Features
 
-### 📚 Description
+* Multimodal learning from spectrograms and crack masks
+* Modular, extensible design for model components
+* Latent diffusion model with conditional sampling
+* Framework-hybrid: TensorFlow (MMVAE), PyTorch (Diffusion)
+* Compatible with multi-GPU training (MirroredStrategy/DDP)
+* Config-driven (OmegaConf-based YAMLs)
 
-A Variational Autoencoder that learns a **shared latent space** from time-frequency spectrograms and binary crack masks. It allows semi-supervised learning of damage progression, using JS divergence and reconstruction losses across modalities.
+---
 
-### 🔥 Training
+## 1⃣ Spectral MMVAE (TensorFlow)
+
+**Module tests (example):**
 
 ```bash
-python scripts/vae_generator.py
+python -m mmvae_tf.tests.test_MoE_MMVAE
 ```
-
-Includes:
-
-* Waveform L1 + SI-L1 loss
-* Multi-resolution STFT (MRSTFT) loss
-* Phase gradient + Laplacian
-* Binary mask loss (Dice + BCE)
-* Damage supervision via global mask mean
-
-### 📊 Evaluation
-
-```bash
-python scripts/Gen_VAE_Test.py
-```
-
-Visualizes:
-
-* Reconstruction comparison
-* Interpolation
-* Latent UMAPs
 
 ---
 
-## 2⃣ Latent Diffusion Model (MLD)
+## 2⃣ Latent Diffusion Model (PyTorch)
 
-### 📚 Description
-
-Autoencoders compress spectrogram and mask inputs into latent codes, then a **score-based diffusion model** learns to denoise and reconstruct samples. It supports conditional generation (e.g., generate mask from spec).
-
-### 🔥 Training
-
-Train autoencoders and the diffusion model:
+**Module tests (example):**
 
 ```bash
-python scripts/diffusion_model.py
+python -m diff_pt.tests.test_reconstruction --ckpt_dir results_diff --n_segments 1
 ```
-
-Set flags:
-
-```python
-train_AE = True
-dm_mode  = "scratch"  # or "continue"
-```
-
-### 📊 Evaluation
-
-```bash
-python scripts/test_diffusion.py --ckpt_dir results_diff --batch 32 --samples 8
-```
-
-Visualizes:
-
-* Time-series vs reconstruction overlays
-* Mask prediction and upsampling
-* PSD metrics and waveform plots
-* Latent space UMAP & FID
-* Sample interpolation
 
 ---
 
-## 📁 Data Preparation
+## 🗂 Data Format
 
-Expected directory:
+Raw input:
 
 ```
-data/
-├── Data/
-│   ├── Test_01/*.csv       # Accelerometer waveforms
-├── Labels/
-│   ├── Test_01/*.png       # Crack masks (RGB, 512x1536)
+Data/
+├── Data/Test_*/accel_*.csv        # Time-series accelerometer data of 12 sensors
+├── Labels/Test_*/label_*.png      # Images of the damage on the bridge
 ```
 
-Preprocessed data is cached as:
-
-* `cache/spectrograms.npy`
-* `cache/masks.npy`
-* `cache/segments.npy`
-* `cache/test_ids.npy`
+Cached and normalized data is stored in `cache/` based on config-defined segment duration and STFT parameters.
 
 ---
 
-## 🧪 Shared Losses
+## 🧪 Package Installation & Usage
 
-Implemented in `losses.py`:
+Install the project as an **editable package** from the repo root:
 
-* `waveform_l1_loss`, `waveform_si_l1_loss`
-* `multi_channel_mrstft_loss`
-* `gradient_loss_phase_only`, `laplacian_loss_phase_only`
-* `magnitude_l1_loss`
-* `custom_mask_loss` (Dice, BCE, optional Focal)
+```bash
+pip install -e .
+```
+
+This enables:
+
+* Running model code using `python -m mmvae_tf.run` or `diff_pt.run`
+* Cross-folder imports between `bridge_data`, `diff_pt`, and `mmvae_tf`
+* Reusable modules without reinstalling after edits
+
+> ⚠️ This is required both locally and on the ETH Euler cluster.
+
+---
+
+## 🚀 Running on ETH Euler Cluster
+
+### ✅ Upload Your Code
+
+Use `rsync` to upload your local folder to `/cluster/scratch/<username>/`:
+
+```bash
+rsync -av --progress ./DataSynthSHM/ <username>@euler.ethz.ch:/cluster/scratch/<username>/DataSynthSHM/
+```
+
+### ✅ Launch a Job with SLURM
+
+```bash
+cd /cluster/scratch/<username>/DataSynthSHM
+sbatch scripts/diff_run.slurm         # or run_vae.slurm for MMVAE
+```
+
+### ✅ Monitor Your Job
+
+```bash
+squeue -u $USER                       # show your running jobs
+scontrol show job <job_id>           # detailed info
+seff <job_id>                        # efficiency summary
+```
+
+### ✅ Debug Output
+
+```bash
+tail -f diff_run.out           # live stdout from job
+cat diff_run.err               # print error output
+```
+
+See the full cheatsheet in `Euler_Cluster_cheatsheet.txt` for more.
 
 ---
 
@@ -151,10 +149,9 @@ Implemented in `losses.py`:
 * Python ≥ 3.10
 * TensorFlow ≥ 2.15
 * PyTorch ≥ 2.0
-* NumPy, SciPy, Matplotlib, OpenCV, Plotly
-* UMAP, tqdm, scikit-learn
+* NumPy, SciPy, OpenCV, Plotly, UMAP, Matplotlib, tqdm
 
-Use your own `requirements.txt` to install all packages:
+Install with:
 
 ```bash
 pip install -r requirements.txt
@@ -162,16 +159,20 @@ pip install -r requirements.txt
 
 ---
 
-## 📊 Logging
+## 🧠 Author
 
-* Training logs: `logs/beta_tracking.csv`, training curves
-* Models: `.keras` (TF) and `.pt` (Torch) saved in respective results folders
+Developed by **Simon Scandella**
+MSc ETH Zürich
 
 ---
 
-## 🧠 Authors & Contact
+## 📄 License
 
-Developed by **Simon Scandella**
+This repository is licensed under the [MIT License](https://opensource.org/licenses/MIT). You are free to use, modify, and distribute the code with attribution.
 
+---
 
-This READ ME is a Draft
+## 📌 Note
+
+This repository is under active development. Expect changes in model structure, training logic, and evaluation over time.
+Also thi README is a draft generated with ChatGPT. There are some mistakes.
