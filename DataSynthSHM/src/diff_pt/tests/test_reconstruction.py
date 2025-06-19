@@ -61,7 +61,7 @@ def main():
     mld = dm.MultiModalLatentDiffusion.from_checkpoint(
         ae_dir        = ckpt / "autoencoders",
         diff_ckpt_path= ckpt / "diffusion" / "final_diffusion_model.pt",
-        spec_norm_path= "cache/spec_norm.npz",
+        spec_norm_path= "cache/spec_norm_magonly.npz",
         latent_dim    = 384,
         device        = device,
     )
@@ -70,7 +70,8 @@ def main():
     sigma  = mld.sig_spec.to(device)
 
     print("🔍 Checking encoder weights:")
-    print("  ‣ adjust_conv.weight norm =", specAE.encoder.adjust_conv.weight.norm().item())
+    print("‣ enc_mag.dw_freq ‖w‖ =",
+      specAE.enc_mag.dw_freq.weight.norm().item())
     print("μ mean:", mu.mean().item(), "σ mean:", sigma.mean().item())
 
     # --------------------------------------------------------------------- #
@@ -85,12 +86,22 @@ def main():
     )                                              # (N, F, T, 2C)
 
     specs_cf = specs_np.transpose(0, 3, 1, 2)      # (N, 2C, F, T)
+    # ----- split & stack like training ---------------------------------
+    C        = specs_cf.shape[1] // 2
+    mag_log  = specs_cf[:, 0::2]                    # log|S|
+    phase    = specs_cf[:, 1::2]                    # φ
+    specs_cf = np.concatenate(
+        [mag_log,
+         np.sin(phase),
+         np.cos(phase)], axis=1                     # (N,3C,F,T)
+    ).astype(np.float32)
     specs_t  = torch.from_numpy(specs_cf).float().to(device)
 
     # normalise exactly as during training ---------------------------------
+    C = specs_t.shape[1] // 3
     specs_norm = specs_t.clone()
-    C = specs_t.shape[1] // 2
-    specs_norm[:, :C] = (specs_t[:, :C] - mu) / sigma
+    specs_norm[:, :C] = (specs_norm[:, :C] - mu) / sigma
+
 
 
     # encode→decode --------------------------------------------------------
@@ -113,6 +124,8 @@ def main():
 
     print("recon_cf shape:", recon_cf.shape)  # should be (N, 2C, F, T)
     print("segments shape:", segments.shape)  # should be (N, T, C)
+
+    print("🔍 enc_mag.dw_freq norm:", specAE.enc_mag.dw_freq.weight.norm().item())
 
     print("Log-mag mean:", recon_cf[:, 0::2].mean().item())
     print("Log-mag std:",  recon_cf[:, 0::2].std().item())
@@ -184,14 +197,20 @@ def main():
     ax[1].set_title("Reconstructed |S|")
     plt.tight_layout(); plt.show()
 
+    # replace inverse_spectrogram call with a helper that merges sin/cos
+    mag_log = recon_cf[:, :C]          # (B, C, F, T)
+    sinφ    = recon_cf[:, C:2*C]
+    cosφ    = recon_cf[:, 2*C:]
+
+    phase   = torch.atan2(sinφ, cosφ)
+    complex = torch.exp(mag_log) * torch.exp(1j*phase)
+
     print("🔄 ISTFT reconstruction…")
     recon_ts = inverse_spectrogram(
-        recon_np,
-        time_length = segments.shape[1],
-        fs          = args.fs,
-        nperseg     = args.nperseg,
-        noverlap    = args.noverlap,
-    )                                              # (N, T, C)
+        complex.cpu().numpy().transpose(0,2,3,1),  # (B,F,T,C) complex
+        time_length=segments.shape[1],
+        fs=args.fs, nperseg=args.nperseg, noverlap=args.noverlap
+    )
 
     rms_recon = recon_ts.std(axis=1).mean()
     print(f"⚡  RMS of waveform after ISTFT: {rms_recon:.4f}")

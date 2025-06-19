@@ -1,0 +1,25 @@
+# ────────────────────────────────────────────────
+# Diffusion-model loss weights & curricula
+# ────────────────────────────────────────────────
+# ❶ static multipliers
+flowmatch:          1.0   #   L_fm
+mag_mse:            0.50  #   L_mag
+phase_dot:          0.50  #   L_p·
+phase_if:           0.25  #   L_p_if
+time_consistency:   0.50  #   L_consist
+wave_l1:            2.00  #   L_wave
+mask_px:            1.00  #   scales focal-Tversky inside losses.py
+# (dice_w & mask_px are read inside focal_tversky_loss)
+dice_w:             0.50
+
+# ❷ damage / focal gamma curriculum
+damage_switch_epoch:     250   # epoch at which weight jumps
+damage_weight_early:     2.0
+damage_weight_late:      0.3
+
+focal_gamma_switch_epoch: 250
+focal_gamma_early:        1.0
+focal_gamma_late:         1.5
+
+# ❸ contrast curriculum for damage_amount_loss
+contrast_weight_max:      0.5

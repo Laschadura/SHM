@@ -22,7 +22,7 @@ from diff_pt.losses import (
     focal_tversky_loss,
 )
 
-from diff_pt.utils import _quick_mask_stats, scheduler
+from diff_pt.utils import _quick_mask_stats, scheduler, split_mag_phase
 
 from omegaconf import DictConfig
 
@@ -53,6 +53,7 @@ def train_autoencoders(
     ):
     """Joint training of spectrogram & mask auto‑encoders with adaptive losses."""
 
+    w = loss_cfg      # short alias for loss weights
     # --- setup ---------------------------------------------------------------
     spec_autoencoder.to(device)
     mask_autoencoder.to(device)
@@ -79,12 +80,26 @@ def train_autoencoders(
         mask_autoencoder.train()
 
         # --- dynamic mask‑loss schedule ------------------------------------
-        damage_w    = loss_cfg.damage_final      if epoch >= 200 else loss_cfg.damage_initial
-        focal_gamma = loss_cfg.focal_gamma_late  if epoch >= 250 else loss_cfg.focal_gamma_init
+        damage_w    = w.damage_final      if epoch >= 200 else w.damage_initial
+        focal_gamma = w.focal_gamma_late  if epoch >= 250 else w.focal_gamma_init
         contrast_w  = min(0.3, epoch / 100 * 0.3)
         w_bce, w_dice, w_focal = (0.4, 0.5, 0.1) if epoch < 200 else (0.1, 0.8, 0.1)
 
-        sum_spec, sum_mask, n_batches = 0.0, 0.0, 0
+        # running sums for logging
+        n_batches = 0
+        loss_acc = {
+            "mag_mse": 0.0,
+            "phase_dot": 0.0,
+            "phase_if": 0.0,
+            "phase_aw": 0.0,
+            "time_cons": 0.0,
+            "wave_l1": 0.0,
+            "spec_total": 0.0,
+            "mask_total": 0.0,
+            "mask_px":     0.0,
+            "mask_damage": 0.0,
+            "mask_dice":   0.0,
+        }
 
         # -----------------------------------------------------------------
         #  MINI‑BATCH TRAIN LOOP
@@ -98,35 +113,39 @@ def train_autoencoders(
             # ===== S P E C  branch ======================================
             opt_spec.zero_grad()
             recon_spec, _ = spec_autoencoder(spec_b)
-            w_curr = phase_curriculum(epoch, loss_cfg)
+            w_curr = phase_curriculum(epoch, w)
 
-            loss_mag   = loss_mag_mse(spec_b, recon_spec)
-            loss_p_dot = loss_phase_dot(spec_b, recon_spec) * w_curr if loss_cfg.phase_dot > 0 else torch.tensor(0.0, device=device)
-            loss_p_if  = loss_phase_if (spec_b, recon_spec) * w_curr if loss_cfg.phase_if  > 0 else torch.tensor(0.0, device=device)
-            loss_p_aw  = loss_phase_abs_aw(spec_b, recon_spec)        if loss_cfg.phase_aw_abs > 0 else torch.tensor(0.0, device=device)
+            # --------  split --------
+            mag_t, phi_t = split_mag_phase(spec_b)          # targets
+            mag_p, phi_p = split_mag_phase(recon_spec)      # predictions
+
+            loss_mag   = loss_mag_mse(mag_p, mag_t)
+            loss_p_dot = loss_phase_dot(phi_t, phi_p) * w_curr 
+            loss_p_if  = loss_phase_if (phi_t, phi_p) * w_curr 
+            loss_p_aw  = loss_phase_abs_aw(phi_t, phi_p)
 
             istft_layer = getattr(spec_autoencoder, "istft", None)
             if istft_layer is not None:
                 loss_time = (
                     loss_spectro_time_consistency(seg_b, recon_spec, SIG_SPEC, MU_SPEC, istft_layer)
-                    if loss_cfg.time_consistency > 0 else torch.tensor(0.0, device=device)
+                    if w.time_consistency > 0 else torch.tensor(0.0, device=device)
                 )
                 # wave‑domain L1 (scale‑invariant)
                 recon_dn = recon_spec.clone()
                 C = recon_dn.shape[1] // 3
                 recon_dn[:, :C] = recon_dn[:, :C] * SIG_SPEC + MU_SPEC
                 wav_rec = istft_layer(recon_dn, length=seg_b.size(1))
-                loss_wave = loss_wave_l1(seg_b, wav_rec) if loss_cfg.wave_l1 > 0 else torch.tensor(0.0, device=device)
+                loss_wave = loss_wave_l1(seg_b, wav_rec) if w.wave_l1 > 0 else torch.tensor(0.0, device=device)
             else:
                 loss_time = loss_wave = torch.tensor(0.0, device=device)
 
             spec_total = (
-                loss_cfg.mag_mse      * loss_mag   +
-                loss_cfg.phase_dot    * loss_p_dot +
-                loss_cfg.phase_if     * loss_p_if  +
-                loss_cfg.phase_aw_abs * loss_p_aw  +
-                loss_cfg.time_consistency * loss_time +
-                loss_cfg.wave_l1      * loss_wave
+                w.mag_mse      * loss_mag   +
+                w.phase_dot    * loss_p_dot +
+                w.phase_if     * loss_p_if  +
+                w.phase_aw_abs * loss_p_aw  +
+                w.time_consistency * loss_time +
+                w.wave_l1      * loss_wave
             )
             spec_total.backward()
             opt_spec.step()
@@ -142,17 +161,30 @@ def train_autoencoders(
             loss_damage  = damage_amount_loss(mask_b, recon_mask, contrast_weight=contrast_w, margin=0.005)
             loss_dice    = custom_mask_loss(mask_b, recon_mask, weight_bce=w_bce, weight_dice=w_dice, weight_focal=w_focal)
 
-            mask_total = loss_cfg.mask_px * loss_mask_px + damage_w * loss_damage + loss_cfg.dice_w * loss_dice
+            mask_total = w.mask_px * loss_mask_px + damage_w * loss_damage + w.dice_w * loss_dice
             mask_total.backward()
             opt_mask.step()
 
-            # accumulate
-            sum_spec += spec_total.item()
-            sum_mask += mask_total.item()
+            # accumulate losses
+            loss_acc["mag_mse"]     += loss_mag.item()
+            loss_acc["phase_dot"]   += loss_p_dot.item()
+            loss_acc["phase_if"]    += loss_p_if.item()
+            loss_acc["phase_aw"]    += loss_p_aw.item()
+            loss_acc["time_cons"]   += loss_time.item()
+            loss_acc["wave_l1"]     += loss_wave.item()
+            loss_acc["spec_total"]  += spec_total.item()
+            loss_acc["mask_total"]  += mask_total.item()
+            loss_acc["mask_px"]     += loss_mask_px.item()
+            loss_acc["mask_damage"] += loss_damage.item()
+            loss_acc["mask_dice"]   += loss_dice.item()
+
 
         # === epoch summary (train) =========================================
-        train_spec_loss = sum_spec / n_batches
-        train_mask_loss = sum_mask / n_batches
+        # average losses
+        for k in loss_acc:
+            loss_acc[k] /= n_batches
+        train_spec_loss = loss_acc["spec_total"]
+        train_mask_loss = loss_acc["mask_total"]
 
         # -----------------------------------------------------------------
         #  VALIDATION LOOP
@@ -169,33 +201,45 @@ def train_autoencoders(
 
                 recon_v, _ = spec_autoencoder(spec_v)
 
-                loss_mag   = loss_mag_mse(spec_v, recon_v)
-                loss_p_dot = loss_phase_dot(spec_v, recon_v) * w_curr if loss_cfg.phase_dot > 0 else torch.tensor(0.0, device=device)
-                loss_p_if  = loss_phase_if (spec_v, recon_v) * w_curr if loss_cfg.phase_if  > 0 else torch.tensor(0.0, device=device)
-                loss_p_aw  = loss_phase_abs_aw(spec_v, recon_v)        if loss_cfg.phase_aw_abs > 0 else torch.tensor(0.0, device=device)
+                # --------  split --------
+                mag_t, phi_t = split_mag_phase(spec_v)          # targets
+                mag_p, phi_p = split_mag_phase(recon_v)      # predictions
+
+                loss_mag   = loss_mag_mse(mag_p, mag_t)
+                loss_p_dot = loss_phase_dot(phi_t, phi_p) * w_curr
+                loss_p_if  = loss_phase_if (phi_t, phi_p) * w_curr
+                loss_p_aw  = loss_phase_abs_aw(phi_t, phi_p)
 
                 if istft_layer is not None:
                     loss_time = (
                         loss_spectro_time_consistency(seg_v, recon_v, SIG_SPEC, MU_SPEC, istft_layer)
-                        if loss_cfg.time_consistency > 0 else torch.tensor(0.0, device=device)
+                        if w.time_consistency > 0 else torch.tensor(0.0, device=device)
                     )
                     recon_dn = recon_v.clone()
                     C = recon_dn.shape[1] // 3
                     recon_dn[:, :C] = recon_dn[:, :C] * SIG_SPEC + MU_SPEC
                     wav_rec = istft_layer(recon_dn, length=seg_v.size(1))
-                    loss_wave = loss_wave_l1(seg_v, wav_rec) if loss_cfg.wave_l1 > 0 else torch.tensor(0.0, device=device)
+                    loss_wave = loss_wave_l1(seg_v, wav_rec) if w.wave_l1 > 0 else torch.tensor(0.0, device=device)
                 else:
                     loss_time = loss_wave = torch.tensor(0.0, device=device)
 
                 val_spec_total = (
-                    loss_cfg.mag_mse      * loss_mag   +
-                    loss_cfg.phase_dot    * loss_p_dot +
-                    loss_cfg.phase_if     * loss_p_if  +
-                    loss_cfg.phase_aw_abs * loss_p_aw  +
-                    loss_cfg.time_consistency * loss_time +
-                    loss_cfg.wave_l1      * loss_wave
+                    w.mag_mse      * loss_mag   +
+                    w.phase_dot    * loss_p_dot +
+                    w.phase_if     * loss_p_if  +
+                    w.phase_aw_abs * loss_p_aw  +
+                    w.time_consistency * loss_time +
+                    w.wave_l1      * loss_wave
                 )
-                val_spec_losses.append(val_spec_total.item())
+                val_spec_losses.append({
+                    "spec_total": val_spec_total.item(),
+                    "mag_mse":   loss_mag.item(),
+                    "phase_dot": loss_p_dot.item(),
+                    "phase_if":  loss_p_if.item(),
+                    "phase_aw":  loss_p_aw.item(),
+                    "time_cons": loss_time.item(),
+                    "wave_l1":   loss_wave.item(),
+                })
 
                 # ---- mask ----
                 recon_mask_v, _ = mask_autoencoder(mask_v)
@@ -203,17 +247,41 @@ def train_autoencoders(
                 loss_damage  = damage_amount_loss(mask_v, recon_mask_v, contrast_weight=contrast_w, margin=0.005)
                 loss_dice    = custom_mask_loss(mask_v, recon_mask_v, weight_bce=w_bce, weight_dice=w_dice, weight_focal=w_focal)
 
-                val_mask_total = loss_cfg.mask_px * loss_mask_px + damage_w * loss_damage + loss_cfg.dice_w * loss_dice
-                val_mask_losses.append(val_mask_total.item())
+                val_mask_total = w.mask_px * loss_mask_px + damage_w * loss_damage + w.dice_w * loss_dice
+                val_mask_losses.append({
+                    "mask_total":  val_mask_total.item(),
+                    "mask_px":     loss_mask_px.item(),
+                    "mask_damage": loss_damage.item(),
+                    "mask_dice":   loss_dice.item(),
+                })
 
-        val_spec_loss = float(np.mean(val_spec_losses))
-        val_mask_loss = float(np.mean(val_mask_losses))
+        # convert list-of-dicts → dict-of-means
+        val_means = {k: float(np.mean([d[k] for d in val_spec_losses])) for k in val_spec_losses[0]}
+        val_spec_loss = val_means["spec_total"]
+
+        if val_mask_losses:     # avoid KeyError if loader is empty
+            val_mask_means = {k: float(np.mean([d[k] for d in val_mask_losses]))
+                              for k in val_mask_losses[0]}
+        else:
+            val_mask_means = {k: 0.0 for k in ["mask_total", "mask_px", "mask_damage", "mask_dice"]}
+        val_mask_loss  = val_mask_means["mask_total"]
+
 
         # record history
         hist["spec_train"].append(train_spec_loss)
         hist["spec_val"].append(val_spec_loss)
         hist["mask_train"].append(train_mask_loss)
         hist["mask_val"].append(val_mask_loss)
+
+        if epoch % 1 == 0:          # every epoch
+            print(
+                f"[AE] Epoch {epoch+1:03d} | "
+                f"train_spec: {train_spec_loss:.4f} | "
+                f"train_mask: {train_mask_loss:.4f} | "
+                f"val_spec: {val_spec_loss:.4f} | "
+                f"val_mask: {val_mask_loss:.4f}",
+                flush=True,
+            )
 
         LOG_EVERY = 100  # log every N epochs
 
@@ -225,11 +293,33 @@ def train_autoencoders(
                     "train/mask": train_mask_loss,
                     "val/spec":   val_spec_loss,
                     "val/mask":   val_mask_loss,
+                    # atomic train losses
+                    "train/mag_mse":   loss_acc["mag_mse"],
+                    "train/phase_dot": loss_acc["phase_dot"],
+                    "train/phase_if":  loss_acc["phase_if"],
+                    "train/phase_aw":  loss_acc["phase_aw"],
+                    "train/time_cons": loss_acc["time_cons"],
+                    "train/wave_l1":   loss_acc["wave_l1"],
+                    # atomic val losses
+                    "val/mag_mse":     val_means["mag_mse"],
+                    "val/phase_dot":   val_means["phase_dot"],
+                    "val/phase_if":    val_means["phase_if"],
+                    "val/phase_aw":    val_means["phase_aw"],
+                    "val/time_cons":   val_means["time_cons"],
+                    "val/wave_l1":     val_means["wave_l1"],
                     "epoch":      epoch,
                     "lr/spec":    opt_spec.param_groups[0]["lr"],
                     "lr/mask":    opt_mask.param_groups[0]["lr"],
                     "phase_weight/curriculum": w_curr,
                     "damage_w":   damage_w,
+                    # --- mask atomics ------------------
+                    "train/mask_px":     loss_acc["mask_px"],
+                    "train/mask_damage": loss_acc["mask_damage"],
+                    "train/mask_dice":   loss_acc["mask_dice"],
+
+                    "val/mask_px":       val_mask_means["mask_px"],
+                    "val/mask_damage":   val_mask_means["mask_damage"],
+                    "val/mask_dice":     val_mask_means["mask_dice"],
                 },
                 step=epoch,
             )
@@ -261,6 +351,5 @@ def train_autoencoders(
 
     wandb.run.summary["val/spec"] = val_spec_loss
     wandb.run.summary["val/mask"] = val_mask_loss
-    wandb.finish()
 
     return spec_hist, mask_hist

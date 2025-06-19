@@ -112,81 +112,75 @@ class DifferentiableISTFT(nn.Module):
         return wav
 
 # ----- Encoders -----
-class SpectrogramEncoder(nn.Module):
-    """
-    Adaptive encoder for spectrogram features that works with any input dimensions.
-    """
-    def __init__(self, latent_dim, channels):
+class MagEncoder(nn.Module):
+    """Log-|S|  →  latent"""
+    def __init__(self, latent_dim: int, channels: int):
         super().__init__()
-        
-        
-        self.adjust_conv = nn.Conv2d(
+
+        # depth-wise (frequency) pre-filter
+        self.dw_freq = nn.Conv2d(
             in_channels=channels,
-            out_channels=32,
-            kernel_size=1,
-            padding='same'
+            out_channels=channels,
+            kernel_size=(7, 1),          # 7 freq bins, 1 time bin
+            padding=(3, 0),
+            groups=channels              # depth-wise
         )
-        self.adjust_relu = nn.ReLU()
-        
-        # Convolutional layers
-        self.conv1 = nn.Conv2d(
-            in_channels=32,
-            out_channels=32,
-            kernel_size=3,
-            stride=2,
-            padding=1
-        )
-        self.gn1 = nn.GroupNorm(8, 32)
-        self.relu1 = nn.LeakyReLU(0.1)
-        self.dropout1 = nn.Dropout(0.3)
-        
-        self.conv2 = nn.Conv2d(
-            in_channels=32,
-            out_channels=64,
-            kernel_size=3,
-            stride=2,
-            padding=1
-        )
-        self.gn2 = nn.GroupNorm(16, 64)
-        self.relu2 = nn.LeakyReLU(0.1)
-        self.dropout2 = nn.Dropout(0.3)
-        
-        self.conv3 = nn.Conv2d(
-            in_channels=64,
-            out_channels=128,
-            kernel_size=3,
-            stride=1,
-            padding=1
-        )
-        self.gn3 = nn.GroupNorm(32, 128)
-        self.relu3 = nn.LeakyReLU(0.1)
-        self.dropout3 = nn.Dropout(0.3)
-        
-        # Global pooling and dense layers
+
+        # point-wise expansion to 32 ch
+        self.pw = nn.Conv2d(channels, 32, kernel_size=1)
+
+        def _block(cin, cout, stride):
+            return nn.Sequential(
+                nn.Conv2d(cin, cout, 3, stride=stride, padding=1),
+                nn.InstanceNorm2d(cout, affine=True), # instance norm should prevent mag underestimation somewhat because we normalize per sample and not across batch
+                nn.LeakyReLU(0.1),
+                nn.Dropout(0.3)
+            )
+        self.conv12 = _block(32, 32, 2)
+        self.conv23 = _block(32, 64, 2)
+        self.conv3  = _block(64, 128, 1)
+
         self.global_pool = nn.AdaptiveAvgPool2d((2, 2))
-        self.dense_reduce = nn.Linear(128 * 2 * 2, 512)
-        self.relu4 = nn.LeakyReLU(0.1)
+        self.fc1 = nn.Linear(128 * 2 * 2, 512)
+        self.act = nn.LeakyReLU(0.1)
+        self.latent = nn.Linear(512, latent_dim)
 
-        # Latent layer (for standard autoencoder)
-        self.latent_layer = nn.Linear(512, latent_dim)
-    
     def forward(self, x):
-        x = self.adjust_relu(self.adjust_conv(x))
+        x = self.dw_freq(x)
+        x = self.pw(x)
+        x = self.conv12(x)
+        x = self.conv23(x)
+        x = self.conv3(x)
+        x = self.global_pool(x).flatten(1)
+        return self.latent(self.act(self.fc1(x)))
 
-        x1 = self.relu1(self.gn1(self.conv1(x)))
-        x1 = self.dropout1(x1)
+class PhaseEncoder(nn.Module):
+    """sin | cos stack  →  latent (circular padding + GN)"""
+    def __init__(self, latent_dim: int, channels: int):
+        super().__init__()
 
-        x2 = self.relu2(self.gn2(self.conv2(x1)))
-        x2 = self.dropout2(x2)
+        def _block(cin, cout, stride):
+            return nn.Sequential(
+                nn.Conv2d(cin, cout, 3, stride=stride, padding=1,
+                          padding_mode="circular"),
+                nn.GroupNorm(1, cout, affine=False),   # keeps unit circle
+                nn.GELU(),
+                nn.Dropout(0.3)
+            )
+        self.conv1 = _block(channels,   32, 2)
+        self.conv2 = _block(32,         64, 2)
+        self.conv3 = _block(64,        128, 1)
 
-        x3 = self.relu3(self.gn3(self.conv3(x2)))
-        x3 = self.dropout3(x3)
+        self.global_pool = nn.AdaptiveAvgPool2d((2, 2))
+        self.fc1 = nn.Linear(128 * 2 * 2, 512)
+        self.latent = nn.Linear(512, latent_dim)
 
-        x_pool = self.global_pool(x3)        # (B,128,2,2)
-        x_flat = x_pool.view(x_pool.size(0), -1)
-        x_fc   = self.relu4(self.dense_reduce(x_flat))
-        latent = self.latent_layer(x_fc)
-        return latent
+    def forward(self, x):
+        x = self.conv1(x)
+        x = self.conv2(x)
+        x = self.conv3(x)
+        x = self.global_pool(x).flatten(1)
+        return self.latent(F.gelu(self.fc1(x)))
 
 class MaskEncoder(nn.Module):
     """
@@ -389,14 +383,11 @@ class SpectrogramAutoencoder(nn.Module):
               └─ dec_phase→  Ŝ_phase(sin|cos)
     recon = cat([Ŝ_mag, Ŝ_phase])   # (B, 3C, F, T)
     """
-    def __init__(self, latent_dim, channels, freq_bins, time_bins, share_weights=False):
+    def __init__(self, latent_dim, channels, freq_bins, time_bins):
         super().__init__()
 
-        self.enc_mag   = SpectrogramEncoder(latent_dim, channels)        #  C
-        self.enc_phase = SpectrogramEncoder(latent_dim, channels * 2)    # 2C
-
-        if share_weights:
-            self.enc_phase.load_state_dict(self.enc_mag.state_dict())
+        self.enc_mag   = MagEncoder  (latent_dim, channels)
+        self.enc_phase = PhaseEncoder(latent_dim, channels * 2)
 
         self.dec_mag   = SpectrogramDecoder(latent_dim, freq_bins, time_bins, channels)
         self.dec_phase = SpectrogramDecoder(latent_dim, freq_bins, time_bins, channels * 2)
@@ -406,6 +397,16 @@ class SpectrogramAutoencoder(nn.Module):
         z_m = self.enc_mag(spec[:, :C])
         z_p = self.enc_phase(spec[:, C:])
         return torch.cat([z_m, z_p], dim=1)
+    
+    def decoder(self, joint_latent):
+        """
+        joint_latent = [z_mag | z_phase]  (concatenated, dim = 2×latent_dim)
+        Returns the full 3-channel reconstruction expected by downstream code.
+        """
+        z_m, z_p = torch.chunk(joint_latent, 2, dim=1)
+        mag_hat  = self.dec_mag(z_m)
+        pha_hat  = self.dec_phase(z_p)
+        return torch.cat([mag_hat, pha_hat], dim=1)
 
     def forward(self, spec):
         C = spec.shape[1] // 3
@@ -844,207 +845,182 @@ class MultiModalLatentDiffusion:
         return self
 
     def train_diffusion_model(
-        self,
-        train_dataloader,
-        val_dataloader=None,
-        num_epochs=100,
-        learning_rate=1e-4,
-        save_dir="./results/diffusion"
+            self,
+            train_dataloader,
+            val_dataloader=None,
+            num_epochs: int = 100,
+            learning_rate: float = 1e-4,
+            save_dir: str = "./results/diffusion",
+            loss_cfg: dict | None = None,          # <- pass cfg.dm_loss
         ):
+        """
+        Train the diffusion model end-to-end.
+
+        Parameters
+        ----------
+        train_dataloader, val_dataloader : DataLoader
+        num_epochs : int
+        learning_rate : float
+        save_dir : str
+        loss_cfg : dict
+            Must contain every key defined in configs/loss_weights/base_dm.yaml
+        """
+
+        assert loss_cfg is not None, "`loss_cfg` (dm_loss) must be provided"
+
         os.makedirs(save_dir, exist_ok=True)
-        optimizer = torch.optim.AdamW(self.diffusion_model.parameters(), lr=learning_rate)
+        opt = torch.optim.AdamW(self.diffusion_model.parameters(), lr=learning_rate)
         history = {"train_loss": [], "val_loss": [] if val_dataloader else None}
-        best_val_loss = float("inf")
+        best_val = float("inf")
+
+        # ─── static multipliers (read once) ──────────────────────────────────────
+        w = loss_cfg
+        w_fm,   w_mag   = w["flowmatch"], w["mag_mse"]
+        w_pdot, w_pif   = w["phase_dot"], w["phase_if"]
+        w_cons, w_wave  = w["time_consistency"], w["wave_l1"]
+        w_mask          = w["mask_px"]
+
+        # ─── helper to compute all partial & total losses ───────────────────────
+        def compute_losses(modality, z_joint, sched):
+            """Returns: total_loss, dict(partial losses already weighted)"""
+            spec_gt = modality["spec"].to(self.device)
+
+            # adaptive σ  (energy in magnitude)
+            mag, _, _ = _split_mag_sincos_from_phase(spec_gt)
+            sigma = energy_sigma(mag).mean(1, keepdim=True)
+            z0 = torch.randn_like(z_joint) * sigma
+
+            B = z_joint.size(0)
+            t = torch.randint(0, self.noise_scheduler.num_timesteps,
+                            (B,), device=self.device)
+            τ = t.view(-1, 1).float() / (self.noise_scheduler.num_timesteps - 1)
+            xτ = τ * z_joint + (1 - τ) * z0
+
+            v_tgt  = z_joint - z0
+            v_pred = self.diffusion_model(xτ, τ)
+
+            loss_fm = F.mse_loss(v_pred, v_tgt)
+
+            # decode
+            out     = self.decode_modalities(v_pred + z0)
+            spec_pr = out["spec"]
+
+            loss_mag   = loss_mag_mse(spec_gt, spec_pr)
+            loss_pdot  = loss_phase_dot(spec_gt, spec_pr)
+            loss_pif   = loss_phase_if(spec_gt, spec_pr)
+
+            # time-domain
+            istft = getattr(self, "istft", None)
+            if istft is not None:
+                C = spec_pr.size(1) // 3
+                spec_pr_dn = spec_pr.clone()
+                spec_pr_dn[:, :C] = spec_pr_dn[:, :C] * self.sig_spec + self.mu_spec
+                wav_pr = istft(spec_pr_dn, length=spec_gt.size(-1) * 4)
+
+                spec_dn = spec_gt.clone()
+                spec_dn[:, :C] = spec_dn[:, :C] * self.sig_spec + self.mu_spec
+                wav_gt = istft(spec_dn, length=spec_gt.size(-1) * 4)
+
+                loss_wave  = loss_wave_l1(wav_gt, wav_pr)
+                loss_cons  = loss_spectro_time_consistency(
+                                wav_gt, spec_pr, self.sig_spec, self.mu_spec, istft)
+            else:
+                loss_wave = loss_cons = torch.tensor(0., device=self.device)
+
+            # mask-side
+            mask_pr = out["mask"]
+            mask_gt = modality["mask"].to(self.device)
+            loss_mask = focal_tversky_loss(mask_gt, mask_pr,
+                                        alpha=0.3, beta=0.8, gamma=sched["focal_gamma"])
+            loss_dmg  = damage_amount_loss(mask_gt, mask_pr,
+                                        contrast_weight=sched["contrast_weight"],
+                                        margin=0.005)
+
+            total = (
+                w_fm   * loss_fm   +
+                w_mag  * loss_mag  +
+                w_pdot * loss_pdot +
+                w_pif  * loss_pif  +
+                w_cons * loss_cons +
+                w_wave * loss_wave +
+                w_mask * loss_mask +
+                sched["damage_weight"] * loss_dmg
+            )
+
+            partial = {
+                "fm":   w_fm   * loss_fm,
+                "mag":  w_mag  * loss_mag,
+                "pdot": w_pdot * loss_pdot,
+                "pif":  w_pif  * loss_pif,
+                "cons": w_cons * loss_cons,
+                "wave": w_wave * loss_wave,
+                "mask": w_mask * loss_mask,
+                "dmg":  sched["damage_weight"] * loss_dmg,
+            }
+            return total, partial
+        # -----------------------------------------------------------------------
 
         for epoch in range(num_epochs):
+            sched = dynamic_loss_weights(epoch, loss_cfg)   # epoch-wise weights
             self.diffusion_model.train()
-            train_losses = []
-
-            weights = dynamic_loss_weights(epoch, wandb.config)
-
-            damage_weight    = weights["damage_weight"]
-            focal_gamma      = weights["focal_gamma"]
-            contrast_weight  = weights["contrast_weight"]
-
+            epoch_losses = []
 
             pbar = tqdm(train_dataloader, desc=f"Epoch {epoch+1}/{num_epochs}")
             for batch in pbar:
-                modality_data = {
-                    name: batch[i] if i < len(batch) else None
-                    for i, name in enumerate(self.modality_names)
-                }
-                latents, joint_latent = self.encode_modalities(modality_data)
-                if joint_latent is None:
+                modality = {n: batch[i] if i < len(batch) else None
+                            for i, n in enumerate(self.modality_names)}
+                _, z_joint = self.encode_modalities(modality)
+                if z_joint is None:
                     continue
 
-                # ========== adaptive σ from mag ==========
-                spec = modality_data["spec"].to(self.device)
-                mag, _, _ = _split_mag_sincos_from_phase(spec)
-                sigma_t = energy_sigma(mag)
-                sigma_mean = sigma_t.mean(dim=1, keepdim=True)
-                z0 = torch.randn_like(joint_latent) * sigma_mean
+                total, parts = compute_losses(modality, z_joint, sched)
 
-                # ========== flow matching ==========
-                B = joint_latent.size(0)
-                t = torch.randint(0, self.noise_scheduler.num_timesteps, (B,), device=self.device)
-                tau = t.view(-1, 1).float() / (self.noise_scheduler.num_timesteps - 1)
+                opt.zero_grad()
+                total.backward()
+                opt.step()
 
-                x_t = tau * joint_latent + (1 - tau) * z0
-                v_tgt = joint_latent - z0
-                v_pred = self.diffusion_model(x_t, tau)
+                epoch_losses.append(total.item())
+                pbar.set_postfix({"loss": f"{total.item():.3f}"})
 
-                loss_fm = F.mse_loss(v_pred, v_tgt)
+                if wandb.run:
+                    wandb.log({f"loss/{k}": v.item() for k, v in parts.items()},
+                            commit=False)
 
-                # ========== decode ==========
-                z_recon = v_pred + z0
-                outputs = self.decode_modalities(z_recon)
-                spec_pred = outputs["spec"]
-                spec_true = modality_data["spec"].to(self.device)
+            avg_train = float(np.mean(epoch_losses))
+            history["train_loss"].append(avg_train)
 
-                # ========== spec losses ==========
-                loss_mag   = loss_mag_mse(spec_true, spec_pred)
-                loss_p_dot = loss_phase_dot(spec_true, spec_pred)
-                loss_p_if  = loss_phase_if(spec_true, spec_pred)
-
-                core = getattr(self, "module", self)
-                istft = getattr(core, "istft", None)
-                if istft is not None:
-                    spec_pred_dn = spec_pred.clone()
-                    C = spec_pred.shape[1] // 3
-                    spec_pred_dn[:, :C] = spec_pred_dn[:, :C] * self.sig_spec + self.mu_spec
-
-                    wav_pred = istft(spec_pred_dn, length=spec_true.size(-1) * 4)
-                    spec_true_dn = spec_true.clone()
-                    spec_true_dn[:, :C] = spec_true_dn[:, :C] * self.sig_spec + self.mu_spec
-                    wav_true = istft(spec_true_dn, length=spec_true.size(-1) * 4)
-
-                    loss_wave = loss_wave_l1(wav_true, wav_pred)
-                    loss_consist = loss_spectro_time_consistency(
-                        wav_true, spec_pred, self.sig_spec, self.mu_spec, istft
-                    )
-                else:
-                    loss_wave = loss_consist = torch.tensor(0.0, device=self.device)
-
-                # ========== mask losses ==========
-                mask_pred = outputs["mask"]
-                mask_true = modality_data["mask"].to(self.device)
-                loss_mask = focal_tversky_loss(mask_true, mask_pred,
-                                            alpha=0.3, beta=0.8, gamma=focal_gamma)
-                loss_dmg  = damage_amount_loss(mask_true, mask_pred,
-                                            contrast_weight=contrast_weight, margin=0.005)
-
-                # ========== total loss ==========
-                loss = (
-                    1.0 * loss_fm +
-                    0.5 * loss_mag +
-                    0.5 * loss_p_dot +
-                    0.25 * loss_p_if +
-                    0.5 * loss_consist +
-                    2.0 * loss_wave +
-                    1.0 * loss_mask +
-                    damage_weight * loss_dmg
-                )
-
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
-
-                train_losses.append(loss.item())
-                pbar.set_postfix({"loss": loss.item()})
-
-            avg_train_loss = sum(train_losses) / len(train_losses)
-            history["train_loss"].append(avg_train_loss)
-
-            # ========== validation ==========
+            # ─── validation ─────────────────────────────────────────────
+            avg_val = None
             if val_dataloader:
                 self.diffusion_model.eval()
-                val_losses = []
-
+                val_tot = []
                 with torch.no_grad():
-                    for batch in tqdm(val_dataloader, desc="Validation"):
-                        modality_data = {
-                            name: batch[i] if i < len(batch) else None
-                            for i, name in enumerate(self.modality_names)
-                        }
-                        latents, joint_latent = self.encode_modalities(modality_data)
-                        if joint_latent is None:
+                    for batch in val_dataloader:
+                        modality = {n: batch[i] if i < len(batch) else None
+                                    for i, n in enumerate(self.modality_names)}
+                        _, z_joint = self.encode_modalities(modality)
+                        if z_joint is None:
                             continue
+                        total_val, _ = compute_losses(modality, z_joint, sched)
+                        val_tot.append(total_val.item())
+                avg_val = float(np.mean(val_tot))
+                history["val_loss"].append(avg_val)
 
-                        B = joint_latent.size(0)
-                        spec = modality_data["spec"].to(self.device)
-                        mag, _, _ = _split_mag_sincos_from_phase(spec)
-                        sigma_t = energy_sigma(mag)
-                        sigma_mean = sigma_t.mean(dim=1, keepdim=True)
-                        z0 = torch.randn_like(joint_latent) * sigma_mean
+                if avg_val < best_val:
+                    best_val = avg_val
+                    torch.save(self.diffusion_model.state_dict(),
+                            f"{save_dir}/best_diffusion_model.pt")
 
-                        t = torch.randint(0, self.noise_scheduler.num_timesteps, (B,), device=self.device)
-                        tau = t.view(-1, 1).float() / (self.noise_scheduler.num_timesteps - 1)
-                        x_t = tau * joint_latent + (1 - tau) * z0
-                        v_tgt = joint_latent - z0
-                        v_pred = self.diffusion_model(x_t, tau)
+            print(f"Epoch {epoch+1:03d} | train={avg_train:.4f}"
+                + (f" | val={avg_val:.4f}" if avg_val is not None else ""))
 
-                        z_recon = v_pred + z0
-                        outputs = self.decode_modalities(z_recon)
+            if wandb.run:
+                wandb.log({"epoch": epoch,
+                        "train/loss": avg_train,
+                        "val/loss":   avg_val})
 
-                        spec_pred = outputs["spec"]
-                        spec_true = modality_data["spec"].to(self.device)
-
-                        loss_fm = F.mse_loss(v_pred, v_tgt)
-                        loss_mag   = loss_mag_mse(spec_true, spec_pred)
-                        loss_p_dot = loss_phase_dot(spec_true, spec_pred)
-                        loss_p_if  = loss_phase_if(spec_true, spec_pred)
-
-                        if istft is not None:
-                            spec_pred_dn = spec_pred.clone()
-                            C = spec_pred.shape[1] // 3
-                            spec_pred_dn[:, :C] = spec_pred_dn[:, :C] * self.sig_spec + self.mu_spec
-                            wav_pred = istft(spec_pred_dn, length=spec_true.size(-1) * 4)
-                            spec_true_dn = spec_true.clone()
-                            spec_true_dn[:, :C] = spec_true_dn[:, :C] * self.sig_spec + self.mu_spec
-                            wav_true = istft(spec_true_dn, length=spec_true.size(-1) * 4)
-                            loss_wave = loss_wave_l1(wav_true, wav_pred)
-                            loss_consist = loss_spectro_time_consistency(wav_true, spec_pred, self.sig_spec, self.mu_spec, istft)
-                        else:
-                            loss_wave = loss_consist = torch.tensor(0.0, device=self.device)
-
-                        mask_pred = outputs["mask"]
-                        mask_true = modality_data["mask"].to(self.device)
-                        loss_mask = focal_tversky_loss(mask_true, mask_pred,
-                                                    alpha=0.3, beta=0.8, gamma=focal_gamma)
-                        loss_dmg = damage_amount_loss(mask_true, mask_pred,
-                                                    contrast_weight=contrast_weight, margin=0.005)
-
-                        total = (
-                            1.0 * loss_fm +
-                            0.5 * loss_mag +
-                            0.5 * loss_p_dot +
-                            0.25 * loss_p_if +
-                            0.5 * loss_consist +
-                            2.0 * loss_wave +
-                            1.0 * loss_mask +
-                            damage_weight * loss_dmg
-                        )
-                        val_losses.append(total.item())
-
-                avg_val_loss = sum(val_losses) / len(val_losses)
-                history["val_loss"].append(avg_val_loss)
-
-                if avg_val_loss < best_val_loss:
-                    best_val_loss = avg_val_loss
-                    torch.save(self.diffusion_model.state_dict(), f"{save_dir}/best_diffusion_model.pt")
-
-            print(f"Epoch {epoch+1}  Train: {avg_train_loss:.4f}"
-                + (f"  Val: {avg_val_loss:.4f}" if val_dataloader else ""))
-
-            # Optional W&B logging
-            if wandb.run is not None:
-                wandb.log({
-                    "train/loss": avg_train_loss,
-                    "val/loss": avg_val_loss if val_dataloader else None,
-                    "epoch": epoch,
-                })
-
-        torch.save(self.diffusion_model.state_dict(), f"{save_dir}/final_diffusion_model.pt")
+        torch.save(self.diffusion_model.state_dict(),
+                f"{save_dir}/final_diffusion_model.pt")
         return history
 
     def encode_modalities(self, modality_data):
@@ -1053,10 +1029,9 @@ class MultiModalLatentDiffusion:
         for modality_name, data in modality_data.items():
             if data is not None:
 
-                # Defensive fix for spec shape
-                if modality_name == "spec" and data.shape[1] != 24:
-                    print(f"⚠️ WARNING: Expected spec channel=48 but got {data.shape[1]}, transposing...")
-                    data = data.permute(0, 2, 3, 1)
+                if modality_name == "spec" and data.ndim == 4 and data.shape[-1] == 36:
+                    raise ValueError("Spec is channel-last; please transpose in the data pipeline.")
+
 
                 data = data.to(self.device)
                 autoencoder = self.autoencoders[modality_name]
@@ -1145,7 +1120,9 @@ class MultiModalLatentDiffusion:
 
         # 2. Rebuild autoencoders (must match dimensions from training)
         spec_autoencoder = SpectrogramAutoencoder(
-            latent_dim, channels=12, freq_bins=129, time_bins=18
+             latent_dim,
+             channels=12,
+             freq_bins=129, time_bins=18
         ).to(device)
         mask_autoencoder = MaskAutoencoder(
             latent_dim, output_shape=(32, 96)
@@ -1161,24 +1138,24 @@ class MultiModalLatentDiffusion:
         print(f"✅ Loaded AE from {spec_ckpt_path}")
         print("‼️  Missing keys:", missing)
         print("‼️  Unexpected keys:", unexpected)
-        print("✅ adjust_conv.weight norm:", spec_autoencoder.encoder.adjust_conv.weight.norm().item())
+        print("✅ enc_mag.dw_freq weight norm:",
+                  spec_autoencoder.enc_mag.dw_freq.weight.norm().item())
 
         print("✅ Loaded spec autoencoder state dict")
-        print("‣ adjust_conv.weight norm:", spec_autoencoder.encoder.adjust_conv.weight.norm().item())
 
         mask_autoencoder.load_state_dict(torch.load(os.path.join(ae_dir, "mask_autoencoder_best.pt"), map_location=device))
         print("‣ mask encoder norm:", mask_autoencoder.encoder.adjust_conv.weight.norm().item())
-
 
         # 3. Construct MLD wrapper
         mld = MultiModalLatentDiffusion(
             spec_autoencoder,
             mask_autoencoder,
-            latent_dim=latent_dim,
+            modality_dims=[latent_dim*2, latent_dim],
+            latent_dim=latent_dim,                    # still needed to rebuild AEs
             modality_names=["spec", "mask"],
             device=device,
             mu_spec=mu_spec,
-            sig_spec=sig_spec
+            sig_spec=sig_spec,
         )
 
         # 4. Load diffusion weights
@@ -1186,7 +1163,8 @@ class MultiModalLatentDiffusion:
         mld.diffusion_model.to(device)
         mld.eval()
 
-        print("Final weight norm:", mld.autoencoders["spec"].encoder.adjust_conv.weight.norm().item())
+        print("Final enc_mag.dw_freq norm:",
+                mld.autoencoders["spec"].enc_mag.dw_freq.weight.norm().item())
 
         return mld
 

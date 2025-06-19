@@ -2,8 +2,8 @@
 defaults:
   - _self_
   - default
-  - loss_weights@loss_weights: base     # Register main loss weights
-  # - loss_weights@debug_loss_weights: debug   # Optional debug override
+  - loss_weights@ae_loss:  base_ae   # for auto-encoders
+  - loss_weights@dm_loss:  base_dm   # for diffusion model
 
 debug_mode: false
 
@@ -11,7 +11,9 @@ model_name: "MultiModalLatentDiffusion"
 
 hydra:
   run:
-    dir: ./outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+    dir: ./results_diff/outputs/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  job:
+    chdir: false
   sweep:
     dir: ./multirun/${now:%Y-%m-%d}/${now:%H-%M-%S}
 
@@ -24,10 +26,10 @@ diffusion:
   ae_ckpt_dir: "${output_dir}/autoencoders"
   latent_dim: 256
   batch_size: 200
-  ae_epochs: 200
-  ae_patience: 50
+  ae_epochs: 5000
+  ae_patience: 300
   ae_learning_rate: 5e-4
-  num_epochs: 500
+  num_epochs: 5000
   learning_rate: 5e-4
   beta_start: 0.0001
   beta_end: 0.02

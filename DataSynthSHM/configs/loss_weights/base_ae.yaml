@@ -1,0 +1,25 @@
+# ─── Magnitude-only losses ────────────────────────────────
+mag_mse:            1.0        # ‖log-|S|‖² reconstruction
+
+# curriculum scaling for phase losses
+mag_curric_min:     0.3        # phase-loss weight at epoch 0
+mag_curric_max:     1.5        # phase-loss weight after curriculum
+
+# ─── Phase-only losses ────────────────────────────────────
+phase_dot:          1.0        # cosine / dot-product loss
+phase_if:           0.1        # instantaneous-frequency loss
+phase_aw_abs:       0.1        # absolute angular-wrap loss
+
+# ─── Cross-domain (mag ↔ phase ↔ waveform) losses ────────
+time_consistency:   0.5        # ∑‖ISTFT(Ŝ)−seg‖ over hop frames
+wave_l1:            1.0        # scale-invariant L1 on reconstructed wave
+
+# ─── Mask-branch losses & schedules ───────────────────────
+mask_px:            0.5        # focal-Tversky pixel loss
+dice_w:             0.5        # BCE + Dice combo weight
+
+damage_initial:     2.0        # damage-amount loss weight (early)
+damage_final:       0.3        # damage-amount loss weight (late)
+
+focal_gamma_init:   1.0        # γ for focal-Tversky (early)
+focal_gamma_late:   1.5        # γ for focal-Tversky (late)

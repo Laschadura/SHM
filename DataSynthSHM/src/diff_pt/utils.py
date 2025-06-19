@@ -8,18 +8,24 @@ import GPUtil
 
 
 # ---------- helper -----------------------------------------------------------
-def _split_mag_sincos_from_phase(spec):
+def _split_mag_sincos_from_phase(spec: torch.Tensor):
     """
-    spec : (B, 2*C, F, T)   = [mag, φ]
+    spec : (B, 3·C, F, T)  = [log|S|, sinφ, cosφ]
     Returns:
-        mag   : (B, C, F, T)
-        sinφ  : (B, C, F, T)
-        cosφ  : (B, C, F, T)
+        log-mag : (B, C , F, T)
+        sinφ    : (B, C , F, T)
+        cosφ    : (B, C , F, T)
     """
-    C = spec.shape[1] // 2
-    mag   = spec[:, 0::2]
-    phase = spec[:, 1::2]
-    return mag, torch.sin(phase), torch.cos(phase)
+    C = spec.shape[1] // 3
+    return spec[:, :C], spec[:, C:2*C], spec[:, 2*C:]
+
+def split_mag_phase(spec: torch.Tensor):
+    """
+    spec: (B, 3·C, F, T)
+    Returns (log-|S|  [B,C,F,T] ,  phase_sincos  [B,2C,F,T])
+    """
+    C = spec.shape[1] // 3
+    return spec[:, :C], spec[:, C:]
 
 
 def _quick_mask_stats(mask_true, mask_logits, mask_prob):

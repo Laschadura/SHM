@@ -12,29 +12,29 @@
 echo "🔄 Job started on $(hostname) at $(date)"
 echo "🧠 Using $SLURM_CPUS_ON_NODE CPU cores"
 
-# ──────────────────────────  MODULES  ──────────────────────────
+# ──────────────── MODULES ────────────────
 module load stack/2024-06
 module load gcc/12.2.0
 module load python_cuda/3.11.6
 
-# ──────────────────────────  ENV VARS  ─────────────────────────
+# ─────────────── ENV VARS ────────────────
 export XLA_FLAGS=--xla_gpu_cuda_data_dir=$CUDA_EULER_ROOT
 export CUDA_DIR=$CUDA_EULER_ROOT
 
-# Disable all W&B networking / logging (the SDK becomes a no-op)
-export WANDB_MODE=disabled
-unset  WANDB_API_KEY              # just to be safe
+# ✅ Debug GPU availability
+python -c "import torch; print(f'🟢 CUDA Available: {torch.cuda.is_available()} | Device: {torch.cuda.get_device_name(0)}')"
+nvidia-smi
 
-# ──────────────────────────  PROJECT PATHS  ────────────────────
-cd /cluster/scratch/scansimo/DataSynthSHM        # project root
-export PYTHONPATH=$PYTHONPATH:$PWD/src           # so diff_pt is importable
+# ✅ W&B OFFLINE (local logging only, sync later)
+export WANDB_MODE=offline
+export WANDB_SENTRY_MODE=disabled
+unset  WANDB_API_KEY  # just in case
 
-# ──────────────────────────  TRAINING CALL  ────────────────────
-# Feel free to add overrides here (e.g. shorter epochs for debugging)
-python -u src/diff_pt/run.py \
-       debug_mode=true \
-       diffusion.ae_epochs=3 \
-       diffusion.batch_size=64
+# ──────────────── PROJECT SETUP ────────────────
+cd /cluster/scratch/scansimo/DataSynthSHM
+export PYTHONPATH=$PYTHONPATH:$PWD/src
 
+# ──────────────── TRAINING ────────────────
+python -u src/diff_pt/run.py
 
 echo "✅ Job finished at $(date)"

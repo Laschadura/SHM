@@ -1,4 +1,6 @@
 import os
+os.environ["WANDB_SENTRY_MODE"] = "disabled"
+os.environ.setdefault("WANDB_MODE", "offline")
 import numpy as np
 import torch
 
@@ -13,6 +15,7 @@ sys.argv = [sys.argv[0]] + [
 
 import hydra
 import wandb
+from wandb.sdk import Settings
 
 from diff_pt.model import SpectrogramAutoencoder, MaskAutoencoder, MultiModalLatentDiffusion, DifferentiableISTFT
 from diff_pt.train import train_autoencoders
@@ -30,11 +33,13 @@ from bridge_data.loader import load_data
 from omegaconf import DictConfig, OmegaConf
 from configs import config_schema
 from configs.config_schema import MainConfig, LossWeights
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="keras")
 
 
 @hydra.main(
     config_path=os.path.join(os.path.dirname(__file__), "../../configs"),
-    config_name="diffusion"
+    config_name="diffusion", version_base="1.1"
 )
 def main(cfg: MainConfig):
     from omegaconf import open_dict, ValidationError
@@ -43,8 +48,12 @@ def main(cfg: MainConfig):
     except ValidationError as e:
         print(e)
         raise
+    
+    print("🛠️ Loaded Hydra config:")
+    print(OmegaConf.to_yaml(cfg))
 
-    loss_cfg = cfg.debug_loss_weights if cfg.debug_mode else cfg.loss_weights
+    ae_loss_cfg = cfg.ae_loss         # for train_autoencoders
+    dm_loss_cfg = cfg.dm_loss         # for diffusion
 
     if cfg.debug_mode:
         print("🔧  Overriding loss weights with debug_loss_weights")
@@ -55,10 +64,10 @@ def main(cfg: MainConfig):
             entity=os.environ.get("WANDB_ENTITY", None),
             config=OmegaConf.to_container(cfg, resolve=True),
             name=f"sweep_run_{os.environ.get('SLURM_JOB_ID', 'local')}",
-            mode="online",
+            mode=os.environ.get("WANDB_MODE", "offline")
         )
-
-
+        if wandb.run:          # safe-guard
+            wandb.config.update({"loss_config_name": "base"}, allow_val_change=True)
 
     # ─── Mode Control ───────────────────────────────────────────────
     train_AE         = cfg.diffusion.train_autoencoders
@@ -99,11 +108,13 @@ def main(cfg: MainConfig):
             sample_rate      = fs,
             recompute        = recompute_data,
             cache_dir        = cache_dir)
+    
+    print(f"[load_data] spectrograms raw shape  : {spectrograms.shape}")
 
     # post-process into channel-first arrays and separate mag/phase(sin/cos)
     spectrograms = spectrograms.transpose(0, 3, 1, 2)    # (N,2C,F,T)
+    print(f"[transpose ] spectrograms new shape  : {spectrograms.shape}")
     N, twoC, F, T = spectrograms.shape
-    C = twoC // 3
     mag   = spectrograms[:, 0::2]
     phase = spectrograms[:, 1::2]
 
@@ -176,13 +187,15 @@ def main(cfg: MainConfig):
 
 
     mld = MultiModalLatentDiffusion(
-        spec_autoencoder,
-        mask_autoencoder,
-        modality_dims=[latent_dim*2, latent_dim],   # ❶
-        device=device,
-        mu_spec=mu_tensor,
-        sig_spec=std_tensor
+            spec_autoencoder,
+            mask_autoencoder,
+            modality_dims=[latent_dim*2, latent_dim],   # ← NEW
+            modality_names=["spec", "mask"],
+            device=device,
+            mu_spec=mu_tensor,
+            sig_spec=std_tensor,
     )
+
 
     mld.istft = DifferentiableISTFT(nperseg=nperseg, noverlap=noverlap).to(device)
 
@@ -194,7 +207,7 @@ def main(cfg: MainConfig):
             device, epochs=ae_epochs,
             lr=learning_rate_ae, patience=patience_ae,
             cache_dir=cache_dir,
-            loss_cfg=loss_cfg
+            loss_cfg=ae_loss_cfg
         )
         save_plotly_loss_curve(spec_history, "results_diff/autoencoders/spec_loss.html", title="Spectrogram AE Loss")
         save_plotly_loss_curve(mask_history, "results_diff/autoencoders/mask_loss.html", title="Mask AE Loss")
@@ -210,35 +223,37 @@ def main(cfg: MainConfig):
         load_autoencoders(mld.autoencoders, device)
 
 
+    # ─── Diffusion training control ─────────────────────────────────
+    if dm_mode == "continue":
+        if os.path.exists(diff_ckpt):
+            print("🔄 Continuing diffusion training from checkpoint.")
+            load_diffusion_model(mld.diffusion_model, device, diff_ckpt)
+        else:
+            print("❌ No diffusion checkpoint found – aborting continue mode.")
+            return
+    elif dm_mode == "scratch":
+        print("🆕 Training diffusion model from scratch.")
+    else:
+        raise ValueError(f"Invalid dm_mode: {dm_mode}. Choose 'scratch' or 'continue'.")
 
-    # # ─── Diffusion training control ─────────────────────────────────
-    # if dm_mode == "continue":
-    #     if os.path.exists(diff_ckpt):
-    #         print("🔄 Continuing diffusion training from checkpoint.")
-    #         load_diffusion_model(mld.diffusion_model, device, diff_ckpt)
-    #     else:
-    #         print("❌ No diffusion checkpoint found – aborting continue mode.")
-    #         return
-    # elif dm_mode == "scratch":
-    #     print("🆕 Training diffusion model from scratch.")
-    # else:
-    #     raise ValueError(f"Invalid dm_mode: {dm_mode}. Choose 'scratch' or 'continue'.")
+    print(f"🚀 Training diffusion model for {dm_epochs} epoch(s).")
+    history = mld.train_diffusion_model(
+        train_dataloader = train_loader,
+        val_dataloader   = val_loader,
+        num_epochs       = dm_epochs,
+        learning_rate    = learning_rate_dm,
+        save_dir         = "results_diff/diffusion",
+        loss_cfg = dm_loss_cfg
+    )
 
-    # print(f"🚀 Training diffusion model for {dm_epochs} epoch(s).")
-    # history = mld.train_diffusion_model(
-    #     train_dataloader = train_loader,
-    #     val_dataloader   = val_loader,
-    #     num_epochs       = dm_epochs,
-    #     learning_rate    = learning_rate_dm,
-    #     save_dir         = "results_diff/diffusion"
-    # )
+    save_diffusion_model(mld.diffusion_model, diff_ckpt)
 
-    # save_diffusion_model(mld.diffusion_model, diff_ckpt)
+    visualize_training_history(history, save_path="results_diff/diffusion/training_curve.png")
+    save_visualizations_and_metrics(mld, train_loader, val_loader, training_metrics=history, output_dir="results_diff")
 
-    # visualize_training_history(history, save_path="results_diff/diffusion/training_curve.png")
-    # save_visualizations_and_metrics(mld, train_loader, val_loader, training_metrics=history, output_dir="results_diff")
-
-    # print("✅ All training, evaluation, and synthesis complete.")
+    if wandb.run:
+        wandb.finish()
+    print("✅ All training, evaluation, and synthesis complete.")
 
 if __name__ == "__main__":
   main()
