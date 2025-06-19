@@ -68,49 +68,41 @@ class DifferentiableISTFT(nn.Module):
         )
 
     def forward(self, spec, length):
-        # Accepts (B, 3C, F, T)   = [log|S|, sinφ, cosφ]
-        spec = spec.permute(0, 2, 3, 1).contiguous()  # (B, F, T, 3C)
-
-        B, F, T, D = spec.shape
+        # spec: (B, 3C, F, T) with STACKED layout
+        B, D, F, T = spec.shape
         C = D // 3
 
-        # split triplets  → (B, F, T, C, 3)
-        spec = spec.view(B, F, T, C, 3)
-        log_mag = spec[..., 0]
-        phase_s = spec[..., 1]
-        phase_c = spec[..., 2]
-        phase   = torch.atan2(phase_s, phase_c)            # recover φ
+        log_mag = spec[:, :C]        # (B, C, F, T)
+        sin_phi = spec[:, C:2*C]
+        cos_phi = spec[:, 2*C:]
 
-        # Flatten for batch ISTFT: (B*C, F, T)
-        log_mag = log_mag.permute(0, 3, 1, 2).reshape(-1, F, T)
-        phase   = phase.permute(0, 3, 1, 2).reshape(-1, F, T)
+        phase   = torch.atan2(sin_phi, cos_phi)
 
-        # Reconstruct magnitude
+        # (B,C,F,T) → (B*C, F, T)
+        log_mag = log_mag.permute(0, 2, 3, 1).reshape(-1, F, T)
+        phase   = phase  .permute(0, 2, 3, 1).reshape(-1, F, T)
+
         mag = torch.exp(log_mag) - self.epsilon
         mag = torch.clamp(mag, min=0.)
 
-        # Form complex spectrogram
         real = mag * torch.cos(phase)
         imag = mag * torch.sin(phase)
-        complex_spec = torch.complex(real, imag)  # shape: (B*C, F, T)
+        Z    = torch.complex(real, imag)
 
-        # Apply ISTFT
         wav = torch.istft(
-            complex_spec,
-            n_fft=self.nperseg,
-            hop_length=self.hop_len,
-            win_length=self.nperseg,
-            window=self.window,
-            center=True,
-            normalized=False,
-            onesided=True,
-            length=length
+            Z,
+            n_fft      = self.nperseg,
+            hop_length = self.hop_len,
+            win_length = self.nperseg,
+            window     = self.window,
+            center     = True,
+            normalized = False,
+            onesided   = True,
+            length     = length
         )
-
-        # Reshape back to (B, length, C)
-        wav = wav.view(B, C, -1).permute(0, 2, 1)
+        wav = wav.view(B, C, -1).permute(0, 2, 1)   # (B, T, C)
         return wav
-
+    
 # ----- Encoders -----
 class MagEncoder(nn.Module):
     """Log-|S|  →  latent"""
@@ -383,7 +375,7 @@ class SpectrogramAutoencoder(nn.Module):
               └─ dec_phase→  Ŝ_phase(sin|cos)
     recon = cat([Ŝ_mag, Ŝ_phase])   # (B, 3C, F, T)
     """
-    def __init__(self, latent_dim, channels, freq_bins, time_bins):
+    def __init__(self, latent_dim, channels, freq_bins, time_bins, nperseg, noverlap):
         super().__init__()
 
         self.enc_mag   = MagEncoder  (latent_dim, channels)
@@ -392,13 +384,18 @@ class SpectrogramAutoencoder(nn.Module):
         self.dec_mag   = SpectrogramDecoder(latent_dim, freq_bins, time_bins, channels)
         self.dec_phase = SpectrogramDecoder(latent_dim, freq_bins, time_bins, channels * 2)
 
+        self.istft = DifferentiableISTFT(
+            nperseg=nperseg,
+            noverlap=noverlap
+        ).to(next(self.parameters()).device)
+
     def encode(self, spec):
         C = spec.shape[1] // 3
         z_m = self.enc_mag(spec[:, :C])
         z_p = self.enc_phase(spec[:, C:])
         return torch.cat([z_m, z_p], dim=1)
     
-    def decoder(self, joint_latent):
+    def decode(self, joint_latent):
         """
         joint_latent = [z_mag | z_phase]  (concatenated, dim = 2×latent_dim)
         Returns the full 3-channel reconstruction expected by downstream code.
@@ -1122,7 +1119,8 @@ class MultiModalLatentDiffusion:
         spec_autoencoder = SpectrogramAutoencoder(
              latent_dim,
              channels=12,
-             freq_bins=129, time_bins=18
+             freq_bins=129, time_bins=18,
+             nperseg=256, noverlap=224
         ).to(device)
         mask_autoencoder = MaskAutoencoder(
             latent_dim, output_shape=(32, 96)

@@ -175,7 +175,7 @@ def main(cfg: MainConfig):
     mask_height, mask_width = mask_segments.shape[-2:]
 
     # ─── Build Model ────────────────────────────────────────────────
-    spec_autoencoder = SpectrogramAutoencoder(latent_dim, channels, freq_bins, time_bins).to(device)
+    spec_autoencoder = SpectrogramAutoencoder(latent_dim, channels, freq_bins, time_bins, nperseg, noverlap).to(device)
     mask_autoencoder = MaskAutoencoder(latent_dim, (mask_height, mask_width)).to(device)
 
     spec_autoencoder.istft = DifferentiableISTFT(nperseg=nperseg, noverlap=noverlap).to(device)
