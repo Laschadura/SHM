@@ -62,7 +62,7 @@ def train_autoencoders(
     opt_mask = optim.AdamW(mask_autoencoder.parameters(), lr=lr)
 
     sch_spec = ReduceLROnPlateau(opt_spec, mode="min", factor=0.5, patience=8, min_lr=5e-6)
-    sch_mask = torch.optim.lr_scheduler.CosineAnnealingLR(opt_mask, T_max=epochs)
+    sch_mask = torch.optim.lr_scheduler.CosineAnnealingLR(opt_mask, T_max=epochs, eta_min=1e-4)
 
     best_spec, best_mask, patience_ctr = float("inf"), float("inf"), 0
     hist = {"spec_train": [], "spec_val": [], "mask_train": [], "mask_val": []}

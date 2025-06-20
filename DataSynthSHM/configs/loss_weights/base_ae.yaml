@@ -6,7 +6,7 @@ mag_curric_min:     0.3        # phase-loss weight at epoch 0
 mag_curric_max:     1.5        # phase-loss weight after curriculum
 
 # ─── Phase-only losses ────────────────────────────────────
-phase_dot:          0.7        # cosine / dot-product loss
+phase_dot:          0.3        # cosine / dot-product loss
 phase_if:           0.15       # instantaneous-frequency loss
 phase_aw_abs:       0.1        # absolute angular-wrap loss
 

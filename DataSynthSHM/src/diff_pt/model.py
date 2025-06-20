@@ -55,6 +55,11 @@ def dynamic_loss_weights(epoch: int, config: dict) -> dict:
     }
 
 # ----- Custom Layers -----
+class UnitNorm(nn.Module):
+    def __init__(self, eps=1e-7): super().__init__(); self.eps = eps
+    def forward(self, x):
+        return x / (x.pow(2).sum(dim=1, keepdim=True).clamp_min(self.eps).sqrt())
+
 class DifferentiableISTFT(nn.Module):
     def __init__(self, nperseg=256, noverlap=224, epsilon=1e-5):
         super().__init__()
@@ -232,92 +237,72 @@ class MaskEncoder(nn.Module):
 # ----- Decoders -----
 class SpectrogramDecoder(nn.Module):
     """
-    Decoder for spectrogram features ensuring exact output dimensions.
+    Shared trunk + two heads:
+        • mag_head : log|S|   (linear)
+        • phi_head : (sin,cos) with FiLM + UnitNorm
     """
-    def __init__(self, latent_dim, freq_bins=129, time_bins=24, channels=24):
+    def __init__(self, latent_dim, freq_bins, time_bins,
+                 channels_mag, channels_phi,
+                 *, n_hidden=128):
         super().__init__()
-        
-        self.freq_bins = freq_bins
-        self.time_bins = time_bins
-        self.channels = channels
-        
-        # Determine minimum dimensions (ensure they're at least 1)
-        self.min_freq = max(1, freq_bins // 4)
-        self.min_time = max(1, time_bins // 4)
-        
-        # Dense and reshape layers
-        self.fc = nn.Linear(latent_dim, self.min_freq * self.min_time * 128)
-        self.relu1 = nn.LeakyReLU(0.1)
-        
-        # Upsampling blocks
-        self.conv_t1 = nn.ConvTranspose2d(
-            in_channels=128,
-            out_channels=64,
-            kernel_size=3,
-            stride=2,
-            padding=1,
-            output_padding=1  # Required for odd dimensions in PyTorch
+        self.freq_bins, self.time_bins = freq_bins, time_bins
+
+        # ---------- shared trunk---------------------------- ----------
+        self.fc = nn.Linear(latent_dim, n_hidden * (freq_bins//4) * (time_bins//4))
+        self.trunk = nn.Sequential(
+            nn.LeakyReLU(0.1),
+            nn.ConvTranspose2d(n_hidden, 64, 3, 2, 1, output_padding=1),
+            nn.GroupNorm(16, 64), nn.LeakyReLU(0.1),
+            nn.ConvTranspose2d(64, 32, 3, 2, 1, output_padding=1),
+            nn.GroupNorm(8, 32),  nn.LeakyReLU(0.1),
         )
-        self.gn1 = nn.GroupNorm(16, 64)
-        self.relu2 = nn.LeakyReLU(0.1)
-        self.drop1 = nn.Dropout(0.3)
-        
-        self.conv_t2 = nn.ConvTranspose2d(
-            in_channels=64,
-            out_channels=32,
-            kernel_size=3,
-            stride=2,
-            padding=1,
-            output_padding=1  # Required for odd dimensions in PyTorch
+
+        # ---------- FiLM parameters derived from z_mag -------------------
+        self.film = nn.Linear(latent_dim//2, 2*32)  # γ|β  for 32 channels (From PHASEN paper)
+
+        # ---------- heads -----------------------------------------------
+        self.mag_head  = nn.Conv2d(32, channels_mag, 3, padding=1)
+        self.phi_head  = nn.Sequential(
+            nn.Conv2d(32, channels_phi, 3, padding=1),
+            nn.Tanh(),                      # keep |sin|,|cos| ≤ 1
+            UnitNorm()                      # ensure ‖(sin,cos)‖=1
         )
-        self.gn2 = nn.GroupNorm(8, 32)
-        self.relu3 = nn.LeakyReLU(0.1)
-        self.drop2 = nn.Dropout(0.3)
 
-        # Final refinement layers
-        self.conv_t3 = nn.Conv2d(in_channels=32, out_channels=32, kernel_size=3, padding=1)
-        self.gn3 = nn.GroupNorm(8, 32)
-        self.relu4 = nn.LeakyReLU(0.1)
-        self.drop3 = nn.Dropout(0.3)
-        
-        # Output projection 
-        self.conv_out = nn.Conv2d(in_channels=32, out_channels=channels, kernel_size=3, padding=1)
+    def forward(self, z_joint):
+        z_mag, z_phi = torch.chunk(z_joint, 2, dim=1)   # (B,∙)
 
-        self.output_gain = nn.Parameter(torch.tensor(1.0))
+        # --- shared up-sampling trunk ---
+        x = self.fc(z_joint)
+        B = x.size(0); F4, T4 = self.freq_bins//4, self.time_bins//4
+        x = x.view(B, -1, F4, T4)
+        x = self.trunk(x)                               # (B,32,~,~)
 
-    def forward(self, z):
-        # Initial projection and reshape
-        x = self.relu1(self.fc(z))
-        x = x.view(-1, 128, self.min_freq, self.min_time)
-        
-        # First upsampling
-        x  = self.conv_t1(x)
-        x = self.relu2(self.gn1(x))
-        x = self.drop1(x)
-        
-        # Second upsampling
-        x = self.conv_t2(x)
-        x = self.relu3(self.gn2(x))
-        x = self.drop2(x)
-        
-        # Final refinement
-        x = self.conv_t3(x)
-        x  = self.relu4(self.gn3(x))
-        x  = self.drop3(x)
-        
-        # Final projection
-        x = self.output_gain * self.conv_out(x)
-        
-        # Ensure the output has the exact desired dimensions
-        if (x.size(2) != self.freq_bins) or (x.size(3) != self.time_bins):
-            x = F.interpolate(
-                x, 
-                size=(self.freq_bins, self.time_bins),
-                mode='bilinear',
-                align_corners=False
-            )
-        
-        return x
+        # --- FiLM conditioning of phase path ---
+        gamma_beta = self.film(z_mag)                   # (B,64)
+        gamma, beta = gamma_beta.chunk(2, dim=1)
+        gamma = gamma[..., None, None]                  # (B,32,1,1)
+        beta  = beta[..., None, None]
+        x_phi = x * (1 + gamma) + beta                  # FiLM
+
+        # --- heads ---
+        mag_hat = self.mag_head(x)                      # (B,C_mag,F,T)
+        phi_hat = self.phi_head(x_phi)                  # (B,2C,F,T), unit norm
+
+        # ---------- ensure exact (F,T) --------------------------------------
+        target_hw = (self.freq_bins, self.time_bins)
+        if mag_hat.shape[2:] != target_hw:
+            mag_hat = F.interpolate(mag_hat,
+                                    size=target_hw,
+                                    mode='bilinear',
+                                    align_corners=False)
+        if phi_hat.shape[2:] != target_hw:
+            phi_hat = F.interpolate(phi_hat,
+                                    size=target_hw,
+                                    mode='bilinear',
+                                    align_corners=False)
+
+        #concatination happens in SpectrogramAutoencoder.forward()
+        return mag_hat, phi_hat
 
 class MaskDecoder(nn.Module):
     """
@@ -381,8 +366,13 @@ class SpectrogramAutoencoder(nn.Module):
         self.enc_mag   = MagEncoder  (latent_dim, channels)
         self.enc_phase = PhaseEncoder(latent_dim, channels * 2)
 
-        self.dec_mag   = SpectrogramDecoder(latent_dim, freq_bins, time_bins, channels)
-        self.dec_phase = SpectrogramDecoder(latent_dim, freq_bins, time_bins, channels * 2)
+        self.decoder_net = SpectrogramDecoder(
+            latent_dim*2, 
+            freq_bins,
+            time_bins,
+            channels_mag=channels,
+            channels_phi=channels*2,
+        )
 
         self.istft = DifferentiableISTFT(
             nperseg=nperseg,
@@ -395,24 +385,27 @@ class SpectrogramAutoencoder(nn.Module):
         z_p = self.enc_phase(spec[:, C:])
         return torch.cat([z_m, z_p], dim=1)
     
-    def decode(self, joint_latent):
+    def reconstruct(self, z_joint):
         """
         joint_latent = [z_mag | z_phase]  (concatenated, dim = 2×latent_dim)
         Returns the full 3-channel reconstruction expected by downstream code.
         """
-        z_m, z_p = torch.chunk(joint_latent, 2, dim=1)
-        mag_hat  = self.dec_mag(z_m)
-        pha_hat  = self.dec_phase(z_p)
+        mag_hat, pha_hat = self.decoder_net(z_joint)
+        mag_hat = torch.clamp(mag_hat, min=-5.0, max=+2.5)  # log-magnitude range (Dataset-specific)
         return torch.cat([mag_hat, pha_hat], dim=1)
 
     def forward(self, spec):
         C = spec.shape[1] // 3
         z_m = self.enc_mag(spec[:, :C])
         z_p = self.enc_phase(spec[:, C:])
-        mag_hat = self.dec_mag(z_m)
-        pha_hat = self.dec_phase(z_p)
-        recon = torch.cat([mag_hat, pha_hat], dim=1)
-        return recon, torch.cat([z_m, z_p], dim=1)
+
+        z_joint = torch.cat([z_m, z_p], dim=1)
+
+        # decoder
+        spec_hat = self.reconstruct(z_joint)                  # (B, 3C, F, T)
+
+        # API unchanged: return reconstruction + latent
+        return spec_hat, z_joint
 
 class MaskAutoencoder(nn.Module):
     def __init__(self, latent_dim, output_shape):

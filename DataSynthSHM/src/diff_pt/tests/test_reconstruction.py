@@ -163,6 +163,9 @@ def main():
     plt.hist(phase_recon.flatten().cpu().numpy(), bins=100)
     plt.title("Histogram of reconstructed φ"); plt.show()
 
+    plt.hist(phase_orig.flatten().cpu().numpy(), bins=100)
+    plt.title("Histogram of original φ"); plt.show()
+
     # Add after phase_orig, phase_recon
     if_orig = phase_orig[..., 1:] - phase_orig[..., :-1]
     if_recon = phase_recon[..., 1:] - phase_recon[..., :-1]

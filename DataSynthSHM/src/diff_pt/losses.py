@@ -27,8 +27,12 @@ def _phase(spec):
 def loss_phase_dot(spec_t, spec_p):
     _, s_t, c_t = _split_mag_sincos(spec_t)
     _, s_p, c_p = _split_mag_sincos(spec_p)
-    dot = (s_p * s_t + c_p * c_t).mean()      # ⟨u·v⟩   (u,v are unit vectors)
-    return 1.0 - dot                          # = 0 when perfectly aligned
+
+    # cosine of the phase difference, safely clamped
+    cos_sim = (s_p * s_t + c_p * c_t).clamp(-1.0, 1.0).mean()
+
+    return 1.0 - cos_sim
+
 
 # ---------- phase: instantaneous frequency (time derivative) ---------------
 def loss_phase_if(spec_t, spec_p):

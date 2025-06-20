@@ -178,8 +178,6 @@ def main(cfg: MainConfig):
     spec_autoencoder = SpectrogramAutoencoder(latent_dim, channels, freq_bins, time_bins, nperseg, noverlap).to(device)
     mask_autoencoder = MaskAutoencoder(latent_dim, (mask_height, mask_width)).to(device)
 
-    spec_autoencoder.istft = DifferentiableISTFT(nperseg=nperseg, noverlap=noverlap).to(device)
-
     # torch.autograd.set_detect_anomaly(True) 
 
     mu_tensor  = torch.tensor(mu_for_loader, dtype=torch.float32).to(device)
@@ -196,8 +194,6 @@ def main(cfg: MainConfig):
             sig_spec=std_tensor,
     )
 
-
-    mld.istft = DifferentiableISTFT(nperseg=nperseg, noverlap=noverlap).to(device)
 
     if train_AE:
         print("🚀 Training Autoencoders...")
